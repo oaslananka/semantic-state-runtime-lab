@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import type { EntityId } from "@ssrl/core";
 import {
   JOURNAL_EVENT_SCHEMA_VERSION,
   JournalEventCollisionError,
@@ -180,7 +179,7 @@ export class SQLiteEventJournal implements RuntimeEventJournal {
     return rows.map((row) => parseEvent(row.event_json));
   }
 
-  async eventsForEntity(entityId: EntityId): Promise<readonly RuntimeJournalEvent[]> {
+  async eventsForEntity(entityId: RuntimeJournalEvent["entityId"]): Promise<readonly RuntimeJournalEvent[]> {
     const rows = this.#db.prepare(`
       SELECT event_json
       FROM runtime_events
