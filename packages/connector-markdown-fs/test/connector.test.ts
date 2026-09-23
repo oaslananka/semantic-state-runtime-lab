@@ -198,6 +198,70 @@ describe("MarkdownFilesystemConnector", () => {
     expect(observed.values["/project/owner"]).toBe("Bob");
   });
 
+  it("creates frontmatter for an existing Markdown body without one", async () => {
+    const root = await vault();
+    const file = join(root, "Inbox.md");
+    await writeFile(file, "# Inbox\n\nKeep this body.\n", "utf8");
+
+    const connector = new MarkdownFilesystemConnector({ root, manifest: manifest() });
+    const inboxBinding: ExternalBinding = {
+      entityId: "entity://project/atlas",
+      provider: "markdown",
+      externalId: "Inbox.md",
+      fields: [{
+        canonical: "Project.status",
+        external: "status",
+        readable: true,
+        writable: true,
+      }],
+    };
+    const snapshot = await connector.observe(inboxBinding);
+
+    expect(snapshot.values.status).toBeUndefined();
+
+    await connector.apply({
+      provider: "markdown",
+      externalId: "Inbox.md",
+      externalPath: "status",
+      canonicalProperty: "Project.status",
+      nextValue: "active",
+      baseRevision: requiredRevision(snapshot),
+    });
+
+    expect(await readFile(file, "utf8")).toBe(
+      "---\nstatus: active\n---\n# Inbox\n\nKeep this body.\n",
+    );
+  });
+
+  it("preserves CRLF body line endings while updating frontmatter", async () => {
+    const root = await vault();
+    const file = join(root, "Windows.md");
+    await writeFile(
+      file,
+      "---\r\ndeadline: 2026-11-15\r\nstatus: active\r\nproject:\r\n  owner: Alice\r\n---\r\n# Windows\r\n\r\nBody stays CRLF.\r\n",
+      "utf8",
+    );
+
+    const connector = new MarkdownFilesystemConnector({ root, manifest: manifest() });
+    const windowsBinding = binding("markdown", "Windows.md");
+    const snapshot = await connector.observe(windowsBinding);
+
+    await connector.apply({
+      provider: "markdown",
+      externalId: "Windows.md",
+      externalPath: "deadline",
+      canonicalProperty: "Project.deadline",
+      nextValue: "2026-11-20",
+      previousValue: "2026-11-15",
+      baseRevision: requiredRevision(snapshot),
+    });
+
+    const after = await readFile(file, "utf8");
+    expect(after).toContain("deadline: 2026-11-20\r\n");
+    expect(after.endsWith("# Windows\r\n\r\nBody stays CRLF.\r\n")).toBe(true);
+    expect(after.replaceAll("\r\n", "").includes("\n")).toBe(false);
+  });
+
   it("rejects a write when the file changed after observation", async () => {
     const root = await vault();
     const file = await seed(root);
