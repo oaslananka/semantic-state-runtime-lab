@@ -38,6 +38,11 @@ export interface ContextPackage {
   readonly consideredRecords: number;
 }
 
+interface RankedRecord {
+  readonly record: ContextRecord;
+  readonly score: number;
+}
+
 function normalize(value: string): string {
   return value
     .normalize("NFKC")
@@ -46,12 +51,14 @@ function normalize(value: string): string {
     .trim();
 }
 
+function termList(value: string): string[] {
+  return normalize(value)
+    .split(" ")
+    .filter((term) => term.length >= 2);
+}
+
 function terms(value: string): Set<string> {
-  return new Set(
-    normalize(value)
-      .split(" ")
-      .filter((term) => term.length >= 2),
-  );
+  return new Set(termList(value));
 }
 
 export function estimateTokens(value: string): number {
@@ -70,6 +77,27 @@ function overlapScore(queryTerms: ReadonlySet<string>, record: ContextRecord): n
     if (recordTerms.has(term)) overlap += 1;
   }
   return overlap;
+}
+
+function selectWithinBudget(
+  ranked: readonly RankedRecord[],
+  budgetTokens: number,
+): { records: ContextRecord[]; estimatedTokens: number } {
+  const records: ContextRecord[] = [];
+  let estimatedTokens = 0;
+
+  for (const candidate of ranked) {
+    const cost = recordTokens(candidate.record);
+    if (estimatedTokens + cost > budgetTokens) continue;
+    records.push(candidate.record);
+    estimatedTokens += cost;
+  }
+
+  return { records, estimatedTokens };
+}
+
+function entityNameMap(corpus: ContextCorpus): ReadonlyMap<string, string> {
+  return new Map(corpus.entities.map((entity) => [entity.id, entity.aliases.join(" ")]));
 }
 
 const kindPriority: Readonly<Record<ContextKind, number>> = {
@@ -146,20 +174,11 @@ export class ContextIndex {
       })
       .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
 
-    const selected: ContextRecord[] = [];
-    let estimatedTokens = 0;
-
-    for (const candidate of ranked) {
-      const cost = recordTokens(candidate.record);
-      if (estimatedTokens + cost > request.budgetTokens) continue;
-      selected.push(candidate.record);
-      estimatedTokens += cost;
-    }
-
+    const selected = selectWithinBudget(ranked, request.budgetTokens);
     return {
-      records: selected,
+      records: selected.records,
       resolvedEntityIds,
-      estimatedTokens,
+      estimatedTokens: selected.estimatedTokens,
       consideredRecords: candidates.length,
     };
   }
@@ -170,9 +189,7 @@ export function lexicalBaseline(
   request: ContextRequest,
 ): ContextPackage {
   const queryTerms = terms(request.query);
-  const entityNames = new Map(
-    corpus.entities.map((entity) => [entity.id, entity.aliases.join(" ")]),
-  );
+  const entityNames = entityNameMap(corpus);
 
   const ranked = corpus.records
     .map((record) => {
@@ -185,22 +202,96 @@ export function lexicalBaseline(
     .filter((candidate) => candidate.score > 0)
     .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
 
-  const selected: ContextRecord[] = [];
-  let estimatedTokens = 0;
-
-  for (const candidate of ranked) {
-    const cost = recordTokens(candidate.record);
-    if (estimatedTokens + cost > request.budgetTokens) continue;
-    selected.push(candidate.record);
-    estimatedTokens += cost;
-  }
-
+  const selected = selectWithinBudget(ranked, request.budgetTokens);
   return {
-    records: selected,
+    records: selected.records,
     resolvedEntityIds: [],
-    estimatedTokens,
+    estimatedTokens: selected.estimatedTokens,
     consideredRecords: corpus.records.length,
   };
+}
+
+export function bm25Baseline(
+  corpus: ContextCorpus,
+  request: ContextRequest,
+  filterEntityIds?: readonly string[],
+): ContextPackage {
+  const filterSet = filterEntityIds === undefined || filterEntityIds.length === 0
+    ? undefined
+    : new Set(filterEntityIds);
+  const candidates = filterSet === undefined
+    ? [...corpus.records]
+    : corpus.records.filter((record) => filterSet.has(record.entityId));
+
+  if (candidates.length === 0) {
+    return {
+      records: [],
+      resolvedEntityIds: filterEntityIds ?? [],
+      estimatedTokens: 0,
+      consideredRecords: 0,
+    };
+  }
+
+  const entityNames = entityNameMap(corpus);
+  const documents = candidates.map((record) => ({
+    record,
+    tokens: termList(`${entityNames.get(record.entityId) ?? ""} ${record.text}`),
+  }));
+  const averageLength = documents.reduce((sum, document) => sum + document.tokens.length, 0)
+    / documents.length;
+  const queryTerms = [...new Set(termList(request.query))];
+  const k1 = 1.2;
+  const b = 0.75;
+
+  const documentFrequency = new Map<string, number>();
+  for (const term of queryTerms) {
+    let frequency = 0;
+    for (const document of documents) {
+      if (document.tokens.includes(term)) frequency += 1;
+    }
+    documentFrequency.set(term, frequency);
+  }
+
+  const ranked = documents
+    .map((document) => {
+      const frequencies = new Map<string, number>();
+      for (const token of document.tokens) {
+        frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+      }
+
+      let score = 0;
+      for (const term of queryTerms) {
+        const tf = frequencies.get(term) ?? 0;
+        if (tf === 0) continue;
+        const df = documentFrequency.get(term) ?? 0;
+        const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5));
+        const denominator = tf + k1 * (1 - b + b * document.tokens.length / averageLength);
+        score += idf * (tf * (k1 + 1)) / denominator;
+      }
+      return { record: document.record, score };
+    })
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score || a.record.id.localeCompare(b.record.id));
+
+  const selected = selectWithinBudget(ranked, request.budgetTokens);
+  return {
+    records: selected.records,
+    resolvedEntityIds: filterEntityIds ?? [],
+    estimatedTokens: selected.estimatedTokens,
+    consideredRecords: candidates.length,
+  };
+}
+
+export function metadataFilteredBm25Baseline(
+  corpus: ContextCorpus,
+  request: ContextRequest,
+): ContextPackage {
+  const resolvedEntityIds = new ContextIndex(corpus).resolveEntities(request.query);
+  return bm25Baseline(
+    corpus,
+    request,
+    resolvedEntityIds.length === 0 ? undefined : resolvedEntityIds,
+  );
 }
 
 export function rawContext(corpus: ContextCorpus): ContextPackage {
