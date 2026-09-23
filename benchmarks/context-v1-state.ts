@@ -74,117 +74,85 @@ function valueText(value: StateValue): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
+function observation(
+  id: string,
+  entityId: EntityId,
+  provider: string,
+  externalId: string,
+  property: string,
+  externalPath: string,
+  value: StateValue,
+  observedAt: string,
+  text: string,
+  kind: ContextKind = "state",
+  relatedEntityIds?: readonly EntityId[],
+): Observation {
+  return {
+    id,
+    entityId,
+    provider,
+    externalId,
+    property,
+    externalPath,
+    value,
+    observedAt,
+    text,
+    kind,
+    ...(relatedEntityIds === undefined ? {} : { relatedEntityIds }),
+  };
+}
+
 function observations(): Observation[] {
   return [
-    {
-      id: "atlas-deadline-pm",
-      entityId: atlas,
-      provider: "pm",
-      externalId: "atlas",
-      property: "Project.deadline",
-      externalPath: "deadline",
-      value: "2026-11-20",
-      observedAt: "2026-09-10T09:00:00Z",
-      text: "Project Atlas delivery deadline is 2026-11-20 in the authoritative project system. Atlas projesi teslim tarihi 2026-11-20.",
-      kind: "state",
-    },
-    {
-      id: "atlas-deadline-chat-proposal",
-      entityId: atlas,
-      provider: "chat",
-      externalId: "thread-77",
-      property: "Project.deadline",
-      externalPath: "deadline",
-      value: "2026-11-25",
-      observedAt: "2026-09-15T13:00:00Z",
-      text: "A chat proposal suggests moving Project Atlas delivery to 2026-11-25, pending project-system approval.",
-      kind: "event",
-    },
-    {
-      id: "atlas-api-rest-old",
-      entityId: atlas,
-      provider: "adr",
-      externalId: "adr-api",
-      property: "Project.apiStyle",
-      externalPath: "apiStyle",
-      value: "REST",
-      observedAt: "2026-02-10T10:00:00Z",
-      text: "ADR: Project Atlas API style is REST. This decision was recorded on 2026-02-10.",
-      kind: "decision",
-    },
-    {
-      id: "atlas-api-graphql-new",
-      entityId: atlas,
-      provider: "adr",
-      externalId: "adr-api",
-      property: "Project.apiStyle",
-      externalPath: "apiStyle",
-      value: "GraphQL",
-      observedAt: "2026-08-20T10:00:00Z",
-      text: "ADR supersedes the previous API decision: Project Atlas API style is GraphQL as of 2026-08-20.",
-      kind: "decision",
-    },
-    {
-      id: "atlas-owner-directory",
-      entityId: atlas,
-      provider: "directory",
-      externalId: "atlas",
-      property: "Project.ownerEntityId",
-      externalPath: "owner",
-      value: alice,
-      observedAt: "2026-09-01T08:00:00Z",
-      text: "Project Atlas owner is Alice. Atlas projesinin sahibi Alice.",
-      kind: "relationship",
-      relatedEntityIds: [alice],
-    },
-    {
-      id: "alice-timezone-profile",
-      entityId: alice,
-      provider: "profile",
-      externalId: "alice",
-      property: "Person.timezone",
-      externalPath: "timezone",
-      value: "Europe/Istanbul",
-      observedAt: "2026-09-05T08:00:00Z",
-      text: "Alice works in timezone Europe/Istanbul. Alice saat dilimi Europe/Istanbul.",
-      kind: "state",
-    },
-    {
-      id: "atlas-person-employer",
-      entityId: atlasPerson,
-      provider: "profile",
-      externalId: "atlas-person",
-      property: "Person.employer",
-      externalPath: "employer",
-      value: "Acme Robotics",
-      observedAt: "2026-09-12T08:00:00Z",
-      text: "The person Atlas works at Acme Robotics. Atlas kişisinin işvereni Acme Robotics.",
-      kind: "state",
-    },
-    {
-      id: "atlas-stage-ops",
-      entityId: atlas,
-      provider: "ops",
-      externalId: "atlas-release",
-      property: "Project.releaseStage",
-      externalPath: "stage",
-      value: "beta",
-      observedAt: "2026-09-20T10:00:00Z",
-      text: "Operations reports Project Atlas release stage as beta.",
-      kind: "state",
-    },
-    {
-      id: "atlas-stage-pm",
-      entityId: atlas,
-      provider: "pm",
-      externalId: "atlas-release",
-      property: "Project.releaseStage",
-      externalPath: "stage",
-      value: "production",
-      observedAt: "2026-09-20T10:00:00Z",
-      text: "Project system reports Project Atlas release stage as production at the same observation time.",
-      kind: "state",
-    },
+    observation(
+      "atlas-deadline-pm", atlas, "pm", "atlas",
+      "Project.deadline", "deadline", "2026-11-20", "2026-09-10T09:00:00Z",
+      "Project Atlas delivery deadline is 2026-11-20 in the authoritative project system. Atlas projesi teslim tarihi 2026-11-20.",
+    ),
+    observation(
+      "atlas-deadline-chat-proposal", atlas, "chat", "thread-77",
+      "Project.deadline", "deadline", "2026-11-25", "2026-09-15T13:00:00Z",
+      "A chat proposal suggests moving Project Atlas delivery to 2026-11-25, pending project-system approval.",
+      "event",
+    ),
+    observation(
+      "atlas-api-rest-old", atlas, "adr", "adr-api",
+      "Project.apiStyle", "apiStyle", "REST", "2026-02-10T10:00:00Z",
+      "ADR: Project Atlas API style is REST. This decision was recorded on 2026-02-10.",
+      "decision",
+    ),
+    observation(
+      "atlas-api-graphql-new", atlas, "adr", "adr-api",
+      "Project.apiStyle", "apiStyle", "GraphQL", "2026-08-20T10:00:00Z",
+      "ADR supersedes the previous API decision: Project Atlas API style is GraphQL as of 2026-08-20.",
+      "decision",
+    ),
+    observation(
+      "atlas-owner-directory", atlas, "directory", "atlas",
+      "Project.ownerEntityId", "owner", alice, "2026-09-01T08:00:00Z",
+      "Project Atlas owner is Alice. Atlas projesinin sahibi Alice.",
+      "relationship", [alice],
+    ),
+    observation(
+      "alice-timezone-profile", alice, "profile", "alice",
+      "Person.timezone", "timezone", "Europe/Istanbul", "2026-09-05T08:00:00Z",
+      "Alice works in timezone Europe/Istanbul. Alice saat dilimi Europe/Istanbul.",
+    ),
+    observation(
+      "atlas-person-employer", atlasPerson, "profile", "atlas-person",
+      "Person.employer", "employer", "Acme Robotics", "2026-09-12T08:00:00Z",
+      "The person Atlas works at Acme Robotics. Atlas kişisinin işvereni Acme Robotics.",
+    ),
+    observation(
+      "atlas-stage-ops", atlas, "ops", "atlas-release",
+      "Project.releaseStage", "stage", "beta", "2026-09-20T10:00:00Z",
+      "Operations reports Project Atlas release stage as beta.",
+    ),
+    observation(
+      "atlas-stage-pm", atlas, "pm", "atlas-release",
+      "Project.releaseStage", "stage", "production", "2026-09-20T10:00:00Z",
+      "Project system reports Project Atlas release stage as production at the same observation time.",
+    ),
   ];
 }
 
@@ -224,18 +192,20 @@ function noiseObservations(): Observation[] {
     const entityId = `entity://project/noise-${n}` as EntityId;
     for (let item = 0; item < 25; item += 1) {
       const property = item % 2 === 0 ? "Project.deadline" : "Project.apiStyle";
-      result.push({
-        id: `noise-${n}-${item}`,
+      result.push(observation(
+        `noise-${n}-${item}`,
         entityId,
-        provider: item % 3 === 0 ? "chat" : "pm",
-        externalId: `noise-${n}-${item}`,
+        item % 3 === 0 ? "chat" : "pm",
+        `noise-${n}-${item}`,
         property,
-        externalPath: property.endsWith("deadline") ? "deadline" : "apiStyle",
-        value: property.endsWith("deadline") ? `2027-0${(item % 9) + 1}-15` : (item % 3 === 0 ? "GraphQL" : "REST"),
-        observedAt: `2026-08-${((item % 27) + 1).toString().padStart(2, "0")}T12:00:00Z`,
-        text: `Unrelated project ${n} planning record ${item}: deadline API REST GraphQL owner release stage authentication delivery.`,
-        kind: item % 2 === 0 ? "state" : "event",
-      });
+        property.endsWith("deadline") ? "deadline" : "apiStyle",
+        property.endsWith("deadline")
+          ? `2027-0${(item % 9) + 1}-15`
+          : (item % 3 === 0 ? "GraphQL" : "REST"),
+        `2026-08-${((item % 27) + 1).toString().padStart(2, "0")}T12:00:00Z`,
+        `Unrelated project ${n} planning record ${item}: deadline API REST GraphQL owner release stage authentication delivery.`,
+        item % 2 === 0 ? "state" : "event",
+      ));
     }
   }
   return result;
@@ -536,55 +506,82 @@ const authorityState = compileState(all, authority());
 const stateBuildMs = Number((performance.now() - stateBuildStarted).toFixed(3));
 const authorityIndex = new ContextIndex(authorityState.corpus);
 
+function factTask(
+  name: string,
+  query: string,
+  budgetTokens: number,
+  expectedFacts: readonly ExpectedFact[],
+  answerNeedles: readonly string[],
+  forbiddenNeedles: readonly string[] = [],
+): BenchmarkTask {
+  return { name, query, budgetTokens, expectedFacts, answerNeedles, forbiddenNeedles };
+}
+
+function conflictTask(
+  name: string,
+  query: string,
+  budgetTokens: number,
+  property: string,
+  answerNeedles: readonly string[],
+): BenchmarkTask {
+  return {
+    name,
+    query,
+    budgetTokens,
+    expectConflicts: [{ entityId: atlas, property }],
+    answerNeedles,
+  };
+}
+
 const tasks: BenchmarkTask[] = [
-  {
-    name: "authority-deadline-tr",
-    query: "Atlas projesinin teslim tarihi nedir?",
-    budgetTokens: 85,
-    expectedFacts: [{ entityId: atlas, property: "Project.deadline", value: "2026-11-20" }],
-    answerNeedles: ["2026-11-20"],
-    forbiddenNeedles: ["2026-11-25"],
-  },
-  {
-    name: "current-api-decision-en",
-    query: "Which API architecture decision is in force for Project Atlas?",
-    budgetTokens: 85,
-    expectedFacts: [{ entityId: atlas, property: "Project.apiStyle", value: "GraphQL" }],
-    answerNeedles: ["GraphQL"],
-    forbiddenNeedles: ["REST"],
-  },
-  {
-    name: "relation-owner-timezone-tr",
-    query: "Atlas projesinin sahibi kim ve sahibi hangi saat diliminde?",
-    budgetTokens: 145,
-    expectedFacts: [
+  factTask(
+    "authority-deadline-tr",
+    "Atlas projesinin teslim tarihi nedir?",
+    85,
+    [{ entityId: atlas, property: "Project.deadline", value: "2026-11-20" }],
+    ["2026-11-20"],
+    ["2026-11-25"],
+  ),
+  factTask(
+    "current-api-decision-en",
+    "Which API architecture decision is in force for Project Atlas?",
+    85,
+    [{ entityId: atlas, property: "Project.apiStyle", value: "GraphQL" }],
+    ["GraphQL"],
+    ["REST"],
+  ),
+  factTask(
+    "relation-owner-timezone-tr",
+    "Atlas projesinin sahibi kim ve sahibi hangi saat diliminde?",
+    145,
+    [
       { entityId: atlas, property: "Project.ownerEntityId", value: alice },
       { entityId: alice, property: "Person.timezone", value: "Europe/Istanbul" },
     ],
-    answerNeedles: ["Alice", "Europe/Istanbul"],
-  },
-  {
-    name: "alias-collision-person-tr",
-    query: "Atlas kişisinin işvereni nedir?",
-    budgetTokens: 80,
-    expectedFacts: [{ entityId: atlasPerson, property: "Person.employer", value: "Acme Robotics" }],
-    answerNeedles: ["Acme Robotics"],
-  },
-  {
-    name: "unresolved-release-conflict-tr",
-    query: "Atlas projesinin yayın aşaması nedir?",
-    budgetTokens: 90,
-    expectConflicts: [{ entityId: atlas, property: "Project.releaseStage" }],
-    answerNeedles: ["beta", "production"],
-  },
-  {
-    name: "historical-api-as-of",
-    query: "On 2026-03-01, what API style did Project Atlas use?",
-    budgetTokens: 80,
-    expectedFacts: [{ entityId: atlas, property: "Project.apiStyle", value: "REST" }],
-    answerNeedles: ["REST"],
-    forbiddenNeedles: ["GraphQL"],
-  },
+    ["Alice", "Europe/Istanbul"],
+  ),
+  factTask(
+    "alias-collision-person-tr",
+    "Atlas kişisinin işvereni nedir?",
+    80,
+    [{ entityId: atlasPerson, property: "Person.employer", value: "Acme Robotics" }],
+    ["Acme Robotics"],
+  ),
+  conflictTask(
+    "unresolved-release-conflict-tr",
+    "Atlas projesinin yayın aşaması nedir?",
+    90,
+    "Project.releaseStage",
+    ["beta", "production"],
+  ),
+  factTask(
+    "historical-api-as-of",
+    "On 2026-03-01, what API style did Project Atlas use?",
+    80,
+    [{ entityId: atlas, property: "Project.apiStyle", value: "REST" }],
+    ["REST"],
+    ["GraphQL"],
+  ),
 ];
 
 const rows = [];
