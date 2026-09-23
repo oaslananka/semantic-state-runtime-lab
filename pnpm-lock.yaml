@@ -224,6 +224,22 @@ importers:
         specifier: workspace:*
         version: link:../journal
 
+  packages/runtime-host:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/journal':
+        specifier: workspace:*
+        version: link:../journal
+      '@ssrl/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+    devDependencies:
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/storage-sqlite:
     dependencies:
       '@ssrl/journal':
