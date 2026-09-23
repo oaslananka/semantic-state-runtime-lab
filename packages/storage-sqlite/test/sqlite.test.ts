@@ -8,6 +8,7 @@ import {
   type RuntimeJournalEvent,
 } from "@ssrl/journal";
 import {
+  CorruptJournalEventError,
   SQLiteEventJournal,
   UnsupportedJournalSchemaError,
 } from "../src/index.js";
@@ -81,6 +82,26 @@ describe("SQLiteEventJournal", () => {
     expect((await journal.eventsForRun("run-1")).map((item) => item.eventId))
       .toEqual(["existing"]);
     journal.close();
+  });
+
+  it("rejects an unknown event type instead of casting corrupted data", async () => {
+    const path = await databasePath();
+    const journal = new SQLiteEventJournal({ path });
+    const item = event("event-1");
+    await journal.append([item]);
+    journal.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE runtime_events SET event_json = ? WHERE event_id = ?").run(
+      JSON.stringify({ ...item, type: "future.unknown" }),
+      item.eventId,
+    );
+    raw.close();
+
+    const reopened = new SQLiteEventJournal({ path });
+    await expect(reopened.eventsForRun("run-1"))
+      .rejects.toBeInstanceOf(CorruptJournalEventError);
+    reopened.close();
   });
 
   it("rejects a database created by a newer unknown schema version", async () => {
