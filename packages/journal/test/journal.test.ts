@@ -64,6 +64,18 @@ describe("runtime journal contract", () => {
     expect(canonicalEventJson(left)).toBe(canonicalEventJson(right));
   });
 
+  it("rejects expanded actor metadata before persistence serialization", () => {
+    const unsafe = {
+      ...started("actor-event"),
+      actor: {
+        subject: "user:alice",
+        accessToken: "must-not-persist",
+      },
+    } as unknown as RuntimeJournalEvent;
+
+    expect(() => canonicalEventJson(unsafe)).toThrow(TypeError);
+  });
+
   it("rejects non-finite values instead of silently serializing them as null", () => {
     const unsafe: RuntimeJournalEvent = {
       schemaVersion: 1,
