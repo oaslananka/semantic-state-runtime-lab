@@ -33,14 +33,17 @@ import {
 import { isMap, parseDocument } from "yaml";
 
 type ParsedDocument = ReturnType<typeof parseDocument>;
+type LineEnding = "\n" | "\r\n";
+type OptionalLineEnding = "" | LineEnding;
+type FrontmatterDelimiter = "---" | "...";
 
 interface MarkdownParts {
   readonly bom: string;
   readonly document: ParsedDocument;
   readonly body: string;
-  readonly eol: "\n" | "\r\n";
-  readonly closingMarker: "---" | "...";
-  readonly closingEol: "" | "\n" | "\r\n";
+  readonly eol: LineEnding;
+  readonly closingMarker: FrontmatterDelimiter;
+  readonly closingEol: OptionalLineEnding;
 }
 
 export interface MarkdownFilesystemConnectorOptions {
@@ -85,7 +88,7 @@ function stripLineEnding(line: string): string {
   return line;
 }
 
-function lineEnding(line: string): "" | "\n" | "\r\n" {
+function lineEnding(line: string): OptionalLineEnding {
   if (line.endsWith("\r\n")) return "\r\n";
   if (line.endsWith("\n")) return "\n";
   return "";
@@ -112,7 +115,7 @@ function assertMappingDocument(
   return document;
 }
 
-function preferredLineEnding(source: string): "\n" | "\r\n" {
+function preferredLineEnding(source: string): LineEnding {
   return source.includes("\r\n") ? "\r\n" : "\n";
 }
 
@@ -120,7 +123,7 @@ function frontmatterlessParts(
   externalId: string,
   bom: string,
   source: string,
-  eol: "\n" | "\r\n",
+  eol: LineEnding,
 ): MarkdownParts {
   return {
     bom,
@@ -135,8 +138,8 @@ function frontmatterlessParts(
 interface ClosingDelimiter {
   readonly index: number;
   readonly lineEnd: number;
-  readonly marker: "---" | "...";
-  readonly eol: "" | "\n" | "\r\n";
+  readonly marker: FrontmatterDelimiter;
+  readonly eol: OptionalLineEnding;
 }
 
 function findClosingDelimiter(source: string, start: number): ClosingDelimiter | undefined {
