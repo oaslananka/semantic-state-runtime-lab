@@ -17,6 +17,8 @@ import {
 import {
   MCP_TOOL_NAMES,
   createRuntimeMcpServer,
+  mcpApplyOutputSchema,
+  mcpPlanOutputSchema,
 } from "../src/index.js";
 
 const entityId = "entity://project/atlas" as const;
@@ -180,6 +182,14 @@ const reader: RuntimePrincipal = {
   scopes: ["state:read"],
 };
 
+function planOutput(result: { readonly structuredContent?: unknown }) {
+  return mcpPlanOutputSchema.parse(result.structuredContent);
+}
+
+function applyOutput(result: { readonly structuredContent?: unknown }) {
+  return mcpApplyOutputSchema.parse(result.structuredContent);
+}
+
 describe("MCP runtime adapter", () => {
   it("exposes exactly plan and apply with safety annotations", async () => {
     const providers = stateProviders();
@@ -218,13 +228,14 @@ describe("MCP runtime adapter", () => {
     const serialized = JSON.stringify(result);
 
     expect(result.isError).not.toBe(true);
-    expect(result.structuredContent).toMatchObject({
+    const output = planOutput(result);
+    expect(output).toMatchObject({
       schemaVersion: "1",
       entityId,
       status: "ready",
       digestAlgorithm: "sha256",
     });
-    expect(result.structuredContent?.proposalDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(output.proposalDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(serialized).not.toContain("TOP-SECRET");
     expect(serialized).not.toContain("old-secret");
     expect(serialized).not.toContain("Project.secret");
@@ -238,8 +249,7 @@ describe("MCP runtime adapter", () => {
       name: MCP_TOOL_NAMES.plan,
       arguments: { entityId },
     });
-    const digest = planned.structuredContent?.proposalDigest;
-    expect(typeof digest).toBe("string");
+    const digest = planOutput(planned).proposalDigest;
 
     const applied = await client.callTool({
       name: MCP_TOOL_NAMES.apply,
@@ -250,7 +260,7 @@ describe("MCP runtime adapter", () => {
     });
 
     expect(applied.isError).not.toBe(true);
-    expect(applied.structuredContent).toMatchObject({
+    expect(applyOutput(applied)).toMatchObject({
       schemaVersion: "1",
       entityId,
       appliedCount: 1,
@@ -281,8 +291,7 @@ describe("MCP runtime adapter", () => {
       name: MCP_TOOL_NAMES.plan,
       arguments: { entityId },
     });
-    const digest = planned.structuredContent?.proposalDigest;
-    expect(typeof digest).toBe("string");
+    const digest = planOutput(planned).proposalDigest;
 
     providers.replica.mutateExternally(
       "replica-atlas",
@@ -313,8 +322,7 @@ describe("MCP runtime adapter", () => {
       name: MCP_TOOL_NAMES.plan,
       arguments: { entityId },
     });
-    const digest = planned.structuredContent?.proposalDigest;
-    expect(typeof digest).toBe("string");
+    const digest = planOutput(planned).proposalDigest;
 
     const result = await readerClient.callTool({
       name: MCP_TOOL_NAMES.apply,
