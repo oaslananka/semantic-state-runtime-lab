@@ -342,11 +342,13 @@ describe("MCP runtime adapter", () => {
     const counter = { calls: 0 };
     const client = await connect(host(providers, policy(counter)), alice);
 
-    await expect(client.callTool({
+    const result = await client.callTool({
       name: MCP_TOOL_NAMES.plan,
       arguments: { entityId: "not-an-entity-id" },
-    })).rejects.toThrow();
+    });
 
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("Input validation error");
     expect(counter.calls).toBe(0);
   });
 
