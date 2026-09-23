@@ -45,7 +45,7 @@ function authority(provider = "primary"): readonly AuthorityRule[] {
 }
 
 function catalog(
-  authorityRules: readonly AuthorityRule[] | undefined = authority(),
+  authorityRules: readonly AuthorityRule[] | null = authority(),
 ): InMemoryEntityRuntimeCatalog {
   return new InMemoryEntityRuntimeCatalog([{
     entityId,
@@ -53,7 +53,7 @@ function catalog(
       binding("primary", false),
       binding("replica", true),
     ],
-    ...(authorityRules === undefined ? {} : { authority: authorityRules }),
+    ...(authorityRules === null ? {} : { authority: authorityRules }),
   }]);
 }
 
@@ -183,7 +183,7 @@ describe("RuntimeHost", () => {
       },
     };
     const host = new RuntimeHost({
-      catalog: catalog(undefined),
+      catalog: catalog(null),
       registry: registry(state.primary, countingReplica),
     });
 
