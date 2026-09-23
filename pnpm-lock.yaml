@@ -240,6 +240,43 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/node-app:
+    dependencies:
+      '@modelcontextprotocol/server':
+        specifier: 2.0.0
+        version: 2.0.0
+      '@ssrl/connector-markdown-fs':
+        specifier: workspace:*
+        version: link:../connector-markdown-fs
+      '@ssrl/connector-sdk':
+        specifier: workspace:*
+        version: link:../connector-sdk
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/mcp-server':
+        specifier: workspace:*
+        version: link:../mcp-server
+      '@ssrl/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      '@ssrl/runtime-host':
+        specifier: workspace:*
+        version: link:../runtime-host
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
+    devDependencies:
+      '@modelcontextprotocol/client':
+        specifier: 2.0.0
+        version: 2.0.0
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/runtime:
     dependencies:
       '@ssrl/core':
