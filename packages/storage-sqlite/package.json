@@ -4,10 +4,13 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ssrl/journal": "workspace:*"
+    "@ssrl/journal": "workspace:*",
+    "@ssrl/core": "workspace:*",
+    "@ssrl/state-store": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.2",
+    "@ssrl/context": "workspace:*"
   },
   "exports": {
     ".": {

@@ -206,3 +206,4 @@ export class SQLiteEventJournal implements RuntimeEventJournal {
     this.#db.close();
   }
 }
+export * from "./semantic-state-store.js";
