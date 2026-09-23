@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   ContextIndex,
+  bm25Baseline,
   lexicalBaseline,
+  metadataFilteredBm25Baseline,
   type ContextCorpus,
 } from "../src/index.js";
 
@@ -23,7 +25,7 @@ const corpus: ContextCorpus = {
       id: "atlas-old",
       entityId: "project:atlas",
       kind: "decision",
-      text: "Old proposal: migrate authentication sessions to JWT.",
+      text: "JWT migration decision for authentication sessions: migrate every session to JWT immediately.",
       current: false,
       importance: 0.2,
     },
@@ -69,5 +71,27 @@ describe("ContextIndex", () => {
 
     expect(compiled.consideredRecords).toBe(2);
     expect(baseline.consideredRecords).toBe(3);
+  });
+
+  it("supports a global BM25 baseline under the same token budget", () => {
+    const result = bm25Baseline(corpus, {
+      query: "What is the current JWT decision for Project Atlas?",
+      budgetTokens: 80,
+    });
+
+    expect(result.estimatedTokens).toBeLessThanOrEqual(80);
+    expect(result.consideredRecords).toBe(3);
+    expect(result.records.length).toBeGreaterThan(0);
+  });
+
+  it("metadata-filtered BM25 gets the same entity candidate reduction as the compiler", () => {
+    const result = metadataFilteredBm25Baseline(corpus, {
+      query: "What is the current JWT decision for Project Atlas?",
+      budgetTokens: 80,
+    });
+
+    expect(result.resolvedEntityIds).toEqual(["project:atlas"]);
+    expect(result.consideredRecords).toBe(2);
+    expect(result.records.some((record) => record.id === "other-jwt")).toBe(false);
   });
 });
