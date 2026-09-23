@@ -86,6 +86,26 @@ function buildCorpus(): ContextCorpus {
   return { entities, records };
 }
 
+function stateAwareBm25Baseline(
+  corpus: ContextCorpus,
+  index: ContextIndex,
+  request: { readonly query: string; readonly budgetTokens: number },
+): ContextPackage {
+  const resolvedEntityIds = new Set(index.resolveEntities(request.query));
+  const asksForCurrentState = /\bcurrent(?:ly)?\b/i.test(request.query);
+  const records = corpus.records.filter((record) => {
+    const entityMatches = resolvedEntityIds.size === 0
+      || resolvedEntityIds.has(record.entityId);
+    const stateMatches = !asksForCurrentState || record.current === true;
+    return entityMatches && stateMatches;
+  });
+
+  return bm25Baseline(
+    { entities: corpus.entities, records },
+    request,
+  );
+}
+
 function evaluate(
   method: string,
   context: ContextPackage,
@@ -152,6 +172,7 @@ for (const task of tasks) {
     evaluate("lexical", lexicalBaseline(corpus, request), task),
     evaluate("bm25-global", bm25Baseline(corpus, request), task),
     evaluate("bm25-metadata-filtered", metadataFilteredBm25Baseline(corpus, request), task),
+    evaluate("bm25-state-aware-heuristic", stateAwareBm25Baseline(corpus, index, request), task),
     evaluate("compiled-v0", index.compile(request), task),
   );
 }
