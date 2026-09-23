@@ -4,14 +4,14 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@modelcontextprotocol/server": "2.1.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
     "zod": "4.6.5",
     "@ssrl/core": "workspace:*"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.1.0",
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "26.6.2"
   },
   "exports": {
