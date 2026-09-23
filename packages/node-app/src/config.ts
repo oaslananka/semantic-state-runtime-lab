@@ -334,7 +334,7 @@ function validatePolicyFields(
 ): void {
   const seen = new Set<string>();
   for (const grant of config.policy.fields) {
-    const key = `${grant.entityId}\\0${grant.property}`;
+    const key = JSON.stringify([grant.entityId, grant.property]);
     if (seen.has(key)) {
       issues.push(`policy.fields: duplicate grant for ${grant.entityId} / ${grant.property}`);
       continue;
