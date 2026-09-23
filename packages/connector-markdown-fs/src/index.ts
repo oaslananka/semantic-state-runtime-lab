@@ -123,7 +123,7 @@ function splitMarkdown(externalId: string, content: string): MarkdownParts {
     }
     return {
       bom,
-      document: assertMappingDocument(externalId, parseDocument("{}\n")),
+      document: assertMappingDocument(externalId, parseDocument("")),
       body: source,
       eol: "\n",
       closingMarker: "---",
@@ -135,7 +135,7 @@ function splitMarkdown(externalId: string, content: string): MarkdownParts {
   if (stripLineEnding(firstLine).trimEnd() !== "---") {
     return {
       bom,
-      document: assertMappingDocument(externalId, parseDocument("{}\n")),
+      document: assertMappingDocument(externalId, parseDocument("")),
       body: source,
       eol: source.includes("\r\n") ? "\r\n" : "\n",
       closingMarker: "---",
