@@ -11,7 +11,8 @@ export type ReconciliationOutcome =
   | "dry-run"
   | "blocked"
   | "noop"
-  | "converged";
+  | "converged"
+  | "not-converged";
 
 export interface JournalErrorSummary {
   readonly name: string;
@@ -70,6 +71,15 @@ export type MutationFailedEvent = EventEnvelope<
   }
 >;
 
+export type ReconciliationFailedEvent = EventEnvelope<
+  "reconciliation.failed",
+  {
+    readonly failed: Mutation;
+    readonly applied: readonly Mutation[];
+    readonly error: JournalErrorSummary;
+  }
+>;
+
 export type ReconciliationCompletedEvent = EventEnvelope<
   "reconciliation.completed",
   {
@@ -85,6 +95,7 @@ export type RuntimeJournalEvent =
   | MutationRequestedEvent
   | MutationAppliedEvent
   | MutationFailedEvent
+  | ReconciliationFailedEvent
   | ReconciliationCompletedEvent;
 
 export type RuntimeJournalEventType = RuntimeJournalEvent["type"];
