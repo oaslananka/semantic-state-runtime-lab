@@ -64,7 +64,7 @@ export interface ActiveRelationQuery {
   readonly knownAt: string;
 }
 
-function normalize(value: string): string {
+export function normalizeEntityAlias(value: string): string {
   return value
     .normalize("NFKC")
     .toLocaleLowerCase("und")
@@ -87,7 +87,7 @@ function matchAliases(
   aliases: readonly string[],
 ): string[] {
   return aliases
-    .map((alias) => ({ raw: alias, normalized: normalize(alias) }))
+    .map((alias) => ({ raw: alias, normalized: normalizeEntityAlias(alias) }))
     .filter((alias) => phraseMatch(normalizedQuery, alias.normalized))
     .sort((left, right) => (
       tokenCount(right.normalized) - tokenCount(left.normalized)
@@ -98,7 +98,7 @@ function matchAliases(
 }
 
 function aliasScore(alias: string): number {
-  const normalized = normalize(alias);
+  const normalized = normalizeEntityAlias(alias);
   return tokenCount(normalized) * 100 + normalized.length;
 }
 
@@ -118,9 +118,9 @@ function candidateFor(
   const typeCueScore = matchedTypeCues.length === 0
     ? 0
     : 10_000 + Math.max(...matchedTypeCues.map(aliasScore));
-  const matchedAliasSet = new Set(matchedAliases.map(normalize));
+  const matchedAliasSet = new Set(matchedAliases.map(normalizeEntityAlias));
   const evidenceRefs = entity.aliases
-    .filter((alias) => matchedAliasSet.has(normalize(alias.value)))
+    .filter((alias) => matchedAliasSet.has(normalizeEntityAlias(alias.value)))
     .flatMap((alias) => alias.evidenceRefs ?? []);
 
   return {
@@ -150,7 +150,7 @@ function validateEntityAliases(entity: TypedEntity): void {
     throw new Error(`Entity ${entity.id} must have at least one alias`);
   }
   for (const alias of entity.aliases) {
-    if (normalize(alias.value).length === 0) {
+    if (normalizeEntityAlias(alias.value).length === 0) {
       throw new Error(`Entity ${entity.id} contains an empty alias`);
     }
   }
@@ -193,7 +193,7 @@ export class TypedEntityResolver {
   }
 
   resolve(query: string): EntityResolution {
-    const normalizedQuery = normalize(query);
+    const normalizedQuery = normalizeEntityAlias(query);
     const candidates = this.#entities
       .map((entity) => {
         const entityType = this.#types.get(entity.type);

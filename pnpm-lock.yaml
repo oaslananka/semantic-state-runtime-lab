@@ -306,12 +306,27 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/state-store:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/storage-sqlite:
     dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
       '@ssrl/journal':
         specifier: workspace:*
         version: link:../journal
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
     devDependencies:
+      '@ssrl/context':
+        specifier: workspace:*
+        version: link:../context
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
