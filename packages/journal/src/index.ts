@@ -20,6 +20,10 @@ export interface JournalErrorSummary {
   readonly name: string;
 }
 
+export interface JournalActor {
+  readonly subject: string;
+}
+
 interface EventEnvelope<Type extends string, Payload> {
   readonly schemaVersion: typeof JOURNAL_EVENT_SCHEMA_VERSION;
   readonly eventId: string;
@@ -27,6 +31,7 @@ interface EventEnvelope<Type extends string, Payload> {
   readonly entityId: EntityId;
   readonly type: Type;
   readonly occurredAt: string;
+  readonly actor?: JournalActor;
   readonly payload: Payload;
 }
 
