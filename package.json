@@ -7,9 +7,9 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "tsc -p packages/core/tsconfig.json",
-    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit",
-    "test": "vitest run packages/core/test"
+    "build": "tsc -p packages/core/tsconfig.build.json && tsc -p packages/runtime/tsconfig.build.json",
+    "typecheck": "tsc -p packages/core/tsconfig.json --noEmit && tsc -p packages/runtime/tsconfig.json --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@types/node": "26.6.2",
