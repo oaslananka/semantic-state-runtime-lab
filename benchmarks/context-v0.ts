@@ -1,6 +1,8 @@
 import {
   ContextIndex,
+  bm25Baseline,
   lexicalBaseline,
+  metadataFilteredBm25Baseline,
   rawContext,
   type ContextCorpus,
   type ContextPackage,
@@ -38,7 +40,7 @@ function buildCorpus(): ContextCorpus {
       id: "atlas-decision-jwt-old",
       entityId: "project:atlas",
       kind: "decision",
-      text: "Historical proposal: migrate every authentication session to JWT immediately.",
+      text: "JWT migration decision for authentication sessions: migrate every session to JWT immediately.",
       current: false,
       importance: 0.2,
     },
@@ -107,6 +109,7 @@ function evaluate(
     estimatedTokens: context.estimatedTokens,
     returnedRecords: context.records.length,
     consideredRecords: context.consideredRecords,
+    returnedIds: context.records.map((record) => record.id),
   };
 }
 
@@ -132,6 +135,13 @@ const tasks: BenchmarkTask[] = [
     requiredEvidence: ["atlas-issue-callback"],
     relevantEvidence: ["atlas-issue-callback", "atlas-state-auth", "atlas-owner"],
   },
+  {
+    name: "temporal-stale-adversary",
+    query: "What is the current JWT migration decision for Atlas?",
+    budgetTokens: 36,
+    requiredEvidence: ["atlas-decision-jwt-current"],
+    relevantEvidence: ["atlas-decision-jwt-current"],
+  },
 ];
 
 const rows = [];
@@ -140,6 +150,8 @@ for (const task of tasks) {
   rows.push(
     evaluate("raw", rawContext(corpus), task),
     evaluate("lexical", lexicalBaseline(corpus, request), task),
+    evaluate("bm25-global", bm25Baseline(corpus, request), task),
+    evaluate("bm25-metadata-filtered", metadataFilteredBm25Baseline(corpus, request), task),
     evaluate("compiled-v0", index.compile(request), task),
   );
 }
