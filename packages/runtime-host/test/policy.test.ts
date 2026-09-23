@@ -1,15 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type {
-  AuthorityRule,
-  ExternalBinding,
-  StateValue,
-} from "@ssrl/core";
 import { InMemoryEventJournal } from "@ssrl/journal";
-import {
-  InMemoryStateProvider,
-  ReconciliationPlanDriftError,
-  type StateProvider,
-} from "@ssrl/runtime";
+import { ReconciliationPlanDriftError } from "@ssrl/runtime";
 import {
   InMemoryEntityRuntimeCatalog,
   RuntimeAccessDeniedError,
@@ -17,8 +8,14 @@ import {
   type RuntimeAccessPolicy,
   type RuntimePrincipal,
 } from "../src/index.js";
+import {
+  catalog,
+  countingProvider,
+  entityId,
+  providers,
+  registry,
+} from "./fixtures.js";
 
-const entityId = "entity://project/atlas" as const;
 const alice: RuntimePrincipal = {
   subject: "user:alice",
   scopes: ["state:read", "state:write"],
@@ -27,93 +24,6 @@ const reader: RuntimePrincipal = {
   subject: "user:reader",
   scopes: ["state:read"],
 };
-
-function field(
-  canonical: string,
-  external: string,
-  writable: boolean,
-): ExternalBinding["fields"][number] {
-  return {
-    canonical,
-    external,
-    readable: true,
-    writable,
-  };
-}
-
-function binding(
-  provider: string,
-  writable: boolean,
-  includeSecret = false,
-): ExternalBinding {
-  return {
-    entityId,
-    provider,
-    externalId: `${provider}-atlas`,
-    fields: [
-      field("Project.deadline", "deadline", writable),
-      ...(includeSecret
-        ? [field("Project.secret", "secret", writable)]
-        : []),
-    ],
-  };
-}
-
-function authority(provider = "primary", includeSecret = false): readonly AuthorityRule[] {
-  return [
-    {
-      property: "Project.deadline",
-      strategy: { kind: "provider", provider },
-    },
-    ...(includeSecret
-      ? [{
-        property: "Project.secret",
-        strategy: { kind: "provider" as const, provider },
-      }]
-      : []),
-  ];
-}
-
-function catalog(
-  options: {
-    readonly authorityProvider?: string;
-    readonly includeSecret?: boolean;
-  } = {},
-): InMemoryEntityRuntimeCatalog {
-  const includeSecret = options.includeSecret === true;
-  return new InMemoryEntityRuntimeCatalog([{
-    entityId,
-    bindings: [
-      binding("primary", false, includeSecret),
-      binding("replica", true, includeSecret),
-    ],
-    authority: authority(options.authorityProvider ?? "primary", includeSecret),
-  }]);
-}
-
-function providers(
-  primaryValues: Readonly<Record<string, StateValue>>,
-  replicaValues: Readonly<Record<string, StateValue>>,
-) {
-  const now = () => "2026-09-24T00:00:00Z";
-  const primary = new InMemoryStateProvider(
-    "primary",
-    [{ externalId: "primary-atlas", values: primaryValues }],
-    now,
-  );
-  const replica = new InMemoryStateProvider(
-    "replica",
-    [{ externalId: "replica-atlas", values: replicaValues }],
-    now,
-  );
-  return { primary, replica };
-}
-
-function registry(...providers: StateProvider[]) {
-  return {
-    providers: new Map(providers.map((provider) => [provider.id, provider])),
-  };
-}
 
 function scopePolicy(
   writeEnabled: () => boolean = () => true,
@@ -165,10 +75,7 @@ function scopePolicy(
 
 describe("RuntimeHost access policy", () => {
   it("lets a read-only principal see allowed state without receiving writable mutations", async () => {
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
+    const state = providers();
     const host = new RuntimeHost({
       catalog: catalog(),
       registry: registry(state.primary, state.replica),
@@ -184,10 +91,16 @@ describe("RuntimeHost access policy", () => {
   });
 
   it("does not leak a denied field value into the proposal or journal", async () => {
-    const state = providers(
-      { deadline: "2026-11-20", secret: "TOP-SECRET" },
-      { deadline: "2026-11-15", secret: "old-secret" },
-    );
+    const state = providers({
+      primaryValues: {
+        deadline: "2026-11-20",
+        secret: "TOP-SECRET",
+      },
+      replicaValues: {
+        deadline: "2026-11-15",
+        secret: "old-secret",
+      },
+    });
     const journal = new InMemoryEventJournal();
     const host = new RuntimeHost({
       catalog: catalog({ includeSecret: true }),
@@ -210,22 +123,11 @@ describe("RuntimeHost access policy", () => {
 
   it("turns write-permission revocation between plan and apply into pre-write drift", async () => {
     let writeEnabled = true;
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
-    let applyCalls = 0;
-    const replica: StateProvider = {
-      id: state.replica.id,
-      observe: (externalBinding) => state.replica.observe(externalBinding),
-      async apply(mutation) {
-        applyCalls += 1;
-        await state.replica.apply(mutation);
-      },
-    };
+    const state = providers();
+    const counted = countingProvider(state.replica);
     const host = new RuntimeHost({
       catalog: catalog(),
-      registry: registry(state.primary, replica),
+      registry: registry(state.primary, counted.provider),
       accessPolicy: scopePolicy(() => writeEnabled),
     });
 
@@ -236,27 +138,16 @@ describe("RuntimeHost access policy", () => {
     await expect(host.apply(entityId, proposal.digest, alice))
       .rejects.toBeInstanceOf(ReconciliationPlanDriftError);
 
-    expect(applyCalls).toBe(0);
+    expect(counted.count()).toBe(0);
     expect(state.replica.read("replica-atlas").deadline).toBe("2026-11-15");
   });
 
   it("rejects a valid digest presented by a principal without apply permission", async () => {
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
-    let applyCalls = 0;
-    const replica: StateProvider = {
-      id: state.replica.id,
-      observe: (externalBinding) => state.replica.observe(externalBinding),
-      async apply(mutation) {
-        applyCalls += 1;
-        await state.replica.apply(mutation);
-      },
-    };
+    const state = providers();
+    const counted = countingProvider(state.replica);
     const host = new RuntimeHost({
       catalog: catalog(),
-      registry: registry(state.primary, replica),
+      registry: registry(state.primary, counted.provider),
       accessPolicy: scopePolicy(),
     });
 
@@ -267,14 +158,14 @@ describe("RuntimeHost access policy", () => {
         name: "RuntimeAccessDeniedError",
         code: "missing-state:write",
       } satisfies Partial<RuntimeAccessDeniedError>);
-    expect(applyCalls).toBe(0);
+    expect(counted.count()).toBe(0);
   });
 
   it("never lets policy widen a source binding that is read-only", async () => {
-    const state = providers(
-      { deadline: "old-primary" },
-      { deadline: "canonical-replica" },
-    );
+    const state = providers({
+      primaryValues: { deadline: "old-primary" },
+      replicaValues: { deadline: "canonical-replica" },
+    });
     const allowAll: RuntimeAccessPolicy = {
       evaluate: () => ({ effect: "allow" }),
     };
@@ -292,10 +183,7 @@ describe("RuntimeHost access policy", () => {
   });
 
   it("records only the principal subject, not scopes, in durable journal evidence", async () => {
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
+    const state = providers();
     const journal = new InMemoryEventJournal();
     const principal: RuntimePrincipal = {
       subject: "user:alice",
@@ -320,10 +208,7 @@ describe("RuntimeHost access policy", () => {
   });
 
   it("authorizes before catalog lookup so denied callers cannot probe entity existence", async () => {
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
+    const state = providers();
     const denyAll: RuntimeAccessPolicy = {
       evaluate: () => ({ effect: "deny", code: "not-allowed" }),
     };
@@ -340,10 +225,7 @@ describe("RuntimeHost access policy", () => {
   });
 
   it("denies requests by default when a policy has no matching rule", async () => {
-    const state = providers(
-      { deadline: "2026-11-20" },
-      { deadline: "2026-11-15" },
-    );
+    const state = providers();
     const host = new RuntimeHost({
       catalog: catalog(),
       registry: registry(state.primary, state.replica),
