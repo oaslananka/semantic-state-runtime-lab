@@ -7,7 +7,8 @@
     "@modelcontextprotocol/server": "2.1.0",
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
-    "zod": "4.6.5"
+    "zod": "4.6.5",
+    "@ssrl/core": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.1.0",
