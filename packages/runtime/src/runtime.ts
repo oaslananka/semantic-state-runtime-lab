@@ -31,6 +31,17 @@ export class ReconciliationBlockedError extends Error {
   }
 }
 
+export class ReconciliationPlanDriftError extends Error {
+  constructor(
+    readonly expectedDigest: string,
+    readonly actualDigest: string,
+    readonly plan: ReconciliationPlan,
+  ) {
+    super(`Reconciliation proposal drifted: expected ${expectedDigest}, actual ${actualDigest}`);
+    this.name = "ReconciliationPlanDriftError";
+  }
+}
+
 export class ReconciliationApplyError extends Error {
   constructor(
     readonly failed: Mutation,
@@ -212,6 +223,11 @@ function journalObserver(
   };
 }
 
+export interface ReconciliationPlanGuard {
+  readonly expectedDigest: string;
+  digest(plan: ReconciliationPlan): string | Promise<string>;
+}
+
 export interface ReconcileInput {
   readonly entityId: EntityId;
   readonly bindings: readonly ExternalBinding[];
@@ -220,6 +236,7 @@ export interface ReconcileInput {
   readonly dryRun?: boolean;
   readonly journal?: RuntimeEventSink;
   readonly now?: () => string;
+  readonly planGuard?: ReconciliationPlanGuard;
 }
 
 export interface ReconcileResult {
@@ -261,6 +278,21 @@ export async function reconcileOnce(input: ReconcileInput): Promise<ReconcileRes
     ...(input.authority === undefined ? {} : { authority: input.authority }),
   });
   await appendEvent(context, "reconciliation.planned", { plan: before });
+
+  if (input.planGuard !== undefined) {
+    const actualDigest = await input.planGuard.digest(before);
+    if (actualDigest !== input.planGuard.expectedDigest) {
+      await appendEvent(context, "reconciliation.completed", {
+        outcome: "drifted",
+        finalPlan: before,
+      });
+      throw new ReconciliationPlanDriftError(
+        input.planGuard.expectedDigest,
+        actualDigest,
+        before,
+      );
+    }
+  }
 
   if (input.dryRun === true || before.mutations.length === 0 || before.conflicts.length > 0) {
     let outcome: "dry-run" | "blocked" | "noop" = "noop";
