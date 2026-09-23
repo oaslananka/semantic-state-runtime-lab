@@ -4,7 +4,6 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@modelcontextprotocol/node": "2.0.0",
     "@ssrl/connector-markdown-fs": "workspace:*",
     "@ssrl/connector-sdk": "workspace:*",
     "@ssrl/core": "workspace:*",
@@ -12,7 +11,8 @@
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
-    "zod": "4.6.5"
+    "zod": "4.6.5",
+    "@modelcontextprotocol/server": "2.0.0"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0",
