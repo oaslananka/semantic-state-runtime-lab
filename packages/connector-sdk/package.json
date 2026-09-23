@@ -1,0 +1,12 @@
+{
+  "name": "@ssrl/connector-sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ssrl/runtime": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
