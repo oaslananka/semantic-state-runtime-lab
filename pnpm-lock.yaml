@@ -181,6 +181,10 @@ importers:
       '@ssrl/runtime':
         specifier: workspace:*
         version: link:../runtime
+    devDependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/context: {}
 
