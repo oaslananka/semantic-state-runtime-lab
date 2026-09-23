@@ -209,11 +209,30 @@ importers:
 
   packages/core: {}
 
+  packages/journal:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/runtime:
     dependencies:
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/journal':
+        specifier: workspace:*
+        version: link:../journal
+
+  packages/storage-sqlite:
+    dependencies:
+      '@ssrl/journal':
+        specifier: workspace:*
+        version: link:../journal
+    devDependencies:
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
 
 packages:
 

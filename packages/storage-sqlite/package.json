@@ -1,11 +1,13 @@
 {
-  "name": "@ssrl/runtime",
+  "name": "@ssrl/storage-sqlite",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ssrl/core": "workspace:*",
     "@ssrl/journal": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2"
   },
   "exports": {
     ".": "./src/index.ts"

@@ -8,6 +8,11 @@ import {
   type ProviderId,
   type ReconciliationPlan,
 } from "@ssrl/core";
+import type {
+  RuntimeEventSink,
+  RuntimeJournalEvent,
+  RuntimeJournalEventType,
+} from "@ssrl/journal";
 
 export interface StateProvider {
   readonly id: ProviderId;
@@ -57,9 +62,21 @@ export async function observeBindings(
   );
 }
 
-export async function applyReconciliationPlan(
+interface MutationApplyObserver<Token> {
+  before(mutation: Mutation): Promise<Token>;
+  applied(mutation: Mutation, token: Token): Promise<void>;
+  failed(
+    mutation: Mutation,
+    token: Token,
+    cause: unknown,
+    applied: readonly Mutation[],
+  ): Promise<void>;
+}
+
+async function applyPlan<Token>(
   plan: ReconciliationPlan,
   registry: ProviderRegistry,
+  observer?: MutationApplyObserver<Token>,
 ): Promise<{ readonly applied: readonly Mutation[] }> {
   if (plan.conflicts.length > 0) {
     throw new ReconciliationBlockedError(plan);
@@ -67,14 +84,132 @@ export async function applyReconciliationPlan(
 
   const applied: Mutation[] = [];
   for (const mutation of plan.mutations) {
+    const token = observer === undefined
+      ? undefined
+      : await observer.before(mutation);
+
     try {
       await providerFor(registry, mutation.provider).apply(mutation);
-      applied.push(mutation);
     } catch (cause) {
+      if (observer !== undefined) {
+        try {
+          await observer.failed(mutation, token as Token, cause, applied);
+        } catch (error_) {
+          throw new ReconciliationApplyError(mutation, [...applied], {
+            cause: new AggregateError(
+              [cause, error_],
+              "Provider mutation failed and failure journaling also failed",
+            ),
+          });
+        }
+      }
       throw new ReconciliationApplyError(mutation, [...applied], { cause });
     }
+
+    applied.push(mutation);
+    if (observer !== undefined) {
+      await observer.applied(mutation, token as Token);
+    }
   }
+
   return { applied };
+}
+
+export async function applyReconciliationPlan(
+  plan: ReconciliationPlan,
+  registry: ProviderRegistry,
+): Promise<{ readonly applied: readonly Mutation[] }> {
+  return applyPlan(plan, registry);
+}
+
+type EventOf<Type extends RuntimeJournalEventType> = Extract<
+  RuntimeJournalEvent,
+  { readonly type: Type }
+>;
+
+type EventPayload<Type extends RuntimeJournalEventType> = EventOf<Type>["payload"];
+
+interface JournalContext {
+  readonly sink: RuntimeEventSink;
+  readonly runId: string;
+  readonly entityId: EntityId;
+  readonly now: () => string;
+}
+
+function journalEvent<Type extends RuntimeJournalEventType>(
+  context: JournalContext,
+  type: Type,
+  payload: EventPayload<Type>,
+): EventOf<Type> {
+  return {
+    schemaVersion: 1,
+    eventId: context.sink.createId(),
+    runId: context.runId,
+    entityId: context.entityId,
+    type,
+    occurredAt: context.now(),
+    payload,
+  } as EventOf<Type>;
+}
+
+async function appendEvent<Type extends RuntimeJournalEventType>(
+  context: JournalContext | undefined,
+  type: Type,
+  payload: EventPayload<Type>,
+): Promise<void> {
+  if (context === undefined) return;
+  await context.sink.append([journalEvent(context, type, payload)]);
+}
+
+async function appendObservations(
+  context: JournalContext | undefined,
+  snapshots: readonly ExternalSnapshot[],
+  phase: "before" | "after",
+): Promise<void> {
+  if (context === undefined) return;
+  await context.sink.append(
+    snapshots.map((snapshot) => journalEvent(
+      context,
+      "observation.recorded",
+      { phase, snapshot },
+    )),
+  );
+}
+
+function errorSummary(cause: unknown): { readonly name: string } {
+  if (cause instanceof Error && cause.name.length > 0) return { name: cause.name };
+  return { name: typeof cause };
+}
+
+function journalObserver(
+  context: JournalContext | undefined,
+): MutationApplyObserver<string> | undefined {
+  if (context === undefined) return undefined;
+
+  return {
+    async before(mutation) {
+      const mutationId = context.sink.createId();
+      await appendEvent(context, "mutation.requested", { mutationId, mutation });
+      return mutationId;
+    },
+    async applied(mutation, mutationId) {
+      await appendEvent(context, "mutation.applied", { mutationId, mutation });
+    },
+    async failed(mutation, mutationId, cause, applied) {
+      await context.sink.append([
+        journalEvent(context, "mutation.failed", {
+          mutationId,
+          mutation,
+          error: errorSummary(cause),
+        }),
+        journalEvent(context, "reconciliation.failed", {
+          failed: mutation,
+          applied: [...applied],
+          error: errorSummary(cause),
+        }),
+      ]);
+    },
+  };
 }
 
 export interface ReconcileInput {
@@ -83,33 +218,85 @@ export interface ReconcileInput {
   readonly authority?: readonly AuthorityRule[];
   readonly registry: ProviderRegistry;
   readonly dryRun?: boolean;
+  readonly journal?: RuntimeEventSink;
+  readonly now?: () => string;
 }
 
 export interface ReconcileResult {
   readonly before: ReconciliationPlan;
   readonly after?: ReconciliationPlan;
   readonly applied: readonly Mutation[];
+  readonly journalRunId?: string;
+}
+
+function resultWithJournal(
+  result: Omit<ReconcileResult, "journalRunId">,
+  context: JournalContext | undefined,
+): ReconcileResult {
+  return context === undefined
+    ? result
+    : { ...result, journalRunId: context.runId };
 }
 
 export async function reconcileOnce(input: ReconcileInput): Promise<ReconcileResult> {
+  const context = input.journal === undefined
+    ? undefined
+    : {
+      sink: input.journal,
+      runId: input.journal.createId(),
+      entityId: input.entityId,
+      now: input.now ?? (() => new Date().toISOString()),
+    } satisfies JournalContext;
+
+  await appendEvent(context, "reconciliation.started", {
+    dryRun: input.dryRun === true,
+  });
+
   const snapshots = await observeBindings(input.bindings, input.registry);
+  await appendObservations(context, snapshots, "before");
+
   const before = planReconciliation({
     entityId: input.entityId,
     snapshots,
     ...(input.authority === undefined ? {} : { authority: input.authority }),
   });
+  await appendEvent(context, "reconciliation.planned", { plan: before });
 
   if (input.dryRun === true || before.mutations.length === 0 || before.conflicts.length > 0) {
-    return { before, applied: [] };
+    let outcome: "dry-run" | "blocked" | "noop" = "noop";
+    if (input.dryRun === true) {
+      outcome = "dry-run";
+    } else if (before.conflicts.length > 0) {
+      outcome = "blocked";
+    }
+    await appendEvent(context, "reconciliation.completed", {
+      outcome,
+      finalPlan: before,
+    });
+    return resultWithJournal({ before, applied: [] }, context);
   }
 
-  const { applied } = await applyReconciliationPlan(before, input.registry);
+  const { applied } = await applyPlan(
+    before,
+    input.registry,
+    journalObserver(context),
+  );
+
   const observedAfter = await observeBindings(input.bindings, input.registry);
+  await appendObservations(context, observedAfter, "after");
   const after = planReconciliation({
     entityId: input.entityId,
     snapshots: observedAfter,
     ...(input.authority === undefined ? {} : { authority: input.authority }),
   });
 
-  return { before, after, applied };
+  const outcome = after.mutations.length === 0 && after.conflicts.length === 0
+    ? "converged"
+    : "not-converged";
+  await appendEvent(context, "reconciliation.completed", {
+    outcome,
+    finalPlan: after,
+  });
+
+  return resultWithJournal({ before, after, applied }, context);
 }
