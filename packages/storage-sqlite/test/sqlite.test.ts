@@ -84,6 +84,32 @@ describe("SQLiteEventJournal", () => {
     journal.close();
   });
 
+  it("rejects journal actor metadata beyond the subject reference", async () => {
+    const path = await databasePath();
+    const journal = new SQLiteEventJournal({ path });
+    const item = event("event-actor");
+    await journal.append([item]);
+    journal.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare("UPDATE runtime_events SET event_json = ? WHERE event_id = ?").run(
+      JSON.stringify({
+        ...item,
+        actor: {
+          subject: "user:alice",
+          accessToken: "must-not-persist",
+        },
+      }),
+      item.eventId,
+    );
+    raw.close();
+
+    const reopened = new SQLiteEventJournal({ path });
+    await expect(reopened.eventsForRun("run-1"))
+      .rejects.toBeInstanceOf(CorruptJournalEventError);
+    reopened.close();
+  });
+
   it("rejects an unknown event type instead of casting corrupted data", async () => {
     const path = await databasePath();
     const journal = new SQLiteEventJournal({ path });
