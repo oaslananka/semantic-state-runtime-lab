@@ -167,6 +167,7 @@ interface JournalContext {
   readonly runId: string;
   readonly entityId: EntityId;
   readonly now: () => string;
+  readonly actorSubject?: string;
 }
 
 function journalEvent<Type extends RuntimeJournalEventType>(
@@ -181,6 +182,9 @@ function journalEvent<Type extends RuntimeJournalEventType>(
     entityId: context.entityId,
     type,
     occurredAt: context.now(),
+    ...(context.actorSubject === undefined
+      ? {}
+      : { actor: { subject: context.actorSubject } }),
     payload,
   } as EventOf<Type>;
 }
@@ -259,6 +263,7 @@ export interface ReconcileInput {
   readonly journal?: RuntimeEventSink;
   readonly now?: () => string;
   readonly planGuard?: ReconciliationPlanGuard;
+  readonly actorSubject?: string;
 }
 
 export interface ReconcileResult {
@@ -285,6 +290,7 @@ export async function reconcileOnce(input: ReconcileInput): Promise<ReconcileRes
       runId: input.journal.createId(),
       entityId: input.entityId,
       now: input.now ?? (() => new Date().toISOString()),
+      ...(input.actorSubject === undefined ? {} : { actorSubject: input.actorSubject }),
     } satisfies JournalContext;
 
   await appendEvent(context, "reconciliation.started", {
