@@ -42,5 +42,8 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Stdio end-to-end smoke test
+        run: pnpm test:stdio
+
       - name: Context benchmark smoke test
         run: pnpm benchmark:context
