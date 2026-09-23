@@ -146,6 +146,7 @@ export interface LocalRuntimeApp {
   readonly config: LocalAppConfig;
   readonly host: RuntimeHost;
   readonly principal: RuntimePrincipal;
+  readonly journal: SQLiteEventJournal;
   createMcpServer(): ReturnType<typeof createRuntimeMcpServer>;
   close(): void;
 }
@@ -198,6 +199,7 @@ export async function createLocalRuntimeApp(
     config,
     host,
     principal,
+    journal,
     createMcpServer() {
       return createRuntimeMcpServer({
         host,
