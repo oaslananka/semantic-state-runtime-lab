@@ -16,10 +16,6 @@ interface SQLiteEventJournalOptions {
   readonly idFactory?: () => string;
 }
 
-interface VersionRow {
-  readonly user_version: number;
-}
-
 interface EventJsonRow {
   readonly event_json: string;
 }
@@ -78,15 +74,21 @@ export class SQLiteEventJournal implements RuntimeEventJournal {
 
   #initialize(): void {
     this.#db.exec("PRAGMA foreign_keys = ON");
-    const row = this.#db.prepare("PRAGMA user_version").get() as VersionRow;
-    if (row.user_version > SQLITE_SCHEMA_VERSION) {
+    const row = this.#db.prepare("PRAGMA user_version").get();
+    const rawVersion = row?.user_version;
+    if (typeof rawVersion !== "number" && typeof rawVersion !== "bigint") {
+      this.#db.close();
+      throw new CorruptJournalEventError("SQLite did not return a numeric schema version");
+    }
+    const version = Number(rawVersion);
+    if (version > SQLITE_SCHEMA_VERSION) {
       this.#db.close();
       throw new UnsupportedJournalSchemaError(
-        row.user_version,
+        version,
         SQLITE_SCHEMA_VERSION,
       );
     }
-    if (row.user_version === SQLITE_SCHEMA_VERSION) return;
+    if (version === SQLITE_SCHEMA_VERSION) return;
 
     this.#db.exec("BEGIN IMMEDIATE");
     try {
