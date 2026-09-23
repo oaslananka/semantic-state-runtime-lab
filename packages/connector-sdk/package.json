@@ -6,6 +6,9 @@
   "dependencies": {
     "@ssrl/runtime": "workspace:*"
   },
+  "devDependencies": {
+    "@ssrl/core": "workspace:*"
+  },
   "exports": {
     ".": "./src/index.ts"
   }
