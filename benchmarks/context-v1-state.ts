@@ -74,7 +74,7 @@ function valueText(value: StateValue): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-function observation(
+type ObservationArgs = readonly [
   id: string,
   entityId: EntityId,
   provider: string,
@@ -84,9 +84,24 @@ function observation(
   value: StateValue,
   observedAt: string,
   text: string,
-  kind: ContextKind = "state",
+  kind?: ContextKind,
   relatedEntityIds?: readonly EntityId[],
-): Observation {
+];
+
+function observation(args: ObservationArgs): Observation {
+  const [
+    id,
+    entityId,
+    provider,
+    externalId,
+    property,
+    externalPath,
+    value,
+    observedAt,
+    text,
+    kind = "state",
+    relatedEntityIds,
+  ] = args;
   return {
     id,
     entityId,
@@ -104,55 +119,55 @@ function observation(
 
 function observations(): Observation[] {
   return [
-    observation(
+    observation([
       "atlas-deadline-pm", atlas, "pm", "atlas",
       "Project.deadline", "deadline", "2026-11-20", "2026-09-10T09:00:00Z",
       "Project Atlas delivery deadline is 2026-11-20 in the authoritative project system. Atlas projesi teslim tarihi 2026-11-20.",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-deadline-chat-proposal", atlas, "chat", "thread-77",
       "Project.deadline", "deadline", "2026-11-25", "2026-09-15T13:00:00Z",
       "A chat proposal suggests moving Project Atlas delivery to 2026-11-25, pending project-system approval.",
       "event",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-api-rest-old", atlas, "adr", "adr-api",
       "Project.apiStyle", "apiStyle", "REST", "2026-02-10T10:00:00Z",
       "ADR: Project Atlas API style is REST. This decision was recorded on 2026-02-10.",
       "decision",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-api-graphql-new", atlas, "adr", "adr-api",
       "Project.apiStyle", "apiStyle", "GraphQL", "2026-08-20T10:00:00Z",
       "ADR supersedes the previous API decision: Project Atlas API style is GraphQL as of 2026-08-20.",
       "decision",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-owner-directory", atlas, "directory", "atlas",
       "Project.ownerEntityId", "owner", alice, "2026-09-01T08:00:00Z",
       "Project Atlas owner is Alice. Atlas projesinin sahibi Alice.",
       "relationship", [alice],
-    ),
-    observation(
+    ]),
+    observation([
       "alice-timezone-profile", alice, "profile", "alice",
       "Person.timezone", "timezone", "Europe/Istanbul", "2026-09-05T08:00:00Z",
       "Alice works in timezone Europe/Istanbul. Alice saat dilimi Europe/Istanbul.",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-person-employer", atlasPerson, "profile", "atlas-person",
       "Person.employer", "employer", "Acme Robotics", "2026-09-12T08:00:00Z",
       "The person Atlas works at Acme Robotics. Atlas kişisinin işvereni Acme Robotics.",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-stage-ops", atlas, "ops", "atlas-release",
       "Project.releaseStage", "stage", "beta", "2026-09-20T10:00:00Z",
       "Operations reports Project Atlas release stage as beta.",
-    ),
-    observation(
+    ]),
+    observation([
       "atlas-stage-pm", atlas, "pm", "atlas-release",
       "Project.releaseStage", "stage", "production", "2026-09-20T10:00:00Z",
       "Project system reports Project Atlas release stage as production at the same observation time.",
-    ),
+    ]),
   ];
 }
 
@@ -185,27 +200,42 @@ function entities() {
   return result;
 }
 
+function noiseProperty(item: number): "Project.deadline" | "Project.apiStyle" {
+  return item % 2 === 0 ? "Project.deadline" : "Project.apiStyle";
+}
+
+function noiseValue(property: string, item: number): StateValue {
+  if (property.endsWith("deadline")) return `2027-0${(item % 9) + 1}-15`;
+  return item % 3 === 0 ? "GraphQL" : "REST";
+}
+
+function noiseObservation(n: string, entityId: EntityId, item: number): Observation {
+  const property = noiseProperty(item);
+  const provider = item % 3 === 0 ? "chat" : "pm";
+  const externalPath = property.endsWith("deadline") ? "deadline" : "apiStyle";
+  const kind: ContextKind = item % 2 === 0 ? "state" : "event";
+  const day = ((item % 27) + 1).toString().padStart(2, "0");
+  return observation([
+    `noise-${n}-${item}`,
+    entityId,
+    provider,
+    `noise-${n}-${item}`,
+    property,
+    externalPath,
+    noiseValue(property, item),
+    `2026-08-${day}T12:00:00Z`,
+    `Unrelated project ${n} planning record ${item}: deadline API REST GraphQL owner release stage authentication delivery.`,
+    kind,
+  ]);
+}
+
 function noiseObservations(): Observation[] {
   const result: Observation[] = [];
   for (let project = 0; project < 80; project += 1) {
     const n = project.toString().padStart(3, "0");
     const entityId = `entity://project/noise-${n}` as EntityId;
     for (let item = 0; item < 25; item += 1) {
-      const property = item % 2 === 0 ? "Project.deadline" : "Project.apiStyle";
-      result.push(observation(
-        `noise-${n}-${item}`,
-        entityId,
-        item % 3 === 0 ? "chat" : "pm",
-        `noise-${n}-${item}`,
-        property,
-        property.endsWith("deadline") ? "deadline" : "apiStyle",
-        property.endsWith("deadline")
-          ? `2027-0${(item % 9) + 1}-15`
-          : (item % 3 === 0 ? "GraphQL" : "REST"),
-        `2026-08-${((item % 27) + 1).toString().padStart(2, "0")}T12:00:00Z`,
-        `Unrelated project ${n} planning record ${item}: deadline API REST GraphQL owner release stage authentication delivery.`,
-        item % 2 === 0 ? "state" : "event",
-      ));
+      result.push(noiseObservation(n, entityId, item));
     }
   }
   return result;
@@ -294,69 +324,129 @@ function stateText(
   return `${entityId} ${propertyLabel(property)}: ${valueText(value)}. Canonical source=${provider}, observed=${observedAt}.`;
 }
 
+function canonicalKind(property: string): ContextKind {
+  if (property.includes("owner")) return "relationship";
+  if (property.includes("apiStyle")) return "decision";
+  return "state";
+}
+
+function relatedEntityIdsForState(
+  observations: readonly Observation[],
+  property: string,
+  provider: string,
+  externalId: string,
+  value: StateValue,
+): readonly EntityId[] | undefined {
+  return observations.find((candidate) => (
+    candidate.provider === provider
+    && candidate.externalId === externalId
+    && candidate.property === property
+    && candidate.value === value
+  ))?.relatedEntityIds;
+}
+
+function addCanonicalStateRecords(
+  entityId: EntityId,
+  entityObservations: readonly Observation[],
+  properties: ReturnType<typeof planReconciliation>["canonical"]["properties"],
+  evidence: Map<string, EvidenceMeta>,
+  records: ContextRecord[],
+): void {
+  for (const [property, state] of Object.entries(properties)) {
+    const id = `state:${entityId}:${property}`;
+    const relatedEntityIds = relatedEntityIdsForState(
+      entityObservations,
+      property,
+      state.source.provider,
+      state.source.externalId,
+      state.value,
+    );
+    evidence.set(id, {
+      facts: [{ key: factKey(entityId, property), value: state.value }],
+      conflicts: [],
+      observedAt: state.observedAt,
+    });
+    records.push({
+      id,
+      entityId,
+      kind: canonicalKind(property),
+      text: stateText(entityId, property, state.value, state.source.provider, state.observedAt),
+      current: true,
+      importance: 1,
+      ...(relatedEntityIds === undefined ? {} : { relatedEntityIds }),
+    });
+  }
+}
+
+function conflictCandidateText(provider: string, value: StateValue): string {
+  return `${provider}=${valueText(value)}`;
+}
+
+function conflictText(
+  property: string,
+  candidates: readonly { readonly provider: string; readonly value: StateValue }[],
+): string {
+  const candidateText = candidates
+    .map((candidate) => conflictCandidateText(candidate.provider, candidate.value))
+    .join("; ");
+  return `Unresolved conflict for ${propertyLabel(property)} (${property}): ${candidateText}. Do not assert a single value.`;
+}
+
+function addConflictRecords(
+  entityId: EntityId,
+  conflicts: ReturnType<typeof planReconciliation>["conflicts"],
+  evidence: Map<string, EvidenceMeta>,
+  records: ContextRecord[],
+): void {
+  for (const conflict of conflicts) {
+    const id = `conflict:${entityId}:${conflict.property}`;
+    evidence.set(id, {
+      facts: [],
+      conflicts: [factKey(entityId, conflict.property)],
+    });
+    records.push({
+      id,
+      entityId,
+      kind: "state",
+      text: conflictText(conflict.property, conflict.candidates),
+      current: true,
+      importance: 1,
+    });
+  }
+}
+
+function groupByEntity(all: readonly Observation[]): Map<EntityId, Observation[]> {
+  const grouped = new Map<EntityId, Observation[]>();
+  for (const item of latestBySourceProperty(all)) {
+    const list = grouped.get(item.entityId) ?? [];
+    list.push(item);
+    grouped.set(item.entityId, list);
+  }
+  return grouped;
+}
+
 function compileState(
   all: readonly Observation[],
   rulesByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]> | undefined,
 ): EvidenceCorpus {
-  const latest = latestBySourceProperty(all);
-  const byEntity = new Map<EntityId, Observation[]>();
-  for (const observation of latest) {
-    const list = byEntity.get(observation.entityId) ?? [];
-    list.push(observation);
-    byEntity.set(observation.entityId, list);
-  }
-
   const evidence = new Map<string, EvidenceMeta>();
   const records: ContextRecord[] = [];
-  for (const [entityId, entityObservations] of byEntity) {
+  for (const [entityId, entityObservations] of groupByEntity(all)) {
+    const authorityRules = rulesByEntity?.get(entityId) ?? [];
     const plan = planReconciliation({
       entityId,
       snapshots: entityObservations.map(observationSnapshot),
-      ...(rulesByEntity === undefined ? {} : { authority: rulesByEntity.get(entityId) ?? [] }),
+      ...(rulesByEntity === undefined ? {} : { authority: authorityRules }),
     });
-
-    for (const [property, state] of Object.entries(plan.canonical.properties)) {
-      const id = `state:${entityId}:${property}`;
-      const sourceObservation = entityObservations.find(
-        (candidate) => candidate.provider === state.source.provider
-          && candidate.externalId === state.source.externalId
-          && candidate.property === property
-          && candidate.value === state.value,
-      );
-      const related = sourceObservation?.relatedEntityIds;
-      evidence.set(id, {
-        facts: [{ key: factKey(entityId, property), value: state.value }],
-        conflicts: [],
-        observedAt: state.observedAt,
-      });
-      records.push({
-        id,
-        entityId,
-        kind: property.includes("owner") ? "relationship" : property.includes("apiStyle") ? "decision" : "state",
-        text: stateText(entityId, property, state.value, state.source.provider, state.observedAt),
-        current: true,
-        importance: 1,
-        ...(related === undefined ? {} : { relatedEntityIds: related }),
-      });
-    }
-
-    for (const conflict of plan.conflicts) {
-      const id = `conflict:${entityId}:${conflict.property}`;
-      evidence.set(id, {
-        facts: [],
-        conflicts: [factKey(entityId, conflict.property)],
-      });
-      records.push({
-        id,
-        entityId,
-        kind: "state",
-        text: `Unresolved conflict for ${propertyLabel(conflict.property)} (${conflict.property}): ${conflict.candidates.map((candidate) => `${candidate.provider}=${valueText(candidate.value)}`).join("; ")}. Do not assert a single value.`,
-        current: true,
-        importance: 1,
-      });
-    }
+    addCanonicalStateRecords(
+      entityId,
+      entityObservations,
+      plan.canonical.properties,
+      evidence,
+      records,
+    );
+    addConflictRecords(entityId, plan.conflicts, evidence, records);
   }
-
   return { corpus: { entities: entities(), records }, evidence };
 }
 
@@ -387,7 +477,7 @@ function asOfRawBm25(
   raw: EvidenceCorpus,
   task: BenchmarkTask,
 ): ContextPackage {
-  const date = task.query.match(/\b20\d{2}-\d{2}-\d{2}\b/)?.[0];
+  const date = /\b20\d{2}-\d{2}-\d{2}\b/.exec(task.query)?.[0];
   if (date === undefined) return resolvedEntityBm25(raw, task);
   const cutoff = Date.parse(`${date}T23:59:59Z`);
   const records = raw.corpus.records.filter((record) => {
