@@ -216,6 +216,13 @@ const legacyCorpus: ContextCorpus = {
   ],
 };
 
+const legacyIndex = new ContextIndex(legacyCorpus);
+
+function legacyResolutionStatus(directEntityIds: readonly string[]): string {
+  if (directEntityIds.length === 0) return "none";
+  return directEntityIds.length > 1 ? "multiple" : "resolved";
+}
+
 function recordCost(record: ContextRecord): number {
   return estimateTokens(record.text) + 8;
 }
@@ -236,8 +243,7 @@ function selectBudget(
 }
 
 function legacyExpandedEntityIds(query: string): string[] {
-  const index = new ContextIndex(legacyCorpus);
-  const direct = index.resolveEntities(query);
+  const direct = legacyIndex.resolveEntities(query);
   const expanded = new Set(direct);
   for (const record of legacyCorpus.records) {
     if (!expanded.has(record.entityId)) continue;
@@ -247,23 +253,24 @@ function legacyExpandedEntityIds(query: string): string[] {
 }
 
 function legacyContextIndex(request: TemporalContextRequest): BenchResult {
-  const result = new ContextIndex(legacyCorpus).compile(request);
+  const result = legacyIndex.compile(request);
   return {
     ...result,
-    resolutionStatus: result.resolvedEntityIds.length > 1 ? "multiple" : "resolved",
+    resolutionStatus: legacyResolutionStatus(result.resolvedEntityIds),
     candidateEdges: 0,
     traversedEdges: 0,
   };
 }
 
 function legacyGraphBm25(request: TemporalContextRequest): BenchResult {
+  const direct = legacyIndex.resolveEntities(request.query);
   const expanded = legacyExpandedEntityIds(request.query);
   const result = bm25Baseline(legacyCorpus, request, expanded);
   return {
     ...result,
-    resolutionStatus: expanded.length === 0 ? "none" : (new ContextIndex(legacyCorpus).resolveEntities(request.query).length > 1 ? "multiple" : "resolved"),
+    resolutionStatus: legacyResolutionStatus(direct),
     candidateEdges: 0,
-    traversedEdges: Math.max(0, expanded.length - new ContextIndex(legacyCorpus).resolveEntities(request.query).length),
+    traversedEdges: Math.max(0, expanded.length - direct.length),
   };
 }
 
@@ -399,7 +406,7 @@ function evaluate(method: string, task: BenchmarkTask, result: BenchResult) {
     consideredRecords: result.consideredRecords,
     candidateEdges: result.candidateEdges,
     traversedEdges: result.traversedEdges,
-    returnedEvidence: [...evidence].sort(),
+    returnedEvidence: [...evidence].sort((left, right) => left.localeCompare(right)),
     returnedIds: result.records.map((record) => record.id),
   };
 }

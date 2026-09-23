@@ -129,13 +129,12 @@ function candidateFor(
     score: strongestAlias + typeCueScore,
     matchedAliases,
     matchedTypeCues,
-    evidenceRefs: [...new Set(evidenceRefs)].sort(),
+    evidenceRefs: [...new Set(evidenceRefs)].sort((left, right) => left.localeCompare(right)),
   };
 }
 
-function validateIdentitySchema(
+function validateEntityTypes(
   types: readonly EntityTypeDescriptor[],
-  entities: readonly TypedEntity[],
 ): ReadonlyMap<string, EntityTypeDescriptor> {
   const typeMap = new Map<string, EntityTypeDescriptor>();
   for (const type of types) {
@@ -143,7 +142,24 @@ function validateIdentitySchema(
     if (typeMap.has(type.id)) throw new Error(`Duplicate entity type id: ${type.id}`);
     typeMap.set(type.id, type);
   }
+  return typeMap;
+}
 
+function validateEntityAliases(entity: TypedEntity): void {
+  if (entity.aliases.length === 0) {
+    throw new Error(`Entity ${entity.id} must have at least one alias`);
+  }
+  for (const alias of entity.aliases) {
+    if (normalize(alias.value).length === 0) {
+      throw new Error(`Entity ${entity.id} contains an empty alias`);
+    }
+  }
+}
+
+function validateEntities(
+  entities: readonly TypedEntity[],
+  typeMap: ReadonlyMap<string, EntityTypeDescriptor>,
+): void {
   const entityIds = new Set<EntityId>();
   for (const entity of entities) {
     if (entityIds.has(entity.id)) throw new Error(`Duplicate entity id: ${entity.id}`);
@@ -151,13 +167,16 @@ function validateIdentitySchema(
     if (!typeMap.has(entity.type)) {
       throw new Error(`Entity ${entity.id} references unknown type ${entity.type}`);
     }
-    if (entity.aliases.length === 0) throw new Error(`Entity ${entity.id} must have at least one alias`);
-    for (const alias of entity.aliases) {
-      if (normalize(alias.value).length === 0) {
-        throw new Error(`Entity ${entity.id} contains an empty alias`);
-      }
-    }
+    validateEntityAliases(entity);
   }
+}
+
+function validateIdentitySchema(
+  types: readonly EntityTypeDescriptor[],
+  entities: readonly TypedEntity[],
+): ReadonlyMap<string, EntityTypeDescriptor> {
+  const typeMap = validateEntityTypes(types);
+  validateEntities(entities, typeMap);
   return typeMap;
 }
 
