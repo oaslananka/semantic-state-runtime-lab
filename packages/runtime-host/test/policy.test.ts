@@ -319,6 +319,26 @@ describe("RuntimeHost access policy", () => {
     expect(serialized).not.toContain("state:write");
   });
 
+  it("authorizes before catalog lookup so denied callers cannot probe entity existence", async () => {
+    const state = providers(
+      { deadline: "2026-11-20" },
+      { deadline: "2026-11-15" },
+    );
+    const denyAll: RuntimeAccessPolicy = {
+      evaluate: () => ({ effect: "deny", code: "not-allowed" }),
+    };
+    const host = new RuntimeHost({
+      catalog: new InMemoryEntityRuntimeCatalog([]),
+      registry: registry(state.primary, state.replica),
+      accessPolicy: denyAll,
+    });
+
+    await expect(host.plan(entityId, alice)).rejects.toMatchObject({
+      name: "RuntimeAccessDeniedError",
+      code: "not-allowed",
+    } satisfies Partial<RuntimeAccessDeniedError>);
+  });
+
   it("denies requests by default when a policy has no matching rule", async () => {
     const state = providers(
       { deadline: "2026-11-20" },
