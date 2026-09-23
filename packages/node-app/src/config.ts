@@ -1,6 +1,9 @@
 import { readFile, stat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import type { ConnectorManifest } from "@ssrl/connector-sdk";
+import {
+  validateConnectorManifest,
+  type ConnectorManifest,
+} from "@ssrl/connector-sdk";
 import type { EntityId } from "@ssrl/core";
 import * as z from "zod/v4";
 
@@ -190,6 +193,13 @@ function semanticIssues(config: ParsedConfig): string[] {
     providers.set(provider.id, provider);
     if (provider.manifest.id !== provider.id) {
       issues.push(`provider ${provider.id}: manifest.id must match provider id`);
+    }
+    try {
+      validateConnectorManifest(provider.manifest as ConnectorManifest);
+    } catch (error) {
+      issues.push(
+        `provider ${provider.id}: ${error instanceof Error ? error.message : "invalid connector manifest"}`,
+      );
     }
   }
 
