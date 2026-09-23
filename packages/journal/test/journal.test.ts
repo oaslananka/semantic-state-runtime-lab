@@ -64,6 +64,29 @@ describe("runtime journal contract", () => {
     expect(canonicalEventJson(left)).toBe(canonicalEventJson(right));
   });
 
+  it("rejects non-finite values instead of silently serializing them as null", () => {
+    const unsafe: RuntimeJournalEvent = {
+      schemaVersion: 1,
+      eventId: "unsafe",
+      runId: "run-1",
+      entityId,
+      type: "mutation.requested",
+      occurredAt: "2026-09-23T21:30:01Z",
+      payload: {
+        mutationId: "mutation-unsafe",
+        mutation: {
+          provider: "replica",
+          externalId: "atlas",
+          externalPath: "score",
+          canonicalProperty: "Project.score",
+          nextValue: Number.NaN,
+        },
+      },
+    };
+
+    expect(() => canonicalEventJson(unsafe)).toThrow(TypeError);
+  });
+
   it("detects requested mutations without an applied or failed terminal event", () => {
     const requested: RuntimeJournalEvent = {
       schemaVersion: 1,
