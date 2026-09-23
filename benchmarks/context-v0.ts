@@ -137,9 +137,11 @@ const tasks: BenchmarkTask[] = [
 const rows = [];
 for (const task of tasks) {
   const request = { query: task.query, budgetTokens: task.budgetTokens };
-  rows.push(evaluate("raw", rawContext(corpus), task));
-  rows.push(evaluate("lexical", lexicalBaseline(corpus, request), task));
-  rows.push(evaluate("compiled-v0", index.compile(request), task));
+  rows.push(
+    evaluate("raw", rawContext(corpus), task),
+    evaluate("lexical", lexicalBaseline(corpus, request), task),
+    evaluate("compiled-v0", index.compile(request), task),
+  );
 }
 
 console.log(JSON.stringify({

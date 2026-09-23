@@ -112,7 +112,7 @@ export class ContextIndex {
         resolved.add(entry.entityId);
       }
     }
-    return [...resolved].sort();
+    return [...resolved].sort((a, b) => a.localeCompare(b));
   }
 
   compile(request: ContextRequest): ContextPackage {
