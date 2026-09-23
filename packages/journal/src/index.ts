@@ -1,8 +1,9 @@
-import type {
-  EntityId,
-  ExternalSnapshot,
-  Mutation,
-  ReconciliationPlan,
+import {
+  canonicalJson,
+  type EntityId,
+  type ExternalSnapshot,
+  type Mutation,
+  type ReconciliationPlan,
 } from "@ssrl/core";
 
 export const JOURNAL_EVENT_SCHEMA_VERSION = 1 as const;
@@ -12,7 +13,8 @@ export type ReconciliationOutcome =
   | "blocked"
   | "noop"
   | "converged"
-  | "not-converged";
+  | "not-converged"
+  | "drifted";
 
 export interface JournalErrorSummary {
   readonly name: string;
@@ -126,45 +128,8 @@ export interface RuntimeEventJournal extends RuntimeEventSink {
   eventsForEntity(entityId: EntityId): Promise<readonly RuntimeJournalEvent[]>;
 }
 
-function canonicalize(value: unknown): unknown {
-  if (
-    value === null
-    || typeof value === "string"
-    || typeof value === "boolean"
-  ) {
-    return value;
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new TypeError("Journal events cannot contain non-finite numbers");
-    }
-    return value;
-  }
-  if (Array.isArray(value)) {
-    return value.map((child) => {
-      if (child === undefined) {
-        throw new TypeError("Journal event arrays cannot contain undefined");
-      }
-      return canonicalize(child);
-    });
-  }
-  if (typeof value === "object") {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      throw new TypeError("Journal events can contain only plain JSON objects");
-    }
-    return Object.fromEntries(
-      Object.entries(value)
-        .filter(([, child]) => child !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, child]) => [key, canonicalize(child)]),
-    );
-  }
-  throw new TypeError(`Journal events cannot contain ${typeof value}`);
-}
-
 export function canonicalEventJson(event: RuntimeJournalEvent): string {
-  return JSON.stringify(canonicalize(event));
+  return canonicalJson(event);
 }
 
 export class JournalEventCollisionError extends Error {
