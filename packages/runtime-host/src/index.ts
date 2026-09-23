@@ -53,7 +53,9 @@ export type RuntimeAccessRequest =
   };
 
 export interface RuntimeAccessPolicy {
-  evaluate(request: RuntimeAccessRequest): RuntimeAccessDecision | Promise<RuntimeAccessDecision>;
+  evaluate(
+    request: RuntimeAccessRequest,
+  ): RuntimeAccessDecision | undefined | Promise<RuntimeAccessDecision | undefined>;
 }
 
 export class RuntimeAccessDeniedError extends Error {
@@ -184,7 +186,8 @@ export class RuntimeHost {
 
   async #decision(request: RuntimeAccessRequest): Promise<RuntimeAccessDecision> {
     if (this.#accessPolicy === undefined) return { effect: "allow" };
-    return this.#accessPolicy.evaluate(request);
+    return await this.#accessPolicy.evaluate(request)
+      ?? { effect: "deny", code: "no-matching-policy-rule" };
   }
 
   async #authorizeOperation(
@@ -234,7 +237,7 @@ export class RuntimeHost {
     binding: ExternalBinding,
     principal: RuntimePrincipal | undefined,
   ): Promise<ExternalBinding> {
-    const fields = [];
+    const fields: ExternalBinding["fields"][number][] = [];
     for (const field of binding.fields) {
       const readable = field.readable
         && await this.#fieldAllowed(
@@ -263,7 +266,7 @@ export class RuntimeHost {
   ): Promise<EntityRuntimeDefinition> {
     if (this.#accessPolicy === undefined) return definition;
 
-    const bindings = [];
+    const bindings: ExternalBinding[] = [];
     for (const binding of definition.bindings) {
       bindings.push(await this.#projectBinding(
         definition.entityId,
