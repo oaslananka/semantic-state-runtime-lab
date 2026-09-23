@@ -112,6 +112,50 @@ function assertMappingDocument(
   return document;
 }
 
+function preferredLineEnding(source: string): "\n" | "\r\n" {
+  return source.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function frontmatterlessParts(
+  externalId: string,
+  bom: string,
+  source: string,
+  eol: "\n" | "\r\n",
+): MarkdownParts {
+  return {
+    bom,
+    document: assertMappingDocument(externalId, parseDocument("")),
+    body: source,
+    eol,
+    closingMarker: "---",
+    closingEol: eol,
+  };
+}
+
+interface ClosingDelimiter {
+  readonly index: number;
+  readonly lineEnd: number;
+  readonly marker: "---" | "...";
+  readonly eol: "" | "\n" | "\r\n";
+}
+
+function findClosingDelimiter(source: string, start: number): ClosingDelimiter | undefined {
+  let cursor = start;
+  while (cursor <= source.length) {
+    const nextNewline = source.indexOf("\n", cursor);
+    const lineEnd = nextNewline < 0 ? source.length : nextNewline + 1;
+    const rawLine = source.slice(cursor, lineEnd);
+    const marker = stripLineEnding(rawLine).trimEnd();
+
+    if (marker === "---" || marker === "...") {
+      return { index: cursor, lineEnd, marker, eol: lineEnding(rawLine) };
+    }
+    if (nextNewline < 0) return undefined;
+    cursor = nextNewline + 1;
+  }
+  return undefined;
+}
+
 function splitMarkdown(externalId: string, content: string): MarkdownParts {
   const bom = content.startsWith("\uFEFF") ? "\uFEFF" : "";
   const source = content.slice(bom.length);
@@ -121,61 +165,36 @@ function splitMarkdown(externalId: string, content: string): MarkdownParts {
     if (source.trimEnd() === "---") {
       throw new InvalidMarkdownFrontmatterError(externalId, "opening delimiter has no closing delimiter");
     }
-    return {
-      bom,
-      document: assertMappingDocument(externalId, parseDocument("")),
-      body: source,
-      eol: "\n",
-      closingMarker: "---",
-      closingEol: "\n",
-    };
+    return frontmatterlessParts(externalId, bom, source, "\n");
   }
 
   const firstLine = source.slice(0, firstNewline + 1);
   if (stripLineEnding(firstLine).trimEnd() !== "---") {
-    return {
-      bom,
-      document: assertMappingDocument(externalId, parseDocument("")),
-      body: source,
-      eol: source.includes("\r\n") ? "\r\n" : "\n",
-      closingMarker: "---",
-      closingEol: source.includes("\r\n") ? "\r\n" : "\n",
-    };
+    return frontmatterlessParts(externalId, bom, source, preferredLineEnding(source));
   }
 
   const eol = lineEnding(firstLine) === "\r\n" ? "\r\n" : "\n";
-  let cursor = firstNewline + 1;
-
-  while (cursor <= source.length) {
-    const nextNewline = source.indexOf("\n", cursor);
-    const lineEnd = nextNewline < 0 ? source.length : nextNewline + 1;
-    const rawLine = source.slice(cursor, lineEnd);
-    const marker = stripLineEnding(rawLine).trimEnd();
-
-    if (marker === "---" || marker === "...") {
-      const frontmatter = source.slice(firstNewline + 1, cursor);
-      return {
-        bom,
-        document: assertMappingDocument(externalId, parseDocument(frontmatter)),
-        body: source.slice(lineEnd),
-        eol,
-        closingMarker: marker,
-        closingEol: lineEnding(rawLine),
-      };
-    }
-
-    if (nextNewline < 0) break;
-    cursor = nextNewline + 1;
+  const closing = findClosingDelimiter(source, firstNewline + 1);
+  if (closing === undefined) {
+    throw new InvalidMarkdownFrontmatterError(externalId, "opening delimiter has no closing delimiter");
   }
 
-  throw new InvalidMarkdownFrontmatterError(externalId, "opening delimiter has no closing delimiter");
+  const frontmatter = source.slice(firstNewline + 1, closing.index);
+  return {
+    bom,
+    document: assertMappingDocument(externalId, parseDocument(frontmatter)),
+    body: source.slice(closing.lineEnd),
+    eol,
+    closingMarker: closing.marker,
+    closingEol: closing.eol,
+  };
 }
 
 function stringifyMarkdown(parts: MarkdownParts): string {
   const yaml = parts.document
     .toString({ lineWidth: 0 })
     .replace(/\n$/, "")
-    .replace(/\n/g, parts.eol);
+    .replaceAll("\n", parts.eol);
 
   return [
     parts.bom,
@@ -200,7 +219,7 @@ function externalPathSegments(path: string): string[] {
       if (/~(?:[^01]|$)/.test(segment)) {
         throw new Error(`Invalid JSON Pointer escape in external path: ${path}`);
       }
-      return segment.replace(/~1/g, "/").replace(/~0/g, "~");
+      return segment.replaceAll("~1", "/").replaceAll("~0", "~");
     });
 }
 
@@ -225,7 +244,7 @@ function toStateValue(value: unknown): StateValue | undefined {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
     if (!Number.isFinite(value)) {
-      throw new Error("Frontmatter contains a non-finite number");
+      throw new TypeError("Frontmatter contains a non-finite number");
     }
     return value;
   }
