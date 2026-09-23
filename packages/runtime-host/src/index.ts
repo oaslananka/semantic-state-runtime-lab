@@ -17,6 +17,58 @@ import {
 export type ProposalDigest = `sha256:${string}`;
 export type ProposalStatus = "ready" | "blocked" | "noop";
 
+export interface RuntimePrincipal {
+  readonly subject: string;
+  readonly scopes: readonly string[];
+}
+
+export type RuntimeAccessDecision =
+  | { readonly effect: "allow" }
+  | { readonly effect: "deny"; readonly code: string };
+
+export type RuntimeAccessRequest =
+  | {
+    readonly kind: "operation";
+    readonly operation: "plan" | "apply";
+    readonly principal: RuntimePrincipal;
+    readonly entityId: EntityId;
+    readonly expectedDigest?: ProposalDigest;
+  }
+  | {
+    readonly kind: "field";
+    readonly operation: "read" | "write";
+    readonly principal: RuntimePrincipal;
+    readonly entityId: EntityId;
+    readonly canonicalProperty: string;
+    readonly provider: string;
+    readonly externalId: string;
+  }
+  | {
+    readonly kind: "proposal";
+    readonly operation: "apply";
+    readonly principal: RuntimePrincipal;
+    readonly entityId: EntityId;
+    readonly digest: ProposalDigest;
+    readonly plan: ReconciliationPlan;
+  };
+
+export interface RuntimeAccessPolicy {
+  evaluate(
+    request: RuntimeAccessRequest,
+  ): RuntimeAccessDecision | undefined | Promise<RuntimeAccessDecision | undefined>;
+}
+
+export class RuntimeAccessDeniedError extends Error {
+  constructor(
+    readonly code: string,
+    readonly requestKind: RuntimeAccessRequest["kind"],
+    readonly operation: RuntimeAccessRequest["operation"],
+  ) {
+    super(`Runtime access denied: ${code}`);
+    this.name = "RuntimeAccessDeniedError";
+  }
+}
+
 export interface EntityRuntimeDefinition {
   readonly entityId: EntityId;
   readonly bindings: readonly ExternalBinding[];
@@ -97,6 +149,7 @@ export interface RuntimeHostOptions {
   readonly registry: ProviderRegistry;
   readonly journal?: RuntimeEventSink;
   readonly now?: () => string;
+  readonly accessPolicy?: RuntimeAccessPolicy;
 }
 
 export class RuntimeHost {
@@ -104,12 +157,14 @@ export class RuntimeHost {
   readonly #registry: ProviderRegistry;
   readonly #journal: RuntimeEventSink | undefined;
   readonly #now: (() => string) | undefined;
+  readonly #accessPolicy: RuntimeAccessPolicy | undefined;
 
   constructor(options: RuntimeHostOptions) {
     this.#catalog = options.catalog;
     this.#registry = options.registry;
     this.#journal = options.journal;
     this.#now = options.now;
+    this.#accessPolicy = options.accessPolicy;
   }
 
   async #definition(entityId: EntityId): Promise<EntityRuntimeDefinition> {
@@ -120,8 +175,143 @@ export class RuntimeHost {
     return definition;
   }
 
-  async plan(entityId: EntityId): Promise<ReconciliationProposal> {
-    const definition = await this.#definition(entityId);
+  #principalOrDeny(
+    principal: RuntimePrincipal | undefined,
+    kind: RuntimeAccessRequest["kind"],
+    operation: RuntimeAccessRequest["operation"],
+  ): RuntimePrincipal {
+    if (principal !== undefined) return principal;
+    throw new RuntimeAccessDeniedError("principal-required", kind, operation);
+  }
+
+  async #decision(request: RuntimeAccessRequest): Promise<RuntimeAccessDecision> {
+    if (this.#accessPolicy === undefined) return { effect: "allow" };
+    return await this.#accessPolicy.evaluate(request)
+      ?? { effect: "deny", code: "no-matching-policy-rule" };
+  }
+
+  async #authorizeOperation(
+    operation: "plan" | "apply",
+    entityId: EntityId,
+    principal: RuntimePrincipal | undefined,
+    expectedDigest?: ProposalDigest,
+  ): Promise<void> {
+    if (this.#accessPolicy === undefined) return;
+    const actor = this.#principalOrDeny(principal, "operation", operation);
+    const request: RuntimeAccessRequest = {
+      kind: "operation",
+      operation,
+      principal: actor,
+      entityId,
+      ...(expectedDigest === undefined ? {} : { expectedDigest }),
+    };
+    const decision = await this.#decision(request);
+    if (decision.effect === "deny") {
+      throw new RuntimeAccessDeniedError(decision.code, request.kind, request.operation);
+    }
+  }
+
+  async #fieldAllowed(
+    operation: "read" | "write",
+    entityId: EntityId,
+    binding: ExternalBinding,
+    canonicalProperty: string,
+    principal: RuntimePrincipal | undefined,
+  ): Promise<boolean> {
+    if (this.#accessPolicy === undefined) return true;
+    const actor = this.#principalOrDeny(principal, "field", operation);
+    const decision = await this.#decision({
+      kind: "field",
+      operation,
+      principal: actor,
+      entityId,
+      canonicalProperty,
+      provider: binding.provider,
+      externalId: binding.externalId,
+    });
+    return decision.effect === "allow";
+  }
+
+  async #projectBinding(
+    entityId: EntityId,
+    binding: ExternalBinding,
+    principal: RuntimePrincipal | undefined,
+  ): Promise<ExternalBinding> {
+    const fields: ExternalBinding["fields"][number][] = [];
+    for (const field of binding.fields) {
+      const readable = field.readable
+        && await this.#fieldAllowed(
+          "read",
+          entityId,
+          binding,
+          field.canonical,
+          principal,
+        );
+      const writable = field.writable
+        && await this.#fieldAllowed(
+          "write",
+          entityId,
+          binding,
+          field.canonical,
+          principal,
+        );
+      fields.push({ ...field, readable, writable });
+    }
+    return { ...binding, fields };
+  }
+
+  async #projectDefinition(
+    definition: EntityRuntimeDefinition,
+    principal: RuntimePrincipal | undefined,
+  ): Promise<EntityRuntimeDefinition> {
+    if (this.#accessPolicy === undefined) return definition;
+
+    const bindings: ExternalBinding[] = [];
+    for (const binding of definition.bindings) {
+      bindings.push(await this.#projectBinding(
+        definition.entityId,
+        binding,
+        principal,
+      ));
+    }
+
+    return {
+      ...definition,
+      bindings,
+    };
+  }
+
+  async #authorizeProposal(
+    entityId: EntityId,
+    plan: ReconciliationPlan,
+    digest: ProposalDigest,
+    principal: RuntimePrincipal | undefined,
+  ): Promise<void> {
+    if (this.#accessPolicy === undefined) return;
+    const actor = this.#principalOrDeny(principal, "proposal", "apply");
+    const request: RuntimeAccessRequest = {
+      kind: "proposal",
+      operation: "apply",
+      principal: actor,
+      entityId,
+      digest,
+      plan,
+    };
+    const decision = await this.#decision(request);
+    if (decision.effect === "deny") {
+      throw new RuntimeAccessDeniedError(decision.code, request.kind, request.operation);
+    }
+  }
+
+  async plan(
+    entityId: EntityId,
+    principal?: RuntimePrincipal,
+  ): Promise<ReconciliationProposal> {
+    await this.#authorizeOperation("plan", entityId, principal);
+    const definition = await this.#projectDefinition(
+      await this.#definition(entityId),
+      principal,
+    );
     const result = await reconcileOnce({
       entityId,
       bindings: definition.bindings,
@@ -130,6 +320,7 @@ export class RuntimeHost {
       ...(definition.authority === undefined ? {} : { authority: definition.authority }),
       ...(this.#journal === undefined ? {} : { journal: this.#journal }),
       ...(this.#now === undefined ? {} : { now: this.#now }),
+      ...(principal === undefined ? {} : { actorSubject: principal.subject }),
     });
     const digest = sha256ProposalDigest(result.before);
 
@@ -145,9 +336,15 @@ export class RuntimeHost {
   async apply(
     entityId: EntityId,
     expectedDigest: string,
+    principal?: RuntimePrincipal,
   ): Promise<ReconcileResult> {
     assertProposalDigest(expectedDigest);
-    const definition = await this.#definition(entityId);
+    await this.#authorizeOperation("apply", entityId, principal, expectedDigest);
+    const definition = await this.#projectDefinition(
+      await this.#definition(entityId),
+      principal,
+    );
+
     const result = await reconcileOnce({
       entityId,
       bindings: definition.bindings,
@@ -155,9 +352,14 @@ export class RuntimeHost {
       ...(definition.authority === undefined ? {} : { authority: definition.authority }),
       ...(this.#journal === undefined ? {} : { journal: this.#journal }),
       ...(this.#now === undefined ? {} : { now: this.#now }),
+      ...(principal === undefined ? {} : { actorSubject: principal.subject }),
       planGuard: {
         expectedDigest,
-        digest: sha256ProposalDigest,
+        digest: async (plan) => {
+          const digest = sha256ProposalDigest(plan);
+          await this.#authorizeProposal(entityId, plan, digest, principal);
+          return digest;
+        },
       },
     });
 

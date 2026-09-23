@@ -20,6 +20,10 @@ export interface JournalErrorSummary {
   readonly name: string;
 }
 
+export interface JournalActor {
+  readonly subject: string;
+}
+
 interface EventEnvelope<Type extends string, Payload> {
   readonly schemaVersion: typeof JOURNAL_EVENT_SCHEMA_VERSION;
   readonly eventId: string;
@@ -27,6 +31,7 @@ interface EventEnvelope<Type extends string, Payload> {
   readonly entityId: EntityId;
   readonly type: Type;
   readonly occurredAt: string;
+  readonly actor?: JournalActor;
   readonly payload: Payload;
 }
 
@@ -128,7 +133,23 @@ export interface RuntimeEventJournal extends RuntimeEventSink {
   eventsForEntity(entityId: EntityId): Promise<readonly RuntimeJournalEvent[]>;
 }
 
+function assertJournalActor(event: RuntimeJournalEvent): void {
+  const actor = (event as { readonly actor?: unknown }).actor;
+  if (actor === undefined) return;
+  if (
+    actor === null
+    || typeof actor !== "object"
+    || Array.isArray(actor)
+    || typeof (actor as { readonly subject?: unknown }).subject !== "string"
+    || (actor as { readonly subject: string }).subject.length === 0
+    || Object.keys(actor).some((key) => key !== "subject")
+  ) {
+    throw new TypeError("Journal actor must contain only a non-empty subject");
+  }
+}
+
 export function canonicalEventJson(event: RuntimeJournalEvent): string {
+  assertJournalActor(event);
   return canonicalJson(event);
 }
 

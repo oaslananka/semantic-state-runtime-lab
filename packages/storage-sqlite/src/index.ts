@@ -45,6 +45,14 @@ function parseEvent(value: string): RuntimeJournalEvent {
   }
 
   const event = parsed as Partial<RuntimeJournalEvent>;
+  const actor = (parsed as { readonly actor?: unknown }).actor;
+  const actorIsInvalid = actor !== undefined && (
+    actor === null
+    || typeof actor !== "object"
+    || Array.isArray(actor)
+    || typeof (actor as { readonly subject?: unknown }).subject !== "string"
+    || Object.keys(actor).some((key) => key !== "subject")
+  );
   if (
     event.schemaVersion !== JOURNAL_EVENT_SCHEMA_VERSION
     || typeof event.eventId !== "string"
@@ -52,6 +60,7 @@ function parseEvent(value: string): RuntimeJournalEvent {
     || typeof event.entityId !== "string"
     || !isRuntimeJournalEventType(event.type)
     || typeof event.occurredAt !== "string"
+    || actorIsInvalid
     || event.payload === undefined
   ) {
     throw new CorruptJournalEventError("Journal event envelope is invalid");

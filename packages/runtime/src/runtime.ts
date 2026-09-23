@@ -64,12 +64,34 @@ function providerFor(registry: ProviderRegistry, providerId: ProviderId): StateP
   return provider;
 }
 
+function sanitizeSnapshot(
+  requestedBinding: ExternalBinding,
+  snapshot: ExternalSnapshot,
+): ExternalSnapshot {
+  const values: Record<string, ExternalSnapshot["values"][string]> = {};
+  for (const field of requestedBinding.fields) {
+    if (!field.readable) continue;
+    const value = snapshot.values[field.external];
+    if (value !== undefined) values[field.external] = value;
+  }
+
+  return {
+    binding: requestedBinding,
+    ...(snapshot.revision === undefined ? {} : { revision: snapshot.revision }),
+    observedAt: snapshot.observedAt,
+    values,
+  };
+}
+
 export async function observeBindings(
   bindings: readonly ExternalBinding[],
   registry: ProviderRegistry,
 ): Promise<ExternalSnapshot[]> {
   return Promise.all(
-    bindings.map((binding) => providerFor(registry, binding.provider).observe(binding)),
+    bindings.map(async (binding) => {
+      const snapshot = await providerFor(registry, binding.provider).observe(binding);
+      return sanitizeSnapshot(binding, snapshot);
+    }),
   );
 }
 
@@ -145,6 +167,7 @@ interface JournalContext {
   readonly runId: string;
   readonly entityId: EntityId;
   readonly now: () => string;
+  readonly actorSubject?: string;
 }
 
 function journalEvent<Type extends RuntimeJournalEventType>(
@@ -159,6 +182,9 @@ function journalEvent<Type extends RuntimeJournalEventType>(
     entityId: context.entityId,
     type,
     occurredAt: context.now(),
+    ...(context.actorSubject === undefined
+      ? {}
+      : { actor: { subject: context.actorSubject } }),
     payload,
   } as EventOf<Type>;
 }
@@ -237,6 +263,7 @@ export interface ReconcileInput {
   readonly journal?: RuntimeEventSink;
   readonly now?: () => string;
   readonly planGuard?: ReconciliationPlanGuard;
+  readonly actorSubject?: string;
 }
 
 export interface ReconcileResult {
@@ -263,6 +290,7 @@ export async function reconcileOnce(input: ReconcileInput): Promise<ReconcileRes
       runId: input.journal.createId(),
       entityId: input.entityId,
       now: input.now ?? (() => new Date().toISOString()),
+      ...(input.actorSubject === undefined ? {} : { actorSubject: input.actorSubject }),
     } satisfies JournalContext;
 
   await appendEvent(context, "reconciliation.started", {

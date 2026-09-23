@@ -1,18 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type {
-  AuthorityRule,
-  ExternalBinding,
-  ReconciliationPlan,
-  StateValue,
-} from "@ssrl/core";
+import type { ReconciliationPlan } from "@ssrl/core";
+import { InMemoryEventJournal } from "@ssrl/journal";
 import {
-  InMemoryEventJournal,
-} from "@ssrl/journal";
-import {
-  InMemoryStateProvider,
   ReconciliationBlockedError,
   ReconciliationPlanDriftError,
-  type StateProvider,
 } from "@ssrl/runtime";
 import {
   EntityNotConfiguredError,
@@ -20,71 +11,18 @@ import {
   RuntimeHost,
   sha256ProposalDigest,
 } from "../src/index.js";
-
-const entityId = "entity://project/atlas" as const;
-
-function binding(provider: string, writable: boolean): ExternalBinding {
-  return {
-    entityId,
-    provider,
-    externalId: `${provider}-atlas`,
-    fields: [{
-      canonical: "Project.deadline",
-      external: "deadline",
-      readable: true,
-      writable,
-    }],
-  };
-}
-
-function authority(provider = "primary"): readonly AuthorityRule[] {
-  return [{
-    property: "Project.deadline",
-    strategy: { kind: "provider", provider },
-  }];
-}
-
-function catalog(
-  authorityRules: readonly AuthorityRule[] | null = authority(),
-): InMemoryEntityRuntimeCatalog {
-  return new InMemoryEntityRuntimeCatalog([{
-    entityId,
-    bindings: [
-      binding("primary", false),
-      binding("replica", true),
-    ],
-    ...(authorityRules === null ? {} : { authority: authorityRules }),
-  }]);
-}
-
-function providers(
-  now: () => string,
-  primaryValue: StateValue = "2026-11-20",
-  replicaValue: StateValue = "2026-11-15",
-) {
-  const primary = new InMemoryStateProvider(
-    "primary",
-    [{ externalId: "primary-atlas", values: { deadline: primaryValue } }],
-    now,
-  );
-  const replica = new InMemoryStateProvider(
-    "replica",
-    [{ externalId: "replica-atlas", values: { deadline: replicaValue } }],
-    now,
-  );
-  return { primary, replica };
-}
-
-function registry(...items: StateProvider[]) {
-  return {
-    providers: new Map(items.map((provider) => [provider.id, provider])),
-  };
-}
+import {
+  catalog,
+  countingProvider,
+  entityId,
+  providers,
+  registry,
+} from "./fixtures.js";
 
 describe("RuntimeHost", () => {
   it("plans then applies an unchanged proposal and converges", async () => {
     let observedAt = "2026-09-24T00:00:00Z";
-    const state = providers(() => observedAt);
+    const state = providers({ now: () => observedAt });
     const host = new RuntimeHost({
       catalog: catalog(),
       registry: registry(state.primary, state.replica),
@@ -103,7 +41,7 @@ describe("RuntimeHost", () => {
 
   it("does not change the proposal digest when only observedAt changes", async () => {
     let observedAt = "2026-09-24T00:00:00Z";
-    const state = providers(() => observedAt);
+    const state = providers({ now: () => observedAt });
     const host = new RuntimeHost({
       catalog: catalog(),
       registry: registry(state.primary, state.replica),
@@ -117,19 +55,11 @@ describe("RuntimeHost", () => {
   });
 
   it("rejects state drift before provider apply", async () => {
-    const state = providers(() => "2026-09-24T00:00:00Z");
-    let applyCalls = 0;
-    const countingReplica: StateProvider = {
-      id: state.replica.id,
-      observe: (externalBinding) => state.replica.observe(externalBinding),
-      async apply(mutation) {
-        applyCalls += 1;
-        await state.replica.apply(mutation);
-      },
-    };
+    const state = providers();
+    const counted = countingProvider(state.replica);
     const host = new RuntimeHost({
       catalog: catalog(),
-      registry: registry(state.primary, countingReplica),
+      registry: registry(state.primary, counted.provider),
     });
 
     const proposal = await host.plan(entityId);
@@ -142,12 +72,12 @@ describe("RuntimeHost", () => {
     await expect(host.apply(entityId, proposal.digest))
       .rejects.toBeInstanceOf(ReconciliationPlanDriftError);
 
-    expect(applyCalls).toBe(0);
+    expect(counted.count()).toBe(0);
     expect(state.replica.read("replica-atlas").deadline).toBe("2026-11-19");
   });
 
   it("journals drift without creating mutation intent", async () => {
-    const state = providers(() => "2026-09-24T00:00:00Z");
+    const state = providers();
     const journal = new InMemoryEventJournal();
     const host = new RuntimeHost({
       catalog: catalog(),
@@ -171,20 +101,14 @@ describe("RuntimeHost", () => {
   });
 
   it("does not apply a conflicted proposal", async () => {
-    const now = () => "2026-09-24T00:00:00Z";
-    const state = providers(now, "x", "y");
-    let applyCalls = 0;
-    const countingReplica: StateProvider = {
-      id: state.replica.id,
-      observe: (externalBinding) => state.replica.observe(externalBinding),
-      async apply(mutation) {
-        applyCalls += 1;
-        await state.replica.apply(mutation);
-      },
-    };
+    const state = providers({
+      primaryValues: { deadline: "x" },
+      replicaValues: { deadline: "y" },
+    });
+    const counted = countingProvider(state.replica);
     const host = new RuntimeHost({
-      catalog: catalog(null),
-      registry: registry(state.primary, countingReplica),
+      catalog: catalog({ authorityProvider: null }),
+      registry: registry(state.primary, counted.provider),
     });
 
     const proposal = await host.plan(entityId);
@@ -192,11 +116,11 @@ describe("RuntimeHost", () => {
 
     await expect(host.apply(entityId, proposal.digest))
       .rejects.toBeInstanceOf(ReconciliationBlockedError);
-    expect(applyCalls).toBe(0);
+    expect(counted.count()).toBe(0);
   });
 
   it("journals a successful apply through the host boundary", async () => {
-    const state = providers(() => "2026-09-24T00:00:00Z");
+    const state = providers();
     const journal = new InMemoryEventJournal();
     const host = new RuntimeHost({
       catalog: catalog(),
@@ -216,7 +140,7 @@ describe("RuntimeHost", () => {
   });
 
   it("fails explicitly when an entity is not configured", async () => {
-    const state = providers(() => "2026-09-24T00:00:00Z");
+    const state = providers();
     const host = new RuntimeHost({
       catalog: new InMemoryEntityRuntimeCatalog([]),
       registry: registry(state.primary, state.replica),
