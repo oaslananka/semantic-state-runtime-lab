@@ -1,5 +1,10 @@
 import { DatabaseSync } from "node:sqlite";
-import { normalizeEntityAlias, type EntityId } from "@ssrl/core";
+import {
+  normalizeEntityAlias,
+  type EntityId,
+  type TemporalObservation,
+  type TemporalRelationEdge,
+} from "@ssrl/core";
 import {
   CorruptSemanticStateError,
   SEMANTIC_STATE_SNAPSHOT_SCHEMA,
@@ -25,7 +30,6 @@ import {
   type SemanticStateSnapshot,
   type SemanticStateStore,
 } from "@ssrl/state-store";
-import type { TemporalObservation, TemporalRelationEdge } from "@ssrl/core";
 
 const STATE_STORE_COMPONENT = "semantic-state-store";
 const STATE_STORE_SCHEMA_VERSION = 1;
