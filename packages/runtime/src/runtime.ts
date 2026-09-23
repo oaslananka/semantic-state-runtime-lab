@@ -94,10 +94,10 @@ async function applyPlan<Token>(
       if (observer !== undefined) {
         try {
           await observer.failed(mutation, token as Token, cause, applied);
-        } catch (journalCause) {
+        } catch (error_) {
           throw new ReconciliationApplyError(mutation, [...applied], {
             cause: new AggregateError(
-              [cause, journalCause],
+              [cause, error_],
               "Provider mutation failed and failure journaling also failed",
             ),
           });
@@ -263,11 +263,12 @@ export async function reconcileOnce(input: ReconcileInput): Promise<ReconcileRes
   await appendEvent(context, "reconciliation.planned", { plan: before });
 
   if (input.dryRun === true || before.mutations.length === 0 || before.conflicts.length > 0) {
-    const outcome = input.dryRun === true
-      ? "dry-run"
-      : before.conflicts.length > 0
-        ? "blocked"
-        : "noop";
+    let outcome: "dry-run" | "blocked" | "noop" = "noop";
+    if (input.dryRun === true) {
+      outcome = "dry-run";
+    } else if (before.conflicts.length > 0) {
+      outcome = "blocked";
+    }
     await appendEvent(context, "reconciliation.completed", {
       outcome,
       finalPlan: before,
