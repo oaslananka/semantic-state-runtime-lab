@@ -14,6 +14,8 @@ Prove that one canonical entity can be bound to heterogeneous external represent
 - field-level authority
 - conflict detection
 - deterministic reconciliation plans
+- provider execution with revision preconditions
+- observed convergence and transparent partial-apply reporting
 - provenance of selected canonical values
 
 ## Explicit non-goals
