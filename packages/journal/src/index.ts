@@ -100,6 +100,22 @@ export type RuntimeJournalEvent =
 
 export type RuntimeJournalEventType = RuntimeJournalEvent["type"];
 
+export const RUNTIME_JOURNAL_EVENT_TYPES = [
+  "reconciliation.started",
+  "observation.recorded",
+  "reconciliation.planned",
+  "mutation.requested",
+  "mutation.applied",
+  "mutation.failed",
+  "reconciliation.failed",
+  "reconciliation.completed",
+] as const satisfies readonly RuntimeJournalEventType[];
+
+export function isRuntimeJournalEventType(value: unknown): value is RuntimeJournalEventType {
+  return typeof value === "string"
+    && (RUNTIME_JOURNAL_EVENT_TYPES as readonly string[]).includes(value);
+}
+
 export interface RuntimeEventSink {
   createId(): string;
   append(events: readonly RuntimeJournalEvent[]): Promise<void>;
@@ -111,8 +127,32 @@ export interface RuntimeEventJournal extends RuntimeEventSink {
 }
 
 function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value !== null && typeof value === "object") {
+  if (
+    value === null
+    || typeof value === "string"
+    || typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new TypeError("Journal events cannot contain non-finite numbers");
+    }
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((child) => {
+      if (child === undefined) {
+        throw new TypeError("Journal event arrays cannot contain undefined");
+      }
+      return canonicalize(child);
+    });
+  }
+  if (typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError("Journal events can contain only plain JSON objects");
+    }
     return Object.fromEntries(
       Object.entries(value)
         .filter(([, child]) => child !== undefined)
@@ -120,7 +160,7 @@ function canonicalize(value: unknown): unknown {
         .map(([key, child]) => [key, canonicalize(child)]),
     );
   }
-  return value;
+  throw new TypeError(`Journal events cannot contain ${typeof value}`);
 }
 
 export function canonicalEventJson(event: RuntimeJournalEvent): string {
