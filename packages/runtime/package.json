@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ssrl/core": "workspace:*"
+    "@ssrl/core": "workspace:*",
+    "@ssrl/journal": "workspace:*"
   },
   "exports": {
     ".": "./src/index.ts"
