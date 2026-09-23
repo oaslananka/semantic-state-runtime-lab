@@ -36,3 +36,17 @@ Run with:
 ```bash
 pnpm benchmark:context
 ```
+
+## v1: semantic state before ranking
+
+`pnpm benchmark:context:v1` tests provider authority, stale/superseded evidence, conflicts, multilingual queries, relation retrieval, alias collisions, and historical as-of questions.
+
+Its main result is negative in the useful sense: it does not establish a proprietary ranker moat. Authority-aware state and graph semantics matter; standard graph BM25 can beat the existing compiler on relation tasks; current-only state fails historical questions. See `docs/context-benchmark-v1.md`.
+
+## v2: typed identity and graph frontier
+
+`pnpm benchmark:context:v2` isolates identity and one-hop relation semantics.
+
+It compares legacy untyped retrieval with a typed semantic frontier, then compares BM25 and BM25/lexical RRF on that exact same typed frontier. The typed BM25 and RRF paths currently have identical task success, reinforcing that the measured improvement comes from identity/graph semantics rather than a special ranker.
+
+See `docs/entity-graph-context-v1.md` for the contract, policy boundary, results, and limitations.

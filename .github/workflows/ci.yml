@@ -45,5 +45,11 @@ jobs:
       - name: Stdio end-to-end smoke test
         run: pnpm test:stdio
 
-      - name: Context benchmark smoke test
+      - name: Context benchmark v0 smoke test
         run: pnpm benchmark:context
+
+      - name: Context benchmark v1 smoke test
+        run: pnpm benchmark:context:v1
+
+      - name: Context benchmark v2 smoke test
+        run: pnpm benchmark:context:v2

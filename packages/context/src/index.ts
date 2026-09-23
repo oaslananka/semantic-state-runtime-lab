@@ -1,11 +1,18 @@
 import {
+  TypedEntityResolver,
+  activeRelationEdges,
   resolveTemporalState,
   type AuthorityRule,
   type Conflict,
   type EntityId,
+  type EntityResolution,
+  type EntityTypeDescriptor,
+  type RelationTypeDescriptor,
   type StateValue,
   type TemporalObservation,
+  type TemporalRelationEdge,
   type TemporalStateResolution,
+  type TypedEntity,
 } from "@ssrl/core";
 
 export type ContextKind =
@@ -343,20 +350,81 @@ function readableProperty(property: string): string {
     .trim();
 }
 
-function stateRecord(
+function resolvedContextRecord(
+  id: string,
+  entityId: EntityId,
+  text: string,
+  evidenceRefs: readonly string[],
+): ContextRecord {
+  return { id, entityId, kind: "state", text, importance: 1, evidenceRefs };
+}
+
+function stateContextRecord(
+  prefix: "temporal" | "graph",
   entityId: EntityId,
   property: string,
+  label: string,
   state: TemporalStateResolution["canonical"]["properties"][string],
   resolution: TemporalStateResolution,
+  includeClockMetadata: boolean,
 ): ContextRecord {
-  return {
-    id: `temporal-state:${entityId}:${property}`,
+  const metadata = includeClockMetadata
+    ? ` source=${state.source.provider}. validAt=${resolution.validAt}. knownAt=${resolution.knownAt}.`
+    : "";
+  return resolvedContextRecord(
+    `${prefix}-state:${entityId}:${property}`,
     entityId,
-    kind: "state",
-    text: `${readableProperty(property)}: ${contextValue(state.value)}. source=${state.source.provider}. validAt=${resolution.validAt}. knownAt=${resolution.knownAt}.`,
-    importance: 1,
-    evidenceRefs: resolution.evidence[property]?.map((item) => item.observationId) ?? [],
-  };
+    `${label}: ${contextValue(state.value)}.${metadata}`,
+    resolution.evidence[property]?.map((item) => item.observationId) ?? [],
+  );
+}
+
+function conflictContextRecord(
+  prefix: "temporal" | "graph",
+  entityId: EntityId,
+  conflict: Conflict,
+  label: string,
+  resolution: TemporalStateResolution,
+  includeInstruction: boolean,
+): ContextRecord {
+  const instruction = includeInstruction ? " Do not assert a single value." : "";
+  return resolvedContextRecord(
+    `${prefix}-conflict:${entityId}:${conflict.property}`,
+    entityId,
+    `Unresolved conflict for ${label}: ${conflictValues(conflict)}.${instruction}`,
+    resolution.conflictEvidence[conflict.property]?.map((item) => item.observationId) ?? [],
+  );
+}
+
+function groupTemporalObservations(
+  observations: readonly TemporalObservation[],
+  knownEntities?: ReadonlySet<EntityId>,
+): Map<EntityId, TemporalObservation[]> {
+  const grouped = new Map<EntityId, TemporalObservation[]>();
+  for (const observation of observations) {
+    if (knownEntities !== undefined && !knownEntities.has(observation.entityId)) {
+      throw new Error(`Temporal observation ${observation.id} references an unknown entity`);
+    }
+    const current = grouped.get(observation.entityId) ?? [];
+    current.push(observation);
+    grouped.set(observation.entityId, current);
+  }
+  return grouped;
+}
+
+function resolveEntityTemporalState(
+  entityId: EntityId,
+  observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>,
+  authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>,
+  request: TemporalContextRequest,
+): TemporalStateResolution {
+  return resolveTemporalState({
+    entityId,
+    observations: observationsByEntity.get(entityId) ?? [],
+    validAt: request.validAt,
+    knownAt: request.knownAt,
+    authority: authorityByEntity.get(entityId) ?? [],
+  });
 }
 
 function conflictValues(conflict: Conflict): string {
@@ -365,33 +433,32 @@ function conflictValues(conflict: Conflict): string {
     .join("; ");
 }
 
-function conflictRecord(
-  entityId: EntityId,
-  conflict: Conflict,
-  resolution: TemporalStateResolution,
-): ContextRecord {
-  return {
-    id: `temporal-conflict:${entityId}:${conflict.property}`,
-    entityId,
-    kind: "state",
-    text: `Unresolved conflict for ${readableProperty(conflict.property)}: ${conflictValues(conflict)}. Do not assert a single value.`,
-    importance: 1,
-    evidenceRefs: resolution.conflictEvidence[conflict.property]
-      ?.map((item) => item.observationId) ?? [],
-  };
-}
-
 function recordsForResolution(resolution: TemporalStateResolution): ContextRecord[] {
   const canonical = Object.entries(resolution.canonical.properties)
-    .map(([property, state]) => stateRecord(resolution.entityId, property, state, resolution));
+    .map(([property, state]) => stateContextRecord(
+      "temporal",
+      resolution.entityId,
+      property,
+      readableProperty(property),
+      state,
+      resolution,
+      true,
+    ));
   const conflicts = resolution.conflicts
-    .map((conflict) => conflictRecord(resolution.entityId, conflict, resolution));
+    .map((conflict) => conflictContextRecord(
+      "temporal",
+      resolution.entityId,
+      conflict,
+      readableProperty(conflict.property),
+      resolution,
+      true,
+    ));
   return [...canonical, ...conflicts];
 }
 
 export class TemporalContextCompiler {
   readonly #entities: readonly TemporalEntityDescriptor[];
-  readonly #observationsByEntity = new Map<EntityId, TemporalObservation[]>();
+  readonly #observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>;
   readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
   readonly #entityResolver: ContextIndex;
 
@@ -399,12 +466,7 @@ export class TemporalContextCompiler {
     this.#entities = options.entities;
     this.#authorityByEntity = options.authorityByEntity ?? new Map();
     this.#entityResolver = new ContextIndex({ entities: options.entities, records: [] });
-
-    for (const observation of options.observations) {
-      const current = this.#observationsByEntity.get(observation.entityId) ?? [];
-      current.push(observation);
-      this.#observationsByEntity.set(observation.entityId, current);
-    }
+    this.#observationsByEntity = groupTemporalObservations(options.observations);
   }
 
   compile(request: TemporalContextRequest): ContextPackage {
@@ -412,16 +474,14 @@ export class TemporalContextCompiler {
       .resolveEntities(request.query)
       .filter((entityId): entityId is EntityId => entityId.startsWith("entity://"));
 
-    const records = resolvedEntityIds.flatMap((entityId) => {
-      const resolution = resolveTemporalState({
+    const records = resolvedEntityIds.flatMap((entityId) => recordsForResolution(
+      resolveEntityTemporalState(
         entityId,
-        observations: this.#observationsByEntity.get(entityId) ?? [],
-        validAt: request.validAt,
-        knownAt: request.knownAt,
-        authority: this.#authorityByEntity.get(entityId) ?? [],
-      });
-      return recordsForResolution(resolution);
-    });
+        this.#observationsByEntity,
+        this.#authorityByEntity,
+        request,
+      ),
+    ));
 
     if (resolvedEntityIds.length === 0 || records.length === 0) {
       return {
@@ -433,5 +493,425 @@ export class TemporalContextCompiler {
     }
 
     return new ContextIndex({ entities: this.#entities, records }).compile(request);
+  }
+}
+
+
+export interface ContextPropertyDescriptor {
+  readonly property: string;
+  readonly aliases: readonly string[];
+}
+
+export type ContextVisibilityRequest =
+  | { readonly kind: "entity"; readonly entityId: EntityId }
+  | {
+    readonly kind: "property";
+    readonly entityId: EntityId;
+    readonly property: string;
+  }
+  | {
+    readonly kind: "relation";
+    readonly edgeId: string;
+    readonly from: EntityId;
+    readonly to: EntityId;
+    readonly relationType: string;
+  };
+
+export interface ContextVisibilityPolicy {
+  allow(request: ContextVisibilityRequest): boolean;
+}
+
+export interface GraphContextCompilerOptions {
+  readonly entityTypes: readonly EntityTypeDescriptor[];
+  readonly entities: readonly TypedEntity[];
+  readonly relationTypes: readonly RelationTypeDescriptor[];
+  readonly relations: readonly TemporalRelationEdge[];
+  readonly observations: readonly TemporalObservation[];
+  readonly properties?: readonly ContextPropertyDescriptor[];
+  readonly authorityByEntity?: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly visibility?: ContextVisibilityPolicy;
+  readonly maxRelationEdges?: number;
+}
+
+export interface GraphFrontierStats {
+  readonly candidateEdges: number;
+  readonly traversedEdges: number;
+  readonly edgeIds: readonly string[];
+  readonly relatedEntityIds: readonly EntityId[];
+  readonly candidateRecords: number;
+  readonly relationTraversalTokens: number;
+}
+
+export interface GraphContextFrontier {
+  readonly entityResolution: EntityResolution;
+  readonly resolvedEntityIds: readonly EntityId[];
+  readonly expandedEntityIds: readonly EntityId[];
+  readonly records: readonly ContextRecord[];
+  readonly traversal: GraphFrontierStats;
+}
+
+export interface GraphTraversalStats extends GraphFrontierStats {
+  readonly outputTokens: number;
+}
+
+export interface GraphContextPackage extends ContextPackage {
+  readonly entityResolution: EntityResolution;
+  readonly traversal: GraphTraversalStats;
+}
+
+const allowAllContext: ContextVisibilityPolicy = {
+  allow: () => true,
+};
+
+function entityAliases(entity: TypedEntity): string[] {
+  return entity.aliases.map((alias) => alias.value);
+}
+
+function entityName(entity: TypedEntity): string {
+  return entity.aliases[0]?.value ?? entity.id;
+}
+
+function propertySearchText(
+  property: string,
+  descriptors: ReadonlyMap<string, ContextPropertyDescriptor>,
+): string {
+  const aliases = descriptors.get(property)?.aliases ?? [];
+  return [readableProperty(property), ...aliases].join(" / ");
+}
+
+
+
+function stateValueVisible(
+  value: StateValue,
+  visibility: ContextVisibilityPolicy,
+): boolean {
+  if (typeof value === "string" && value.startsWith("entity://")) {
+    return visibility.allow({ kind: "entity", entityId: value as EntityId });
+  }
+  if (Array.isArray(value)) {
+    return value.every((item) => stateValueVisible(item, visibility));
+  }
+  if (value !== null && typeof value === "object") {
+    return Object.values(value).every((item) => stateValueVisible(item, visibility));
+  }
+  return true;
+}
+
+function recordsForVisibleResolution(
+  resolution: TemporalStateResolution,
+  visibility: ContextVisibilityPolicy,
+  descriptors: ReadonlyMap<string, ContextPropertyDescriptor>,
+): ContextRecord[] {
+  const canonical = Object.entries(resolution.canonical.properties)
+    .filter(([property, state]) => (
+      visibility.allow({
+        kind: "property",
+        entityId: resolution.entityId,
+        property,
+      })
+      && stateValueVisible(state.value, visibility)
+    ))
+    .map(([property, state]) => stateContextRecord(
+      "graph",
+      resolution.entityId,
+      property,
+      propertySearchText(property, descriptors),
+      state,
+      resolution,
+      false,
+    ));
+  const conflicts = resolution.conflicts
+    .filter((conflict) => visibility.allow({
+      kind: "property",
+      entityId: resolution.entityId,
+      property: conflict.property,
+    }))
+    .map((conflict) => conflictContextRecord(
+      "graph",
+      resolution.entityId,
+      conflict,
+      propertySearchText(conflict.property, descriptors),
+      resolution,
+      false,
+    ));
+  return [...canonical, ...conflicts];
+}
+
+function relationText(
+  edge: TemporalRelationEdge,
+  entities: ReadonlyMap<EntityId, TypedEntity>,
+  relationTypes: ReadonlyMap<string, RelationTypeDescriptor>,
+): string {
+  const from = entities.get(edge.from);
+  const to = entities.get(edge.to);
+  const aliases = relationTypes.get(edge.relationType)?.aliases ?? [edge.relationType];
+  return `${from === undefined ? edge.from : entityName(from)} ${aliases.join(" / ")} ${to === undefined ? edge.to : entityName(to)}.`;
+}
+
+function relationRecord(
+  edge: TemporalRelationEdge,
+  entities: ReadonlyMap<EntityId, TypedEntity>,
+  relationTypes: ReadonlyMap<string, RelationTypeDescriptor>,
+): ContextRecord {
+  return {
+    id: `graph-relation:${edge.id}`,
+    entityId: edge.from,
+    kind: "relationship",
+    text: relationText(edge, entities, relationTypes),
+    importance: 1,
+    relatedEntityIds: [edge.to],
+    evidenceRefs: edge.evidenceRefs ?? [edge.id],
+  };
+}
+
+function relationScore(
+  edge: TemporalRelationEdge,
+  queryTerms: ReadonlySet<string>,
+  entities: ReadonlyMap<EntityId, TypedEntity>,
+  relationTypes: ReadonlyMap<string, RelationTypeDescriptor>,
+): number {
+  const searchable = terms(relationText(edge, entities, relationTypes));
+  let score = 0;
+  for (const term of queryTerms) {
+    if (searchable.has(term)) score += 1;
+  }
+  return score;
+}
+
+interface RelationCandidate {
+  readonly edge: TemporalRelationEdge;
+  readonly score: number;
+  readonly tokenCost: number;
+}
+
+function relationCandidates(
+  edges: readonly TemporalRelationEdge[],
+  queryTerms: ReadonlySet<string>,
+  entities: ReadonlyMap<EntityId, TypedEntity>,
+  relationTypes: ReadonlyMap<string, RelationTypeDescriptor>,
+): RelationCandidate[] {
+  return edges
+    .map((edge) => ({
+      edge,
+      score: relationScore(edge, queryTerms, entities, relationTypes),
+      tokenCost: recordTokens(relationRecord(edge, entities, relationTypes)),
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => (
+      right.score - left.score
+      || left.tokenCost - right.tokenCost
+      || left.edge.id.localeCompare(right.edge.id)
+    ));
+}
+
+function selectRelationCandidates(
+  candidates: readonly RelationCandidate[],
+  maxRelationEdges: number,
+  budgetTokens: number,
+): { readonly edges: readonly TemporalRelationEdge[]; readonly tokenCost: number } {
+  const edges: TemporalRelationEdge[] = [];
+  let tokenCost = 0;
+  for (const candidate of candidates) {
+    if (edges.length >= maxRelationEdges) break;
+    if (tokenCost + candidate.tokenCost > budgetTokens) continue;
+    edges.push(candidate.edge);
+    tokenCost += candidate.tokenCost;
+  }
+  return { edges, tokenCost };
+}
+
+function emptyGraphFrontier(
+  entityResolution: EntityResolution,
+): GraphContextFrontier {
+  return {
+    entityResolution,
+    resolvedEntityIds: [],
+    expandedEntityIds: [],
+    records: [],
+    traversal: {
+      candidateEdges: 0,
+      traversedEdges: 0,
+      edgeIds: [],
+      relatedEntityIds: [],
+      candidateRecords: 0,
+      relationTraversalTokens: 0,
+    },
+  };
+}
+
+function packageFromEmptyFrontier(
+  frontier: GraphContextFrontier,
+): GraphContextPackage {
+  return {
+    records: [],
+    resolvedEntityIds: frontier.resolvedEntityIds,
+    estimatedTokens: 0,
+    consideredRecords: frontier.records.length,
+    entityResolution: frontier.entityResolution,
+    traversal: {
+      ...frontier.traversal,
+      outputTokens: 0,
+    },
+  };
+}
+
+export class GraphContextCompiler {
+  readonly #entityTypes: readonly EntityTypeDescriptor[];
+  readonly #entities: readonly TypedEntity[];
+  readonly #entityMap: ReadonlyMap<EntityId, TypedEntity>;
+  readonly #relationTypes: ReadonlyMap<string, RelationTypeDescriptor>;
+  readonly #relations: readonly TemporalRelationEdge[];
+  readonly #observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>;
+  readonly #properties: ReadonlyMap<string, ContextPropertyDescriptor>;
+  readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly #visibility: ContextVisibilityPolicy;
+  readonly #maxRelationEdges: number;
+
+  constructor(options: GraphContextCompilerOptions) {
+    this.#entityTypes = options.entityTypes;
+    this.#entities = options.entities;
+    this.#entityMap = new Map(options.entities.map((entity) => [entity.id, entity]));
+    this.#relationTypes = new Map(options.relationTypes.map((type) => [type.id, type]));
+    this.#relations = options.relations;
+    this.#properties = new Map((options.properties ?? []).map((descriptor) => [descriptor.property, descriptor]));
+    this.#authorityByEntity = options.authorityByEntity ?? new Map();
+    this.#visibility = options.visibility ?? allowAllContext;
+    const maxRelationEdges = options.maxRelationEdges ?? 4;
+    if (!Number.isInteger(maxRelationEdges) || maxRelationEdges < 0) {
+      throw new Error("maxRelationEdges must be a non-negative integer");
+    }
+    this.#maxRelationEdges = maxRelationEdges;
+
+    if (this.#relationTypes.size !== options.relationTypes.length) {
+      throw new Error("Relation type ids must be unique");
+    }
+    if (this.#properties.size !== (options.properties ?? []).length) {
+      throw new Error("Context property descriptors must be unique by property");
+    }
+    for (const relation of options.relations) {
+      if (!this.#relationTypes.has(relation.relationType)) {
+        throw new Error(`Relation ${relation.id} references unknown relation type ${relation.relationType}`);
+      }
+      if (!this.#entityMap.has(relation.from) || !this.#entityMap.has(relation.to)) {
+        throw new Error(`Relation ${relation.id} references an unknown entity`);
+      }
+    }
+    this.#observationsByEntity = groupTemporalObservations(
+      options.observations,
+      new Set(this.#entityMap.keys()),
+    );
+  }
+
+  #visibleEntities(): TypedEntity[] {
+    return this.#entities.filter((entity) => this.#visibility.allow({
+      kind: "entity",
+      entityId: entity.id,
+    }));
+  }
+
+  #stateRecords(
+    entityIds: readonly EntityId[],
+    request: TemporalContextRequest,
+  ): ContextRecord[] {
+    return entityIds.flatMap((entityId) => recordsForVisibleResolution(
+      resolveEntityTemporalState(
+        entityId,
+        this.#observationsByEntity,
+        this.#authorityByEntity,
+        request,
+      ),
+      this.#visibility,
+      this.#properties,
+    ));
+  }
+
+  frontier(request: TemporalContextRequest): GraphContextFrontier {
+    const visibleEntities = this.#visibleEntities();
+    const resolution = new TypedEntityResolver({
+      types: this.#entityTypes,
+      entities: visibleEntities,
+    }).resolve(request.query);
+    if (resolution.status !== "resolved") return emptyGraphFrontier(resolution);
+
+    const directEntityId = resolution.entityId;
+    const activeEdges = activeRelationEdges({
+      edges: this.#relations,
+      fromEntityIds: [directEntityId],
+      validAt: request.validAt,
+      knownAt: request.knownAt,
+    }).filter((edge) => (
+      this.#visibility.allow({ kind: "entity", entityId: edge.to })
+      && this.#visibility.allow({
+        kind: "relation",
+        edgeId: edge.id,
+        from: edge.from,
+        to: edge.to,
+        relationType: edge.relationType,
+      })
+    ));
+
+    const candidates = relationCandidates(
+      activeEdges,
+      terms(request.query),
+      this.#entityMap,
+      this.#relationTypes,
+    );
+    const selectedRelations = selectRelationCandidates(
+      candidates,
+      this.#maxRelationEdges,
+      request.budgetTokens,
+    );
+    const traversed = selectedRelations.edges;
+    const relatedEntityIds = [...new Set(traversed.map((edge) => edge.to))];
+    const expandedEntityIds = [directEntityId, ...relatedEntityIds];
+    const stateRecords = this.#stateRecords(expandedEntityIds, request);
+    const relationRecords = traversed.map((edge) => relationRecord(
+      edge,
+      this.#entityMap,
+      this.#relationTypes,
+    ));
+    const records = [...relationRecords, ...stateRecords];
+
+    return {
+      entityResolution: resolution,
+      resolvedEntityIds: [directEntityId],
+      expandedEntityIds,
+      records,
+      traversal: {
+        candidateEdges: candidates.length,
+        traversedEdges: traversed.length,
+        edgeIds: traversed.map((edge) => edge.id),
+        relatedEntityIds,
+        candidateRecords: records.length,
+        relationTraversalTokens: selectedRelations.tokenCost,
+      },
+    };
+  }
+
+  compile(request: TemporalContextRequest): GraphContextPackage {
+    const frontier = this.frontier(request);
+    if (frontier.entityResolution.status !== "resolved" || frontier.records.length === 0) {
+      return packageFromEmptyFrontier(frontier);
+    }
+
+    const visibleEntities = this.#visibleEntities();
+    const corpus: ContextCorpus = {
+      entities: visibleEntities.map((entity) => ({
+        id: entity.id,
+        aliases: entityAliases(entity),
+      })),
+      records: frontier.records,
+    };
+    const ranked = bm25Baseline(corpus, request, frontier.expandedEntityIds);
+
+    return {
+      ...ranked,
+      resolvedEntityIds: frontier.resolvedEntityIds,
+      entityResolution: frontier.entityResolution,
+      traversal: {
+        ...frontier.traversal,
+        outputTokens: ranked.estimatedTokens,
+      },
+    };
   }
 }
