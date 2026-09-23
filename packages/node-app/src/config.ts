@@ -181,129 +181,196 @@ function formatZodIssues(error: z.ZodError): string[] {
   });
 }
 
-function semanticIssues(config: ParsedConfig): string[] {
-  const issues: string[] = [];
-  const providers = new Map<string, ParsedConfig["providers"][number]>();
+type ParsedProvider = ParsedConfig["providers"][number];
+type ParsedEntity = ParsedConfig["entities"][number];
+type PropertyProviders = Map<string, Set<string>>;
+type EntityProperties = Map<string, PropertyProviders>;
 
+function validateProvider(
+  provider: ParsedProvider,
+  providers: Map<string, ParsedProvider>,
+  issues: string[],
+): void {
+  if (providers.has(provider.id)) {
+    issues.push(`providers: duplicate provider id ${provider.id}`);
+    return;
+  }
+  providers.set(provider.id, provider);
+
+  if (provider.manifest.id !== provider.id) {
+    issues.push(`provider ${provider.id}: manifest.id must match provider id`);
+  }
+  try {
+    validateConnectorManifest(provider.manifest as ConnectorManifest);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "invalid connector manifest";
+    issues.push(`provider ${provider.id}: ${detail}`);
+  }
+}
+
+function collectProviders(
+  config: ParsedConfig,
+  issues: string[],
+): Map<string, ParsedProvider> {
+  const providers = new Map<string, ParsedProvider>();
   for (const provider of config.providers) {
-    if (providers.has(provider.id)) {
-      issues.push(`providers: duplicate provider id ${provider.id}`);
+    validateProvider(provider, providers, issues);
+  }
+  return providers;
+}
+
+function addBindingProperties(
+  entity: ParsedEntity,
+  binding: ParsedEntity["bindings"][number],
+  providers: ReadonlyMap<string, ParsedProvider>,
+  properties: PropertyProviders,
+  issues: string[],
+): void {
+  const provider = providers.get(binding.provider);
+  if (provider === undefined) {
+    issues.push(`entity ${entity.entityId}: unknown provider ${binding.provider}`);
+    return;
+  }
+
+  const mapping = provider.manifest.entities.find(
+    (candidate) => candidate.canonicalType === binding.canonicalType,
+  );
+  if (mapping === undefined) {
+    issues.push(
+      `entity ${entity.entityId}: provider ${binding.provider} does not declare canonical type ${binding.canonicalType}`,
+    );
+    return;
+  }
+
+  for (const field of mapping.fields) {
+    const fieldProviders = properties.get(field.canonical) ?? new Set<string>();
+    fieldProviders.add(binding.provider);
+    properties.set(field.canonical, fieldProviders);
+  }
+}
+
+function validateAuthority(
+  entity: ParsedEntity,
+  properties: PropertyProviders,
+  issues: string[],
+): void {
+  const seen = new Set<string>();
+  for (const rule of entity.authority) {
+    if (seen.has(rule.property)) {
+      issues.push(`entity ${entity.entityId}: duplicate authority rule for ${rule.property}`);
       continue;
     }
-    providers.set(provider.id, provider);
-    if (provider.manifest.id !== provider.id) {
-      issues.push(`provider ${provider.id}: manifest.id must match provider id`);
-    }
-    try {
-      validateConnectorManifest(provider.manifest as ConnectorManifest);
-    } catch (error) {
+    seen.add(rule.property);
+
+    if (!properties.get(rule.property)?.has(rule.provider)) {
       issues.push(
-        `provider ${provider.id}: ${error instanceof Error ? error.message : "invalid connector manifest"}`,
+        `entity ${entity.entityId}: authority provider ${rule.provider} does not expose ${rule.property}`,
       );
     }
   }
+}
 
-  const entities = new Map<string, ParsedConfig["entities"][number]>();
-  const entityProperties = new Map<string, Map<string, Set<string>>>();
+function validateEntity(
+  entity: ParsedEntity,
+  entities: Set<string>,
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): PropertyProviders | undefined {
+  if (entities.has(entity.entityId)) {
+    issues.push(`entities: duplicate entityId ${entity.entityId}`);
+    return undefined;
+  }
+  entities.add(entity.entityId);
 
+  const seenProviders = new Set<string>();
+  const properties: PropertyProviders = new Map();
+  for (const binding of entity.bindings) {
+    if (seenProviders.has(binding.provider)) {
+      issues.push(
+        `entity ${entity.entityId}: provider ${binding.provider} may be bound only once in config v1`,
+      );
+    }
+    seenProviders.add(binding.provider);
+    addBindingProperties(entity, binding, providers, properties, issues);
+  }
+  validateAuthority(entity, properties, issues);
+  return properties;
+}
+
+function collectEntityProperties(
+  config: ParsedConfig,
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): EntityProperties {
+  const entityProperties: EntityProperties = new Map();
+  const entities = new Set<string>();
   for (const entity of config.entities) {
-    if (entities.has(entity.entityId)) {
-      issues.push(`entities: duplicate entityId ${entity.entityId}`);
-      continue;
-    }
-    entities.set(entity.entityId, entity);
-
-    const seenProviders = new Set<string>();
-    const propertyProviders = new Map<string, Set<string>>();
-
-    for (const binding of entity.bindings) {
-      if (seenProviders.has(binding.provider)) {
-        issues.push(
-          `entity ${entity.entityId}: provider ${binding.provider} may be bound only once in config v1`,
-        );
-      }
-      seenProviders.add(binding.provider);
-
-      const provider = providers.get(binding.provider);
-      if (provider === undefined) {
-        issues.push(`entity ${entity.entityId}: unknown provider ${binding.provider}`);
-        continue;
-      }
-      const mapping = provider.manifest.entities.find(
-        (candidate) => candidate.canonicalType === binding.canonicalType,
-      );
-      if (mapping === undefined) {
-        issues.push(
-          `entity ${entity.entityId}: provider ${binding.provider} does not declare canonical type ${binding.canonicalType}`,
-        );
-        continue;
-      }
-      for (const field of mapping.fields) {
-        const set = propertyProviders.get(field.canonical) ?? new Set<string>();
-        set.add(binding.provider);
-        propertyProviders.set(field.canonical, set);
-      }
-    }
-
-    entityProperties.set(entity.entityId, propertyProviders);
-
-    const seenAuthority = new Set<string>();
-    for (const rule of entity.authority) {
-      if (seenAuthority.has(rule.property)) {
-        issues.push(`entity ${entity.entityId}: duplicate authority rule for ${rule.property}`);
-        continue;
-      }
-      seenAuthority.add(rule.property);
-
-      const providersForProperty = propertyProviders.get(rule.property);
-      if (providersForProperty === undefined || !providersForProperty.has(rule.provider)) {
-        issues.push(
-          `entity ${entity.entityId}: authority provider ${rule.provider} does not expose ${rule.property}`,
-        );
-      }
+    const properties = validateEntity(entity, entities, providers, issues);
+    if (properties !== undefined) {
+      entityProperties.set(entity.entityId, properties);
     }
   }
+  return entityProperties;
+}
 
-  const seenPolicyFields = new Set<string>();
+function validateGrantProviders(
+  grant: ParsedConfig["policy"]["fields"][number],
+  available: ReadonlySet<string>,
+  issues: string[],
+): void {
+  for (const provider of grant.providers ?? []) {
+    if (!available.has(provider)) {
+      issues.push(
+        `policy.fields: provider ${provider} does not expose ${grant.entityId} / ${grant.property}`,
+      );
+    }
+  }
+}
+
+function validatePolicyFields(
+  config: ParsedConfig,
+  entityProperties: EntityProperties,
+  issues: string[],
+): void {
+  const seen = new Set<string>();
   for (const grant of config.policy.fields) {
-    const key = `${grant.entityId}\0${grant.property}`;
-    if (seenPolicyFields.has(key)) {
+    const key = `${grant.entityId}\\0${grant.property}`;
+    if (seen.has(key)) {
       issues.push(`policy.fields: duplicate grant for ${grant.entityId} / ${grant.property}`);
       continue;
     }
-    seenPolicyFields.add(key);
+    seen.add(key);
 
-    const properties = entityProperties.get(grant.entityId);
-    const availableProviders = properties?.get(grant.property);
-    if (availableProviders === undefined) {
+    const available = entityProperties.get(grant.entityId)?.get(grant.property);
+    if (available === undefined) {
       issues.push(`policy.fields: unknown property ${grant.entityId} / ${grant.property}`);
       continue;
     }
-    if (grant.providers !== undefined) {
-      for (const provider of grant.providers) {
-        if (!availableProviders.has(provider)) {
-          issues.push(
-            `policy.fields: provider ${provider} does not expose ${grant.entityId} / ${grant.property}`,
-          );
-        }
-      }
-    }
+    validateGrantProviders(grant, available, issues);
   }
+}
 
+function validatePrincipalScopes(config: ParsedConfig, issues: string[]): void {
   const scopes = new Set(config.principal.scopes);
-  if (config.policy.operations.plan && !scopes.has("state:read")) {
-    issues.push("principal.scopes must include state:read when policy.operations.plan is enabled");
-  }
-  if (config.policy.operations.apply && !scopes.has("state:write")) {
-    issues.push("principal.scopes must include state:write when policy.operations.apply is enabled");
-  }
-  if (config.policy.fields.some((grant) => grant.read) && !scopes.has("state:read")) {
-    issues.push("principal.scopes must include state:read when any field read grant is enabled");
-  }
-  if (config.policy.fields.some((grant) => grant.write) && !scopes.has("state:write")) {
-    issues.push("principal.scopes must include state:write when any field write grant is enabled");
-  }
+  const needsRead = config.policy.operations.plan
+    || config.policy.fields.some((grant) => grant.read);
+  const needsWrite = config.policy.operations.apply
+    || config.policy.fields.some((grant) => grant.write);
 
+  if (needsRead && !scopes.has("state:read")) {
+    issues.push("principal.scopes must include state:read when read access is enabled");
+  }
+  if (needsWrite && !scopes.has("state:write")) {
+    issues.push("principal.scopes must include state:write when write access is enabled");
+  }
+}
+
+function semanticIssues(config: ParsedConfig): string[] {
+  const issues: string[] = [];
+  const providers = collectProviders(config, issues);
+  const entityProperties = collectEntityProperties(config, providers, issues);
+  validatePolicyFields(config, entityProperties, issues);
+  validatePrincipalScopes(config, issues);
   return issues;
 }
 

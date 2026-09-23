@@ -12,7 +12,9 @@ import {
   InMemoryEntityRuntimeCatalog,
   RuntimeHost,
   type EntityRuntimeDefinition,
+  type RuntimeAccessDecision,
   type RuntimeAccessPolicy,
+  type RuntimeAccessRequest,
   type RuntimePrincipal,
 } from "@ssrl/runtime-host";
 import { SQLiteEventJournal } from "@ssrl/storage-sqlite";
@@ -83,53 +85,66 @@ function hasScope(principal: RuntimePrincipal, scope: string): boolean {
   return principal.scopes.includes(scope);
 }
 
+function operationDecision(
+  config: LocalAppConfig,
+  request: Extract<RuntimeAccessRequest, { readonly kind: "operation" }>,
+): RuntimeAccessDecision {
+  const plan = request.operation === "plan";
+  const enabled = plan ? config.policy.operations.plan : config.policy.operations.apply;
+  const scope = plan ? "state:read" : "state:write";
+  if (enabled && hasScope(request.principal, scope)) return { effect: "allow" };
+  return { effect: "deny", code: plan ? "plan-denied" : "apply-denied" };
+}
+
+function proposalDecision(
+  config: LocalAppConfig,
+  request: Extract<RuntimeAccessRequest, { readonly kind: "proposal" }>,
+): RuntimeAccessDecision {
+  if (config.policy.operations.apply && hasScope(request.principal, "state:write")) {
+    return { effect: "allow" };
+  }
+  return { effect: "deny", code: "proposal-apply-denied" };
+}
+
+function fieldDecision(
+  config: LocalAppConfig,
+  request: Extract<RuntimeAccessRequest, { readonly kind: "field" }>,
+): RuntimeAccessDecision {
+  const grant = fieldGrant(config, request.entityId, request.canonicalProperty);
+  if (grant === undefined || (grant.providers?.includes(request.provider) === false)) {
+    return { effect: "deny", code: "field-not-granted" };
+  }
+
+  const read = request.operation === "read";
+  const enabled = read ? grant.read : grant.write;
+  const scope = read ? "state:read" : "state:write";
+  if (enabled && hasScope(request.principal, scope)) return { effect: "allow" };
+  return { effect: "deny", code: read ? "field-read-denied" : "field-write-denied" };
+}
+
+function accessDecision(
+  config: LocalAppConfig,
+  request: RuntimeAccessRequest,
+): RuntimeAccessDecision {
+  if (request.principal.subject !== config.principal.subject) {
+    return { effect: "deny", code: "principal-subject-mismatch" };
+  }
+
+  switch (request.kind) {
+    case "operation":
+      return operationDecision(config, request);
+    case "proposal":
+      return proposalDecision(config, request);
+    case "field":
+      return fieldDecision(config, request);
+  }
+}
+
 export function createLocalAccessPolicy(
   config: LocalAppConfig,
 ): RuntimeAccessPolicy {
   return {
-    evaluate(request) {
-      if (request.principal.subject !== config.principal.subject) {
-        return { effect: "deny", code: "principal-subject-mismatch" };
-      }
-
-      if (request.kind === "operation") {
-        if (request.operation === "plan") {
-          return config.policy.operations.plan && hasScope(request.principal, "state:read")
-            ? { effect: "allow" }
-            : { effect: "deny", code: "plan-denied" };
-        }
-        return config.policy.operations.apply && hasScope(request.principal, "state:write")
-          ? { effect: "allow" }
-          : { effect: "deny", code: "apply-denied" };
-      }
-
-      if (request.kind === "proposal") {
-        return config.policy.operations.apply && hasScope(request.principal, "state:write")
-          ? { effect: "allow" }
-          : { effect: "deny", code: "proposal-apply-denied" };
-      }
-
-      const grant = fieldGrant(
-        config,
-        request.entityId,
-        request.canonicalProperty,
-      );
-      if (
-        grant === undefined
-        || (grant.providers !== undefined && !grant.providers.includes(request.provider))
-      ) {
-        return { effect: "deny", code: "field-not-granted" };
-      }
-
-      if (request.operation === "read") {
-        return grant.read && hasScope(request.principal, "state:read")
-          ? { effect: "allow" }
-          : { effect: "deny", code: "field-read-denied" };
-      }
-      return grant.write && hasScope(request.principal, "state:write")
-        ? { effect: "allow" }
-        : { effect: "deny", code: "field-write-denied" };
-    },
+    evaluate: (request) => accessDecision(config, request),
   };
 }
 
