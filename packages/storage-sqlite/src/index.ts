@@ -4,6 +4,7 @@ import {
   JOURNAL_EVENT_SCHEMA_VERSION,
   JournalEventCollisionError,
   canonicalEventJson,
+  isRuntimeJournalEventType,
   type RuntimeEventJournal,
   type RuntimeJournalEvent,
 } from "@ssrl/journal";
@@ -49,7 +50,7 @@ function parseEvent(value: string): RuntimeJournalEvent {
     || typeof event.eventId !== "string"
     || typeof event.runId !== "string"
     || typeof event.entityId !== "string"
-    || typeof event.type !== "string"
+    || !isRuntimeJournalEventType(event.type)
     || typeof event.occurredAt !== "string"
     || event.payload === undefined
   ) {
