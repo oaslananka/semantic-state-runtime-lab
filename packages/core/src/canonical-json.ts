@@ -70,7 +70,7 @@ function mutationOrder(left: Mutation, right: Mutation): number {
     || left.externalId.localeCompare(right.externalId)
     || left.externalPath.localeCompare(right.externalPath)
     || left.canonicalProperty.localeCompare(right.canonicalProperty)
-    || canonicalJson(left.nextValue).localeCompare(canonicalJson(right.nextValue));
+    || canonicalJson(left).localeCompare(canonicalJson(right));
 }
 
 export function reconciliationProposalMaterial(
