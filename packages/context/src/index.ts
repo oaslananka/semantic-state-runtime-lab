@@ -1,3 +1,13 @@
+import {
+  resolveTemporalState,
+  type AuthorityRule,
+  type Conflict,
+  type EntityId,
+  type StateValue,
+  type TemporalObservation,
+  type TemporalStateResolution,
+} from "@ssrl/core";
+
 export type ContextKind =
   | "state"
   | "decision"
@@ -19,6 +29,7 @@ export interface ContextRecord {
   readonly current?: boolean;
   readonly importance?: number;
   readonly relatedEntityIds?: readonly string[];
+  readonly evidenceRefs?: readonly string[];
 }
 
 export interface ContextCorpus {
@@ -301,4 +312,126 @@ export function rawContext(corpus: ContextCorpus): ContextPackage {
     estimatedTokens: corpus.records.reduce((sum, record) => sum + recordTokens(record), 0),
     consideredRecords: corpus.records.length,
   };
+}
+
+
+export interface TemporalEntityDescriptor extends EntityDescriptor {
+  readonly id: EntityId;
+}
+
+export interface TemporalContextRequest extends ContextRequest {
+  /** World-valid time to compile. */
+  readonly validAt: string;
+  /** Knowledge/transaction cutoff to replay. */
+  readonly knownAt: string;
+}
+
+export interface TemporalContextCompilerOptions {
+  readonly entities: readonly TemporalEntityDescriptor[];
+  readonly observations: readonly TemporalObservation[];
+  readonly authorityByEntity?: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+}
+
+function contextValue(value: StateValue): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function readableProperty(property: string): string {
+  return property
+    .replace(/([a-z\d])([A-Z])/g, "$1 $2")
+    .replace(/[._]+/g, " ")
+    .trim();
+}
+
+function stateRecord(
+  entityId: EntityId,
+  property: string,
+  state: TemporalStateResolution["canonical"]["properties"][string],
+  resolution: TemporalStateResolution,
+): ContextRecord {
+  return {
+    id: `temporal-state:${entityId}:${property}`,
+    entityId,
+    kind: "state",
+    text: `${readableProperty(property)}: ${contextValue(state.value)}. source=${state.source.provider}. validAt=${resolution.validAt}. knownAt=${resolution.knownAt}.`,
+    importance: 1,
+    evidenceRefs: resolution.evidence[property]?.map((item) => item.observationId) ?? [],
+  };
+}
+
+function conflictValues(conflict: Conflict): string {
+  return conflict.candidates
+    .map((candidate) => `${candidate.provider}=${contextValue(candidate.value)}`)
+    .join("; ");
+}
+
+function conflictRecord(
+  entityId: EntityId,
+  conflict: Conflict,
+  resolution: TemporalStateResolution,
+): ContextRecord {
+  return {
+    id: `temporal-conflict:${entityId}:${conflict.property}`,
+    entityId,
+    kind: "state",
+    text: `Unresolved conflict for ${readableProperty(conflict.property)}: ${conflictValues(conflict)}. Do not assert a single value.`,
+    importance: 1,
+    evidenceRefs: resolution.conflictEvidence[conflict.property]
+      ?.map((item) => item.observationId) ?? [],
+  };
+}
+
+function recordsForResolution(resolution: TemporalStateResolution): ContextRecord[] {
+  const canonical = Object.entries(resolution.canonical.properties)
+    .map(([property, state]) => stateRecord(resolution.entityId, property, state, resolution));
+  const conflicts = resolution.conflicts
+    .map((conflict) => conflictRecord(resolution.entityId, conflict, resolution));
+  return [...canonical, ...conflicts];
+}
+
+export class TemporalContextCompiler {
+  readonly #entities: readonly TemporalEntityDescriptor[];
+  readonly #observationsByEntity = new Map<EntityId, TemporalObservation[]>();
+  readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly #entityResolver: ContextIndex;
+
+  constructor(options: TemporalContextCompilerOptions) {
+    this.#entities = options.entities;
+    this.#authorityByEntity = options.authorityByEntity ?? new Map();
+    this.#entityResolver = new ContextIndex({ entities: options.entities, records: [] });
+
+    for (const observation of options.observations) {
+      const current = this.#observationsByEntity.get(observation.entityId) ?? [];
+      current.push(observation);
+      this.#observationsByEntity.set(observation.entityId, current);
+    }
+  }
+
+  compile(request: TemporalContextRequest): ContextPackage {
+    const resolvedEntityIds = this.#entityResolver
+      .resolveEntities(request.query)
+      .filter((entityId): entityId is EntityId => entityId.startsWith("entity://"));
+
+    const records = resolvedEntityIds.flatMap((entityId) => {
+      const resolution = resolveTemporalState({
+        entityId,
+        observations: this.#observationsByEntity.get(entityId) ?? [],
+        validAt: request.validAt,
+        knownAt: request.knownAt,
+        authority: this.#authorityByEntity.get(entityId) ?? [],
+      });
+      return recordsForResolution(resolution);
+    });
+
+    if (resolvedEntityIds.length === 0 || records.length === 0) {
+      return {
+        records: [],
+        resolvedEntityIds,
+        estimatedTokens: 0,
+        consideredRecords: records.length,
+      };
+    }
+
+    return new ContextIndex({ entities: this.#entities, records }).compile(request);
+  }
 }

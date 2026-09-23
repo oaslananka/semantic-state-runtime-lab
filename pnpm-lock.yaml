@@ -205,7 +205,11 @@ importers:
         specifier: workspace:*
         version: link:../core
 
-  packages/context: {}
+  packages/context:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
 
   packages/core: {}
 
