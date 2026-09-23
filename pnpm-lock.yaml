@@ -178,6 +178,12 @@ importers:
 
   packages/core: {}
 
+  packages/runtime:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+
 packages:
 
   '@jridgewell/resolve-uri@3.1.2':
