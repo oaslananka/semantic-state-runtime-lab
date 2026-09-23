@@ -11,12 +11,13 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import type {
   ExternalBinding,
-  Mutation,
+  ExternalSnapshot,
 } from "@ssrl/core";
 import {
   InMemoryStateProvider,
   ReconciliationApplyError,
   reconcileOnce,
+  type StateProvider,
 } from "@ssrl/runtime";
 import type { ConnectorManifest } from "@ssrl/connector-sdk";
 import {
@@ -103,6 +104,11 @@ function binding(provider = "markdown", externalId = "Projects/Atlas.md"): Exter
   };
 }
 
+function requiredRevision(snapshot: ExternalSnapshot): string {
+  if (snapshot.revision === undefined) throw new Error("Expected connector revision");
+  return snapshot.revision;
+}
+
 async function seed(root: string, relativePath = "Projects/Atlas.md"): Promise<string> {
   const file = join(root, ...relativePath.split("/"));
   await mkdir(dirname(file), { recursive: true });
@@ -161,7 +167,7 @@ describe("MarkdownFilesystemConnector", () => {
       canonicalProperty: "Project.deadline",
       nextValue: "2026-11-20",
       previousValue: "2026-11-15",
-      baseRevision: snapshot.revision,
+      baseRevision: requiredRevision(snapshot),
     });
 
     const after = await readFile(file, "utf8");
@@ -185,7 +191,7 @@ describe("MarkdownFilesystemConnector", () => {
       canonicalProperty: "Project.owner",
       nextValue: "Bob",
       previousValue: "Alice",
-      baseRevision: snapshot.revision,
+      baseRevision: requiredRevision(snapshot),
     });
 
     const observed = await connector.observe(binding());
@@ -211,7 +217,7 @@ describe("MarkdownFilesystemConnector", () => {
       canonicalProperty: "Project.deadline",
       nextValue: "2026-11-20",
       previousValue: "2026-11-15",
-      baseRevision: snapshot.revision,
+      baseRevision: requiredRevision(snapshot),
     })).rejects.toBeInstanceOf(StaleMarkdownFileError);
 
     expect(await readFile(file, "utf8")).toContain("deadline: 2026-11-15");
@@ -285,7 +291,7 @@ describe("MarkdownFilesystemConnector", () => {
         strategy: { kind: "provider", provider: "primary" },
       }],
       registry: {
-        providers: new Map([
+        providers: new Map<string, StateProvider>([
           [primary.id, primary],
           [markdown.id, markdown],
         ]),
@@ -302,34 +308,72 @@ describe("MarkdownFilesystemConnector", () => {
     const root = await vault();
     const file = await seed(root);
     const markdown = new MarkdownFilesystemConnector({ root, manifest: manifest() });
-    const markdownBinding: ExternalBinding = {
-      ...binding(),
-      fields: [binding().fields[0]!],
-    };
-    const snapshot = await markdown.observe(markdownBinding);
+    let raced = false;
 
-    await writeFile(
-      file,
-      (await readFile(file, "utf8")).replace("status: active", "status: changed-elsewhere"),
-      "utf8",
+    const racingProvider: StateProvider = {
+      id: markdown.id,
+      async observe(externalBinding) {
+        const snapshot = await markdown.observe(externalBinding);
+        if (!raced) {
+          raced = true;
+          await writeFile(
+            file,
+            (await readFile(file, "utf8")).replace("status: active", "status: changed-elsewhere"),
+            "utf8",
+          );
+        }
+        return snapshot;
+      },
+      apply(mutation) {
+        return markdown.apply(mutation);
+      },
+    };
+
+    const primary = new InMemoryStateProvider(
+      "primary",
+      [{ externalId: "atlas", values: { deadline: "2026-11-20" } }],
+      () => "2026-09-23T21:00:00Z",
     );
 
-    const mutation: Mutation = {
-      provider: "markdown",
-      externalId: "Projects/Atlas.md",
-      externalPath: "deadline",
-      canonicalProperty: "Project.deadline",
-      nextValue: "2026-11-20",
-      previousValue: "2026-11-15",
-      baseRevision: snapshot.revision,
-    };
-
-    const primary = new InMemoryStateProvider("unused", []);
-    const runtimeError = new ReconciliationApplyError(mutation, [], {
-      cause: new StaleMarkdownFileError(snapshot.revision, "sha256:changed"),
-    });
-
-    expect(runtimeError.cause).toBeInstanceOf(StaleMarkdownFileError);
-    expect(primary.id).toBe("unused");
+    await expect(reconcileOnce({
+      entityId: "entity://project/atlas",
+      bindings: [
+        {
+          entityId: "entity://project/atlas",
+          provider: "primary",
+          externalId: "atlas",
+          fields: [{
+            canonical: "Project.deadline",
+            external: "deadline",
+            readable: true,
+            writable: false,
+          }],
+        },
+        {
+          entityId: "entity://project/atlas",
+          provider: "markdown",
+          externalId: "Projects/Atlas.md",
+          fields: [{
+            canonical: "Project.deadline",
+            external: "deadline",
+            readable: true,
+            writable: true,
+          }],
+        },
+      ],
+      authority: [{
+        property: "Project.deadline",
+        strategy: { kind: "provider", provider: "primary" },
+      }],
+      registry: {
+        providers: new Map<string, StateProvider>([
+          [primary.id, primary],
+          [racingProvider.id, racingProvider],
+        ]),
+      },
+    })).rejects.toMatchObject({
+      name: "ReconciliationApplyError",
+      cause: expect.any(StaleMarkdownFileError),
+    } satisfies Partial<ReconciliationApplyError>);
   });
 });
