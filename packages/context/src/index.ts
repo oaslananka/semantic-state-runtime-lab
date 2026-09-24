@@ -915,3 +915,66 @@ export class GraphContextCompiler {
     };
   }
 }
+
+
+export interface ContextCapsuleView {
+  readonly entityId: EntityId;
+  readonly material: {
+    readonly entity: TypedEntity;
+    readonly state: Pick<
+      TemporalStateResolution,
+      "canonical" | "conflicts" | "evidence" | "conflictEvidence"
+    >;
+    readonly activeRelations: readonly TemporalRelationEdge[];
+  };
+}
+
+export interface CapsuleContextProjectionOptions {
+  readonly relationTypes: readonly RelationTypeDescriptor[];
+  readonly properties?: readonly ContextPropertyDescriptor[];
+}
+
+export function contextCorpusFromCapsules(
+  capsules: readonly ContextCapsuleView[],
+  options: CapsuleContextProjectionOptions,
+): ContextCorpus {
+  const entityMap = new Map<EntityId, TypedEntity>();
+  for (const capsule of capsules) {
+    entityMap.set(capsule.entityId, capsule.material.entity);
+  }
+  const relationTypes = new Map(options.relationTypes.map((type) => [type.id, type]));
+  const properties = new Map(
+    (options.properties ?? []).map((descriptor) => [descriptor.property, descriptor]),
+  );
+  const records: ContextRecord[] = [];
+
+  for (const capsule of [...capsules].sort((left, right) => left.entityId.localeCompare(right.entityId))) {
+    const state = capsule.material.state;
+    for (const [property, value] of Object.entries(state.canonical.properties)) {
+      records.push(resolvedContextRecord(
+        `capsule-state:${capsule.entityId}:${property}`,
+        capsule.entityId,
+        `${propertySearchText(property, properties)}: ${contextValue(value.value)}.`,
+        state.evidence[property]?.map((item) => item.observationId) ?? [],
+      ));
+    }
+    for (const conflict of state.conflicts) {
+      records.push(resolvedContextRecord(
+        `capsule-conflict:${capsule.entityId}:${conflict.property}`,
+        capsule.entityId,
+        `Unresolved conflict for ${propertySearchText(conflict.property, properties)}: ${conflictValues(conflict)}.`,
+        state.conflictEvidence[conflict.property]?.map((item) => item.observationId) ?? [],
+      ));
+    }
+    for (const relation of capsule.material.activeRelations) {
+      records.push(relationRecord(relation, entityMap, relationTypes));
+    }
+  }
+
+  return {
+    entities: [...entityMap.values()]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((entity) => ({ id: entity.id, aliases: entityAliases(entity) })),
+    records: records.sort((left, right) => left.id.localeCompare(right.id)),
+  };
+}
