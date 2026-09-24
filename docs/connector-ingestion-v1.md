@@ -54,26 +54,49 @@ If the process dies mid-round, it restarts from the previous completed checkpoin
 
 A checkpoint is persisted only after all semantic effects and projection state for the round are durable.
 
-## Replay-stable SourceChange
+## Provider draft vs resolved SourceChange
+
+Providers do not all supply a reliable modification timestamp on every change. Sparse deletion records are a common example. The source contract therefore separates the provider-owned draft from the fully resolved change used by semantic ingestion:
 
 ```ts
-interface SourceChange<TPayload = unknown> {
+interface SourceChangeDraft<TPayload = unknown> {
   changeId: string;
   externalType: string;
   externalId: string;
   kind: "upsert" | "delete";
-  effectiveAt: string;
-  recordedAt: string;
+  effectiveAt?: string;
+  recordedAt?: string;
   revision?: string;
   payload?: TPayload;
 }
+
+interface SourceChange<TPayload = unknown> extends SourceChangeDraft<TPayload> {
+  effectiveAt: string;
+  recordedAt: string;
+}
 ```
 
-`changeId`, `effectiveAt`, and `recordedAt` must be replay-stable.
+`changeId` remains provider/adapter replay-stable. The engine resolves omitted times only on the first durable receipt:
 
-The engine never manufactures source-change identity from `Date.now()`.
+```text
+recordedAt = provider recordedAt ?? firstObservedAt
+effectiveAt = provider effectiveAt ?? provider recordedAt ?? firstObservedAt
+```
 
-The full envelope is canonicalized and durably recorded before semantic effects. Replaying the same `sourceKey + changeId` with different content fails closed with `SourceChangeCollisionError`.
+The ingestion state store persists **both** canonical forms:
+
+```text
+provider draft identity
+resolved SourceChange
+```
+
+On replay, the same provider draft returns the stored resolved change and does not call the clock again. This keeps a sparse delete stable even if the process restarts hours later.
+
+Provider-supplied timestamps are never replaced by fallback time. The resolved receipt must preserve the provider-owned resource identity, kind, revision, payload, and any timestamps the provider did supply. A mismatched resolved receipt fails closed.
+
+Replaying the same `sourceKey + changeId` with different provider content still fails with `SourceChangeCollisionError`.
+
+The engine never uses wall-clock time as source-change **identity**. Fallback observation time is durable receipt data only.
 
 ## Durable mapped plan
 
@@ -169,7 +192,7 @@ Retraction `effectiveFrom` and `recordedAt` come directly from the normalized so
 For one source change:
 
 ```text
-1. assert durable source-change identity
+1. load or persist durable provider-draft + resolved source-change receipt
 2. load or persist durable mapped plan
 3. load previous resource projection
 4. derive semantic batch
@@ -238,7 +261,7 @@ The backend-neutral `IngestionStateStore` persists:
 
 - source checkpoints;
 - resource projections;
-- source-change receipts;
+- provider-draft + resolved source-change receipts;
 - mapped plans;
 - active/completed full-sync generations;
 - generation seen sets.
@@ -268,6 +291,9 @@ Tests cover:
 - multi-page initial sync;
 - continuation never persisted as checkpoint;
 - duplicate delivery is idempotent;
+- missing provider timestamps are stamped once and reused across replay;
+- provider-supplied timestamps remain authoritative;
+- resolved receipts cannot mutate provider-owned source fields;
 - changed observation slot;
 - removed observation slot;
 - changed relation slot;

@@ -17,6 +17,7 @@ export default defineConfig({
       "@ssrl/runtime-host": source("./packages/runtime-host/src/index.ts"),
       "@ssrl/context": source("./packages/context/src/index.ts"),
       "@ssrl/connector-sdk": source("./packages/connector-sdk/src/index.ts"),
+      "@ssrl/connector-google-calendar": source("./packages/connector-google-calendar/src/index.ts"),
       "@ssrl/connector-markdown-fs": source("./packages/connector-markdown-fs/src/index.ts"),
       "@ssrl/storage-sqlite": source("./packages/storage-sqlite/src/index.ts"),
       "@ssrl/mcp-server": source("./packages/mcp-server/src/index.ts"),

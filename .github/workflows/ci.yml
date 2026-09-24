@@ -53,3 +53,6 @@ jobs:
 
       - name: Context benchmark v2 smoke test
         run: pnpm benchmark:context:v2
+
+      - name: Google Calendar fixture benchmark smoke test
+        run: pnpm benchmark:google-calendar:v1
