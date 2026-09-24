@@ -9,6 +9,8 @@ export default defineConfig({
   resolve: {
     alias: {
       "@ssrl/core": source("./packages/core/src/index.ts"),
+      "@ssrl/artifact-store": source("./packages/artifact-store/src/index.ts"),
+      "@ssrl/storage-local-artifacts": source("./packages/storage-local-artifacts/src/index.ts"),
       "@ssrl/state-store": source("./packages/state-store/src/index.ts"),
       "@ssrl/materializer": source("./packages/materializer/src/index.ts"),
       "@ssrl/ingestion": source("./packages/ingestion/src/index.ts"),
