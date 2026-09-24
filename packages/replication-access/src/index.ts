@@ -19,12 +19,7 @@ import {
 } from "@ssrl/replication/merkle";
 import {
   FrozenPrefixMerkleView,
-  type LeafPageOptions,
-  type MerkleNodeHashResponse,
-  type MerkleNodeRef,
-  type NodeQueryOptions,
   type ReconciliationEndpoint,
-  type ReconciliationLeafPage,
   type ReconciliationViewInfo,
 } from "@ssrl/replication/sync";
 
@@ -495,7 +490,7 @@ export class ReplicationAccessGateway {
     }
 
     const index = await buildPrefixMerkleIndex(
-      allowed.map(replicationDescriptor),
+      allowed.map((record) => replicationDescriptor(record)),
       input.prefixBits === undefined ? {} : { prefixBits: input.prefixBits },
     );
     const frozen = await FrozenPrefixMerkleView.open(index);
