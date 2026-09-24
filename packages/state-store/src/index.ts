@@ -2,13 +2,15 @@ import {
   canonicalJson,
   normalizeEntityAlias,
   type EntityId,
+  type SemanticRetraction,
+  type SourceRef,
   type StateValue,
   type TemporalObservation,
   type TemporalRelationEdge,
   type TypedEntity,
 } from "@ssrl/core";
 
-export const SEMANTIC_STATE_SNAPSHOT_SCHEMA = "ssrl-semantic-state-snapshot-v1" as const;
+export const SEMANTIC_STATE_SNAPSHOT_SCHEMA = "ssrl-semantic-state-snapshot-v2" as const;
 
 export interface SemanticEntity {
   readonly entityId: EntityId;
@@ -28,6 +30,7 @@ export interface SemanticStateBatch {
   readonly aliases?: readonly EntityAliasRecord[];
   readonly observations?: readonly TemporalObservation[];
   readonly relations?: readonly TemporalRelationEdge[];
+  readonly retractions?: readonly SemanticRetraction[];
 }
 
 export interface SemanticAppendCounts {
@@ -35,6 +38,7 @@ export interface SemanticAppendCounts {
   readonly aliases: number;
   readonly observations: number;
   readonly relations: number;
+  readonly retractions: number;
 }
 
 
@@ -64,6 +68,7 @@ export interface SemanticStateSnapshot {
   readonly aliases: readonly EntityAliasRecord[];
   readonly observations: readonly TemporalObservation[];
   readonly relations: readonly TemporalRelationEdge[];
+  readonly retractions: readonly SemanticRetraction[];
 }
 
 export interface AliasLookupMatch {
@@ -83,11 +88,12 @@ export interface SemanticStateStore {
   aliasesForEntity(entityId: EntityId): Promise<readonly EntityAliasRecord[]>;
   observationsForEntity(entityId: EntityId): Promise<readonly TemporalObservation[]>;
   relationsFromEntity(entityId: EntityId): Promise<readonly TemporalRelationEdge[]>;
+  retractionsForEntity(entityId: EntityId): Promise<readonly SemanticRetraction[]>;
   lookupAlias(value: string): Promise<AliasLookupResult>;
   changesAfter(cursor?: SemanticChangeCursor, limit?: number): Promise<SemanticChangePage>;
 }
 
-export type SemanticRecordKind = "entity" | "alias" | "observation" | "relation";
+export type SemanticRecordKind = "entity" | "alias" | "observation" | "relation" | "retraction";
 
 export class SemanticRecordCollisionError extends Error {
   constructor(
@@ -103,6 +109,16 @@ export class UnknownSemanticEntityError extends Error {
   constructor(readonly entityId: EntityId) {
     super(`Semantic record references unknown entity ${entityId}`);
     this.name = "UnknownSemanticEntityError";
+  }
+}
+
+export class UnknownSemanticTargetError extends Error {
+  constructor(
+    readonly targetKind: "observation" | "relation",
+    readonly targetId: string,
+  ) {
+    super(`Semantic retraction references unknown ${targetKind} ${targetId}`);
+    this.name = "UnknownSemanticTargetError";
   }
 }
 
@@ -200,8 +216,20 @@ export function normalizeEntityAliasRecord(value: EntityAliasRecord): EntityAlia
   };
 }
 
+function normalizedSourceRef(value: SourceRef, label: string): SourceRef {
+  const source = plainObject(value, label);
+  const revision = source.revision === undefined
+    ? undefined
+    : requiredString(source.revision, `${label}.revision`);
+  return {
+    provider: requiredString(source.provider, `${label}.provider`),
+    externalId: requiredString(source.externalId, `${label}.externalId`),
+    ...(revision === undefined ? {} : { revision }),
+  };
+}
+
 export function normalizeTemporalObservation(value: TemporalObservation): TemporalObservation {
-  const source = plainObject(value.source, "observation.source");
+  const source = normalizedSourceRef(value.source, "observation.source");
   const validFrom = isoTimestamp(value.validFrom, "observation.validFrom");
   const validTo = value.validTo === undefined
     ? undefined
@@ -209,19 +237,12 @@ export function normalizeTemporalObservation(value: TemporalObservation): Tempor
   if (validTo !== undefined && Date.parse(validTo) <= Date.parse(validFrom)) {
     throw new TypeError("observation.validTo must be after validFrom");
   }
-  const revision = source.revision === undefined
-    ? undefined
-    : requiredString(source.revision, "observation.source.revision");
   return {
     id: requiredString(value.id, "observation.id"),
     entityId: entityIdValue(value.entityId, "observation.entityId"),
     property: requiredString(value.property, "observation.property"),
     value: normalizedStateValue(value.value, "observation.value"),
-    source: {
-      provider: requiredString(source.provider, "observation.source.provider"),
-      externalId: requiredString(source.externalId, "observation.source.externalId"),
-      ...(revision === undefined ? {} : { revision }),
-    },
+    source,
     validFrom,
     ...(validTo === undefined ? {} : { validTo }),
     recordedAt: isoTimestamp(value.recordedAt, "observation.recordedAt"),
@@ -249,6 +270,25 @@ export function normalizeTemporalRelation(value: TemporalRelationEdge): Temporal
   };
 }
 
+export function normalizeSemanticRetraction(value: SemanticRetraction): SemanticRetraction {
+  const refs = normalizedEvidenceRefs(value.evidenceRefs, "retraction.evidenceRefs");
+  const source = value.source === undefined
+    ? undefined
+    : normalizedSourceRef(value.source, "retraction.source");
+  if (value.targetKind !== "observation" && value.targetKind !== "relation") {
+    throw new TypeError("retraction.targetKind must be observation or relation");
+  }
+  return {
+    id: requiredString(value.id, "retraction.id"),
+    targetKind: value.targetKind,
+    targetId: requiredString(value.targetId, "retraction.targetId"),
+    effectiveFrom: isoTimestamp(value.effectiveFrom, "retraction.effectiveFrom"),
+    recordedAt: isoTimestamp(value.recordedAt, "retraction.recordedAt"),
+    ...(source === undefined ? {} : { source }),
+    ...(refs === undefined ? {} : { evidenceRefs: refs }),
+  };
+}
+
 export function semanticEntityJson(value: SemanticEntity): string {
   return canonicalJson(normalizeSemanticEntity(value));
 }
@@ -263,6 +303,10 @@ export function temporalObservationJson(value: TemporalObservation): string {
 
 export function temporalRelationJson(value: TemporalRelationEdge): string {
   return canonicalJson(normalizeTemporalRelation(value));
+}
+
+export function semanticRetractionJson(value: SemanticRetraction): string {
+  return canonicalJson(normalizeSemanticRetraction(value));
 }
 
 function parseJsonObject(value: string, label: string): Readonly<Record<string, unknown>> {
@@ -308,6 +352,14 @@ export function parseTemporalRelationJson(value: string): TemporalRelationEdge {
   return parseNormalized(value, "temporal relation", normalizeTemporalRelation as (record: never) => TemporalRelationEdge);
 }
 
+export function parseSemanticRetractionJson(value: string): SemanticRetraction {
+  return parseNormalized(
+    value,
+    "semantic retraction",
+    normalizeSemanticRetraction as (record: never) => SemanticRetraction,
+  );
+}
+
 export function emptySemanticStateSnapshot(): SemanticStateSnapshot {
   return {
     schema: SEMANTIC_STATE_SNAPSHOT_SCHEMA,
@@ -315,6 +367,7 @@ export function emptySemanticStateSnapshot(): SemanticStateSnapshot {
     aliases: [],
     observations: [],
     relations: [],
+    retractions: [],
   };
 }
 

@@ -29,7 +29,7 @@ A change contains:
 ```ts
 interface SemanticChange {
   cursor: SemanticChangeCursor;
-  kind: "entity" | "alias" | "observation" | "relation";
+  kind: "entity" | "alias" | "observation" | "relation" | "retraction";
   recordId: string;
   primaryEntityId: EntityId;
   affectedEntityIds: readonly EntityId[];
@@ -54,6 +54,8 @@ affectedEntityIds = sorted unique [relation.from, relation.to]
 
 The current capsule contains **outgoing** relations, so a relation insertion rematerializes the source capsule. The target remains visible in affected metadata for future reverse-index/invalidation use.
 
+A retraction inherits invalidation scope from its target: observation retractions invalidate the observation owner; relation retractions use the relation source as primary and both endpoints as affected.
+
 ## Transactional feed invariant
 
 A change row is inserted in the same SQLite transaction as the semantic record.
@@ -66,7 +68,7 @@ semantic insert rolled back -> change rolled back
 idempotent replay/no insert -> no new change
 ```
 
-There is no orphan change and no inserted semantic record without a corresponding change in schema v2.
+There is no orphan change and no inserted semantic record without a corresponding change in schema v2+. Retractions use the same transaction invariant.
 
 ## Store-bound opaque cursors
 
@@ -101,6 +103,8 @@ Opening a v1 database performs one atomic migration:
 
 The bootstrap means an incremental consumer can start from no cursor after upgrade and discover all pre-existing semantic state without a special full-snapshot mode.
 
+Schema v3 adds `semantic_retractions` and extends the existing change feed with `retraction`. Its migration preserves the persistent feed ID and existing sequence values, so a cursor issued on v2 remains valid on v3.
+
 ## Entity-scoped reads
 
 The store now supports:
@@ -110,6 +114,7 @@ entity(entityId)
 aliasesForEntity(entityId)
 observationsForEntity(entityId)
 relationsFromEntity(entityId)
+retractionsForEntity(entityId)
 ```
 
 The materializer does not call `snapshot()` for ordinary entity refreshes.
@@ -134,6 +139,7 @@ interface ContextCapsule {
       conflictEvidence;
     };
     activeRelations: readonly TemporalRelationEdge[];
+    appliedRetractions: readonly SemanticRetraction[];
     nextTemporalBoundary?: string;
   };
 }
@@ -180,6 +186,7 @@ The materializer therefore computes `nextTemporalBoundary` from:
 - observation activation/deactivation boundaries
 - relation activation/deactivation boundaries
 - future alias `recordedAt`
+- scheduled retraction transitions
 
 For current-state capsules where `validAt == knownAt == now`, a temporal record becomes active at:
 
@@ -189,7 +196,7 @@ max(validFrom, recordedAt)
 
 provided that instant is before `validTo`.
 
-An active record can deactivate at `validTo`.
+An active record can deactivate at `validTo`. A known scheduled retraction can also invalidate its target at `max(effectiveFrom, recordedAt)` for current-state materialization, provided it shortens the target's original interval.
 
 `ContextCapsuleStore.staleEntityIds(at, configurationVersion)` marks a capsule stale when:
 
@@ -288,6 +295,9 @@ Tests cover:
 - zero-write September refresh to GraphQL
 - Alice timezone change rematerializes Alice only
 - relation change rematerializes source Project only
+- observation/relation retraction changes rematerialize their primary entity only
+- scheduled retraction refreshes at its temporal boundary even with an empty feed
+- cached BM25 projection excludes retracted state and relations
 - worker failure before checkpoint safely replays
 - configuration-version invalidation
 - capsule material deterministic under append array reordering
@@ -303,15 +313,16 @@ Tests cover:
 - raw artifact invalidation
 - automatic authority-policy persistence
 - background cloud scheduler
-- deletion/tombstone propagation
+- entity tombstone propagation / physical privacy erasure
 
 ## Next step
 
-The next major product layer is **ingestion**:
+The next major product layer is **connector ingestion/checkpointing**:
 
 ```text
 connector event / file watcher / webhook
   -> deterministic semantic extraction/normalization
+  -> map source updates/deletes to assertions + retractions
   -> SemanticStateStore.append()
   -> durable change feed
   -> incremental capsule refresh

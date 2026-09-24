@@ -246,6 +246,103 @@ describe("incremental context capsules", () => {
     state.close();
   });
 
+  it("rematerializes the target entity when a retraction change removes current state", async () => {
+    const { state, cache, worker } = await seededRuntime();
+    await worker.runOnce({ at: "2026-09-01T00:00:00Z" });
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("GraphQL");
+
+    await state.append({
+      retractions: [{
+        id: "retract-graphql",
+        targetKind: "observation",
+        targetId: "api-graphql",
+        effectiveFrom: "2026-09-20T00:00:00Z",
+        recordedAt: "2026-09-20T00:00:00Z",
+        evidenceRefs: ["adr:deleted"],
+      }],
+    });
+    const run = await worker.runOnce({ at: "2026-09-24T00:00:00Z" });
+    const capsule = await cache.get(project);
+
+    expect(run.changedEntityIds).toEqual([project]);
+    expect(run.materializedEntityIds).toEqual([project]);
+    expect(capsule?.material.state.canonical.properties["Project.apiStyle"]).toBeUndefined();
+    expect(capsule?.material.appliedRetractions.map((item) => item.id))
+      .toEqual(["retract-graphql"]);
+    state.close();
+  });
+
+  it("refreshes at a scheduled relation retraction boundary with an empty change feed", async () => {
+    const { state, cache, worker } = await seededRuntime();
+    await state.append({
+      retractions: [{
+        id: "scheduled-owner-removal",
+        targetKind: "relation",
+        targetId: "owner-alice",
+        effectiveFrom: "2026-10-01T00:00:00Z",
+        recordedAt: "2026-09-01T00:00:00Z",
+      }],
+    });
+    await worker.runOnce({ at: "2026-09-15T00:00:00Z" });
+    const before = await cache.get(project);
+    expect(before?.material.activeRelations.map((relation) => relation.id)).toEqual(["owner-alice"]);
+    expect(before?.material.nextTemporalBoundary).toBe("2026-10-01T00:00:00.000Z");
+
+    const refresh = await worker.runOnce({ at: "2026-10-02T00:00:00Z" });
+    const after = await cache.get(project);
+    expect(refresh.changesRead).toBe(0);
+    expect(refresh.staleEntityIds).toEqual([project]);
+    expect(after?.material.activeRelations).toEqual([]);
+    expect(after?.material.appliedRetractions.map((item) => item.id))
+      .toEqual(["scheduled-owner-removal"]);
+    state.close();
+  });
+
+  it("does not project retracted state or relations into cached BM25 context", async () => {
+    const { state, materializer: mat } = await seededRuntime();
+    await state.append({
+      retractions: [
+        {
+          id: "retract-graphql-context",
+          targetKind: "observation",
+          targetId: "api-graphql",
+          effectiveFrom: "2026-09-01T00:00:00Z",
+          recordedAt: "2026-09-02T00:00:00Z",
+        },
+        {
+          id: "retract-owner-context",
+          targetKind: "relation",
+          targetId: "owner-alice",
+          effectiveFrom: "2026-09-01T00:00:00Z",
+          recordedAt: "2026-09-02T00:00:00Z",
+        },
+      ],
+    });
+    const capsule = await mat.materializeEntity(project, "2026-09-24T00:00:00Z");
+    if (capsule === undefined) throw new Error("expected project capsule");
+    const corpus = contextCorpusFromCapsules([capsule], {
+      relationTypes: [{ id: "Project.owner", aliases: ["owner"] }],
+      properties: [{ property: "Project.apiStyle", aliases: ["api style"] }],
+    });
+    const result = bm25Baseline(
+      corpus,
+      { query: "Project Atlas owner API GraphQL Alice", budgetTokens: 160 },
+      [project],
+    );
+    const text = result.records.map((record) => record.text).join("\n");
+
+    expect(capsule.material.activeRelations).toEqual([]);
+    expect(capsule.material.state.canonical.properties["Project.apiStyle"]).toBeUndefined();
+    expect(text).not.toContain("GraphQL");
+    expect(text).not.toContain("Alice");
+    expect(capsule.material.appliedRetractions.map((item) => item.id)).toEqual([
+      "retract-graphql-context",
+      "retract-owner-context",
+    ]);
+    state.close();
+  });
+
   it("does not advance the checkpoint until every affected capsule write succeeds", async () => {
     const failCache = new FailOnceCapsuleStore(project);
     const { state, worker } = await seededRuntime(failCache);

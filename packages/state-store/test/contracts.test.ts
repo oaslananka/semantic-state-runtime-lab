@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   entityAliasJson,
   normalizeTemporalObservation,
+  semanticRetractionJson,
   typedEntitiesFromStateSnapshot,
   type SemanticStateSnapshot,
 } from "../src/index.js";
@@ -23,6 +24,29 @@ describe("state-store contracts", () => {
       value: "Atlas",
       recordedAt: "2026-09-24T00:00:00Z",
       evidenceRefs: ["a", "b"],
+    });
+
+    expect(second).toBe(first);
+  });
+
+  it("canonicalizes semantically equivalent retractions for idempotent persistence", () => {
+    const first = semanticRetractionJson({
+      id: "retract-owner",
+      targetKind: "relation",
+      targetId: "owner-alice",
+      effectiveFrom: "2026-10-01T03:00:00+03:00",
+      recordedAt: "2026-09-20T03:00:00+03:00",
+      source: { provider: "directory", externalId: "owner-alice", revision: "r1" },
+      evidenceRefs: ["event:b", "event:a", "event:a"],
+    });
+    const second = semanticRetractionJson({
+      id: "retract-owner",
+      targetKind: "relation",
+      targetId: "owner-alice",
+      effectiveFrom: "2026-10-01T00:00:00Z",
+      recordedAt: "2026-09-20T00:00:00Z",
+      source: { provider: "directory", externalId: "owner-alice", revision: "r1" },
+      evidenceRefs: ["event:a", "event:b"],
     });
 
     expect(second).toBe(first);
@@ -56,7 +80,7 @@ describe("state-store contracts", () => {
 
   it("hydrates typed entities from alias evidence deterministically", () => {
     const snapshot: SemanticStateSnapshot = {
-      schema: "ssrl-semantic-state-snapshot-v1",
+      schema: "ssrl-semantic-state-snapshot-v2",
       entities: [{ entityId: project, entityType: "Project" }],
       aliases: [
         {
@@ -75,6 +99,7 @@ describe("state-store contracts", () => {
       ],
       observations: [],
       relations: [],
+      retractions: [],
     };
 
     expect(typedEntitiesFromStateSnapshot(snapshot)).toEqual([{

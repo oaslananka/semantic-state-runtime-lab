@@ -3,6 +3,7 @@ import type {
   AuthorityRule,
   EntityTypeDescriptor,
   RelationTypeDescriptor,
+  SemanticRetraction,
   TemporalObservation,
   TemporalRelationEdge,
   TypedEntity,
@@ -133,6 +134,7 @@ const authorityByEntity: ReadonlyMap<string, readonly AuthorityRule[]> = new Map
 function compiler(options: {
   readonly visibility?: ContextVisibilityPolicy;
   readonly maxRelationEdges?: number;
+  readonly retractions?: readonly SemanticRetraction[];
 } = {}) {
   return new GraphContextCompiler({
     entityTypes,
@@ -210,6 +212,28 @@ describe("GraphContextCompiler", () => {
     expect(result.entityResolution.status).toBe("ambiguous");
     expect(result.records).toEqual([]);
     expect(result.traversal.traversedEdges).toBe(0);
+  });
+
+  it("does not traverse a relation that is retracted at the requested valid/known time", () => {
+    const result = compiler({
+      retractions: [{
+        id: "retract-owner-alice",
+        targetKind: "relation",
+        targetId: "atlas-owner-alice",
+        effectiveFrom: "2026-09-01T00:00:00Z",
+        recordedAt: "2026-09-02T00:00:00Z",
+      }],
+    }).compile({
+      query: "Atlas projesinin sahibi kim ve sahibi hangi saat diliminde?",
+      budgetTokens: 160,
+      ...current,
+    });
+    const text = result.records.map((record) => record.text).join("\n");
+
+    expect(result.traversal.edgeIds).not.toContain("atlas-owner-alice");
+    expect(result.traversal.relatedEntityIds).not.toContain(alice);
+    expect(text).not.toContain("Alice");
+    expect(text).not.toContain("Europe/Istanbul");
   });
 
   it("does not traverse into a policy-denied related entity", () => {
@@ -304,6 +328,27 @@ describe("GraphContextCompiler", () => {
     });
 
     expect(JSON.stringify(result)).not.toContain(alice);
+  });
+
+  it("rejects duplicate retraction ids even when they target different entities or record kinds", () => {
+    expect(() => compiler({
+      retractions: [
+        {
+          id: "duplicate-retraction",
+          targetKind: "relation",
+          targetId: "atlas-owner-alice",
+          effectiveFrom: "2026-09-01T00:00:00Z",
+          recordedAt: "2026-09-02T00:00:00Z",
+        },
+        {
+          id: "duplicate-retraction",
+          targetKind: "observation",
+          targetId: "alice-timezone",
+          effectiveFrom: "2026-09-01T00:00:00Z",
+          recordedAt: "2026-09-02T00:00:00Z",
+        },
+      ],
+    })).toThrow(/Duplicate semantic retraction id/);
   });
 
   it("rejects invalid graph bounds during construction", () => {

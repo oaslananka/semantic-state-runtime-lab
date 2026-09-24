@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   canonicalJson,
   resolveTemporalState,
+  type SemanticRetraction,
   type TemporalObservation,
   type TemporalRelationEdge,
 } from "@ssrl/core";
@@ -15,6 +16,7 @@ import {
   InvalidSemanticChangeCursorError,
   SemanticRecordCollisionError,
   UnknownSemanticEntityError,
+  UnknownSemanticTargetError,
   entityAliasJson,
   semanticEntityJson,
   temporalObservationJson,
@@ -78,6 +80,24 @@ function ownerRelation(
     ...(validTo === undefined ? {} : { validTo }),
     recordedAt: validFrom,
     evidenceRefs: [`directory:${id}`],
+  };
+}
+
+function semanticRetraction(
+  id: string,
+  targetKind: "observation" | "relation",
+  targetId: string,
+  effectiveFrom: string,
+  recordedAt: string,
+): SemanticRetraction {
+  return {
+    id,
+    targetKind,
+    targetId,
+    effectiveFrom,
+    recordedAt,
+    source: { provider: "source-sync", externalId: targetId, revision: id },
+    evidenceRefs: [`event:${id}`],
   };
 }
 
@@ -241,6 +261,42 @@ function createV1Database(path: string): void {
   raw.close();
 }
 
+async function createV2Database(path: string): Promise<SemanticChangeCursor> {
+  const current = new SQLiteSemanticStateStore({ path });
+  await current.append(baseBatch());
+  const cursor = (await current.changesAfter()).nextCursor;
+  if (cursor === undefined) throw new Error("expected v3 cursor before downgrade fixture");
+  current.close();
+
+  const raw = new DatabaseSync(path);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TABLE semantic_retractions;
+    ALTER TABLE semantic_changes RENAME TO semantic_changes_v3;
+    CREATE TABLE semantic_changes (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      record_kind TEXT NOT NULL CHECK(record_kind IN ('entity', 'alias', 'observation', 'relation')),
+      record_id TEXT NOT NULL,
+      primary_entity_id TEXT NOT NULL,
+      affected_entity_ids_json TEXT NOT NULL CHECK(json_valid(affected_entity_ids_json)),
+      UNIQUE(record_kind, record_id)
+    ) STRICT;
+    INSERT INTO semantic_changes(
+      sequence, record_kind, record_id, primary_entity_id, affected_entity_ids_json
+    )
+    SELECT sequence, record_kind, record_id, primary_entity_id, affected_entity_ids_json
+    FROM semantic_changes_v3
+    ORDER BY sequence;
+    DROP TABLE semantic_changes_v3;
+    UPDATE semantic_state_meta
+    SET schema_version = 2
+    WHERE component = 'semantic-state-store';
+    PRAGMA foreign_keys = ON;
+  `);
+  raw.close();
+  return cursor;
+}
+
 describe("SQLiteSemanticStateStore", () => {
   it("atomically persists a semantic batch and reopens with an identical deterministic snapshot", async () => {
     const path = await databasePath();
@@ -250,6 +306,7 @@ describe("SQLiteSemanticStateStore", () => {
       aliases: 3,
       observations: 4,
       relations: 2,
+      retractions: 0,
     });
     const before = await first.snapshot();
     first.close();
@@ -277,6 +334,7 @@ describe("SQLiteSemanticStateStore", () => {
       aliases: 0,
       observations: 0,
       relations: 0,
+      retractions: 0,
     });
     expect((await store.snapshot()).observations).toHaveLength(4);
     store.close();
@@ -305,7 +363,7 @@ describe("SQLiteSemanticStateStore", () => {
         recordedAt: "2026-09-24T00:00:00Z",
         evidenceRefs: ["a", "b"],
       }],
-    })).toEqual({ entities: 0, aliases: 0, observations: 0, relations: 0 });
+    })).toEqual({ entities: 0, aliases: 0, observations: 0, relations: 0, retractions: 0 });
     store.close();
   });
 
@@ -579,6 +637,181 @@ describe("SQLiteSemanticStateStore", () => {
     store.close();
   });
 
+  it("persists observation retractions with idempotent replay and entity-scoped provenance", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+    const item = semanticRetraction(
+      "retract-api-rest",
+      "observation",
+      "api-rest",
+      "2026-07-15T00:00:00Z",
+      "2026-07-20T00:00:00Z",
+    );
+
+    expect(await store.append({ retractions: [item] })).toEqual({
+      entities: 0,
+      aliases: 0,
+      observations: 0,
+      relations: 0,
+      retractions: 1,
+    });
+    expect((await store.retractionsForEntity(project)).map((value) => value.id))
+      .toEqual(["retract-api-rest"]);
+    expect((await store.snapshot()).retractions).toEqual([
+      expect.objectContaining({ id: "retract-api-rest", targetId: "api-rest" }),
+    ]);
+    store.close();
+
+    const reopened = new SQLiteSemanticStateStore({ path });
+    expect((await reopened.snapshot()).retractions).toEqual([
+      expect.objectContaining({ id: "retract-api-rest", targetId: "api-rest" }),
+    ]);
+    expect(await reopened.append({ retractions: [item] })).toEqual({
+      entities: 0,
+      aliases: 0,
+      observations: 0,
+      relations: 0,
+      retractions: 0,
+    });
+    const change = (await reopened.changesAfter()).changes.at(-1);
+    expect(change).toEqual(expect.objectContaining({
+      kind: "retraction",
+      recordId: "retract-api-rest",
+      primaryEntityId: project,
+      affectedEntityIds: [project],
+    }));
+    reopened.close();
+  });
+
+  it("rejects corrupted stored retraction JSON instead of silently casting it", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+    await store.append({
+      retractions: [semanticRetraction(
+        "corrupt-me",
+        "observation",
+        "api-rest",
+        "2026-07-01T00:00:00Z",
+        "2026-07-02T00:00:00Z",
+      )],
+    });
+    store.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare(`
+      UPDATE semantic_retractions
+      SET record_json = ?
+      WHERE retraction_id = ?
+    `).run(JSON.stringify({ id: "corrupt-me", targetKind: "observation" }), "corrupt-me");
+    raw.close();
+
+    const reopened = new SQLiteSemanticStateStore({ path });
+    await expect(reopened.retractionsForEntity(project))
+      .rejects.toBeInstanceOf(CorruptSemanticStateError);
+    reopened.close();
+  });
+
+  it("maps relation retraction invalidation to both relation endpoints", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+    await store.append({
+      retractions: [semanticRetraction(
+        "retract-owner-alice",
+        "relation",
+        "owner-alice",
+        "2026-09-01T00:00:00Z",
+        "2026-09-02T00:00:00Z",
+      )],
+    });
+
+    const change = (await store.changesAfter()).changes.at(-1);
+    expect(change?.kind).toBe("retraction");
+    expect(change?.primaryEntityId).toBe(project);
+    expect(change?.affectedEntityIds).toEqual([alice, project]);
+    store.close();
+  });
+
+  it("rolls back the whole batch for an unknown or wrong-kind retraction target", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+    const before = await store.changesAfter();
+
+    await expect(store.append({
+      entities: [{ entityId: "entity://person/rollback" as const, entityType: "Person" }],
+      retractions: [semanticRetraction(
+        "wrong-kind",
+        "relation",
+        "api-rest",
+        "2026-07-01T00:00:00Z",
+        "2026-07-02T00:00:00Z",
+      )],
+    })).rejects.toBeInstanceOf(UnknownSemanticTargetError);
+
+    expect(await store.entity("entity://person/rollback" as const)).toBeUndefined();
+    expect(await store.changesAfter()).toEqual(before);
+    store.close();
+  });
+
+  it("rolls back records before a colliding retraction id", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+    const first = semanticRetraction(
+      "same-retraction",
+      "observation",
+      "api-rest",
+      "2026-07-01T00:00:00Z",
+      "2026-07-02T00:00:00Z",
+    );
+    await store.append({ retractions: [first] });
+
+    await expect(store.append({
+      entities: [{ entityId: "entity://person/rollback-collision" as const, entityType: "Person" }],
+      retractions: [{ ...first, effectiveFrom: "2026-06-01T00:00:00Z" }],
+    })).rejects.toBeInstanceOf(SemanticRecordCollisionError);
+
+    expect(await store.entity("entity://person/rollback-collision" as const)).toBeUndefined();
+    store.close();
+  });
+
+  it("migrates v2 to v3 without changing feed identity or invalidating an issued cursor", async () => {
+    const path = await databasePath();
+    const oldCursor = await createV2Database(path);
+
+    const migrated = new SQLiteSemanticStateStore({ path });
+    expect(await migrated.changesAfter(oldCursor)).toEqual({
+      changes: [],
+      nextCursor: oldCursor,
+      hasMore: false,
+    });
+    await migrated.append({
+      retractions: [semanticRetraction(
+        "post-migration-retraction",
+        "observation",
+        "api-rest",
+        "2026-07-01T00:00:00Z",
+        "2026-07-02T00:00:00Z",
+      )],
+    });
+    const after = await migrated.changesAfter(oldCursor);
+    expect(after.changes).toHaveLength(1);
+    expect(after.changes[0]).toEqual(expect.objectContaining({
+      kind: "retraction",
+      recordId: "post-migration-retraction",
+    }));
+    migrated.close();
+
+    const raw = new DatabaseSync(path);
+    expect(raw.prepare(`
+      SELECT schema_version FROM semantic_state_meta WHERE component = 'semantic-state-store'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
+    raw.close();
+  });
+
   it("rejects malformed or foreign semantic change cursors", async () => {
     const path = await databasePath();
     const store = new SQLiteSemanticStateStore({ path });
@@ -636,7 +869,7 @@ describe("SQLiteSemanticStateStore", () => {
     const raw = new DatabaseSync(path);
     expect(raw.prepare(`
       SELECT schema_version FROM semantic_state_meta WHERE component = 'semantic-state-store'
-    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
     raw.close();
   });
 

@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   TypedEntityResolver,
   activeRelationEdges,
+  resolveActiveRelationEdges,
   type EntityTypeDescriptor,
   type TemporalRelationEdge,
   type TypedEntity,
 } from "../src/identity.js";
+import type { SemanticRetraction } from "../src/retraction.js";
 
 const project = "entity://project/atlas" as const;
 const person = "entity://person/atlas" as const;
@@ -143,6 +145,60 @@ describe("activeRelationEdges", () => {
     });
 
     expect(result).toEqual([]);
+  });
+
+  it("removes a relation after a known retraction while preserving earlier valid time", () => {
+    const retractions: readonly SemanticRetraction[] = [{
+      id: "owner-removed",
+      targetKind: "relation",
+      targetId: "owner-current",
+      effectiveFrom: "2026-09-10T00:00:00Z",
+      recordedAt: "2026-09-12T00:00:00Z",
+      evidenceRefs: ["directory:event-42"],
+    }];
+
+    const historical = resolveActiveRelationEdges({
+      edges,
+      retractions,
+      fromEntityIds: [project],
+      validAt: "2026-09-05T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+    });
+    const beforeKnowledge = resolveActiveRelationEdges({
+      edges,
+      retractions,
+      fromEntityIds: [project],
+      validAt: "2026-09-15T00:00:00Z",
+      knownAt: "2026-09-11T00:00:00Z",
+    });
+    const afterKnowledge = resolveActiveRelationEdges({
+      edges,
+      retractions,
+      fromEntityIds: [project],
+      validAt: "2026-09-15T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+    });
+
+    expect(historical.edges.map((edge) => edge.id)).toEqual(["owner-current"]);
+    expect(beforeKnowledge.edges.map((edge) => edge.id)).toEqual(["owner-current"]);
+    expect(afterKnowledge.edges).toEqual([]);
+    expect(afterKnowledge.appliedRetractions.map((item) => item.id)).toEqual(["owner-removed"]);
+  });
+
+  it("rejects relation retractions that target an unknown edge", () => {
+    expect(() => activeRelationEdges({
+      edges,
+      retractions: [{
+        id: "bad-retraction",
+        targetKind: "relation",
+        targetId: "missing-edge",
+        effectiveFrom: "2026-09-01T00:00:00Z",
+        recordedAt: "2026-09-02T00:00:00Z",
+      }],
+      fromEntityIds: [project],
+      validAt: "2026-09-24T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+    })).toThrow(/targets unknown relation/);
   });
 
   it("never traverses edges from entities outside the requested frontier", () => {

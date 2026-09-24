@@ -1,4 +1,11 @@
 import type { EntityId } from "./model.js";
+import {
+  effectiveRetractionEnd,
+  uniqueRetractions,
+  validateUniqueRetractionIds,
+  type SemanticRetraction,
+} from "./retraction.js";
+import { temporalWindowIsActive, timestamp } from "./time.js";
 
 export interface EntityAliasEvidence {
   readonly value: string;
@@ -62,6 +69,12 @@ export interface ActiveRelationQuery {
   readonly fromEntityIds: readonly EntityId[];
   readonly validAt: string;
   readonly knownAt: string;
+  readonly retractions?: readonly SemanticRetraction[];
+}
+
+export interface ActiveRelationResolution {
+  readonly edges: readonly TemporalRelationEdge[];
+  readonly appliedRetractions: readonly SemanticRetraction[];
 }
 
 export function normalizeEntityAlias(value: string): string {
@@ -211,12 +224,6 @@ export class TypedEntityResolver {
   }
 }
 
-function timestamp(value: string, label: string): number {
-  const result = Date.parse(value);
-  if (!Number.isFinite(result)) throw new Error(`Invalid ${label} timestamp: ${value}`);
-  return result;
-}
-
 function validateRelation(edge: TemporalRelationEdge): void {
   if (edge.id.length === 0) throw new Error("Relation edge id must not be empty");
   const validFrom = timestamp(edge.validFrom, "relation validFrom");
@@ -233,17 +240,20 @@ function relationIsActive(
   fromEntityIds: ReadonlySet<EntityId>,
   validAt: number,
   knownAt: number,
+  effectiveValidTo: number,
 ): boolean {
-  if (!fromEntityIds.has(edge.from)) return false;
-  const validTo = edge.validTo === undefined
-    ? Number.POSITIVE_INFINITY
-    : Date.parse(edge.validTo);
-  return Date.parse(edge.validFrom) <= validAt
-    && validAt < validTo
-    && Date.parse(edge.recordedAt) <= knownAt;
+  return fromEntityIds.has(edge.from) && temporalWindowIsActive({
+    validFrom: edge.validFrom,
+    recordedAt: edge.recordedAt,
+    validAt,
+    knownAt,
+    effectiveValidTo,
+  });
 }
 
-export function activeRelationEdges(input: ActiveRelationQuery): TemporalRelationEdge[] {
+export function resolveActiveRelationEdges(
+  input: ActiveRelationQuery,
+): ActiveRelationResolution {
   const validAt = timestamp(input.validAt, "relation validAt");
   const knownAt = timestamp(input.knownAt, "relation knownAt");
   const ids = new Set<string>();
@@ -252,13 +262,39 @@ export function activeRelationEdges(input: ActiveRelationQuery): TemporalRelatio
     ids.add(edge.id);
     validateRelation(edge);
   }
+  const retractions = input.retractions ?? [];
+  validateUniqueRetractionIds(retractions);
+  for (const retraction of retractions) {
+    if (retraction.targetKind !== "relation" || !ids.has(retraction.targetId)) {
+      throw new Error(`Semantic retraction ${retraction.id} targets unknown relation ${retraction.targetId}`);
+    }
+  }
   const fromEntityIds = new Set(input.fromEntityIds);
-  return input.edges
-    .filter((edge) => relationIsActive(edge, fromEntityIds, validAt, knownAt))
-    .sort((left, right) => (
+  const appliedRetractions: SemanticRetraction[] = [];
+  const edges = input.edges
+    .filter((edge) => {
+      const effective = effectiveRetractionEnd({
+        targetKind: "relation",
+        targetId: edge.id,
+        ...(edge.validTo === undefined ? {} : { originalValidTo: edge.validTo }),
+        retractions,
+        knownAt: input.knownAt,
+      });
+      appliedRetractions.push(...effective.retractions);
+      return relationIsActive(edge, fromEntityIds, validAt, knownAt, effective.validTo);
+    })
+    .toSorted((left, right) => (
       left.from.localeCompare(right.from)
       || left.relationType.localeCompare(right.relationType)
       || left.to.localeCompare(right.to)
       || left.id.localeCompare(right.id)
     ));
+  return {
+    edges,
+    appliedRetractions: uniqueRetractions(appliedRetractions),
+  };
+}
+
+export function activeRelationEdges(input: ActiveRelationQuery): TemporalRelationEdge[] {
+  return [...resolveActiveRelationEdges(input).edges];
 }
