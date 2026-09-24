@@ -5,10 +5,10 @@
   "type": "module",
   "dependencies": {
     "@ssrl/access": "workspace:*",
+    "@ssrl/artifact-store": "workspace:*",
     "@ssrl/replication": "workspace:*"
   },
   "devDependencies": {
-    "@ssrl/artifact-store": "workspace:*",
     "@ssrl/state-store": "workspace:*",
     "@ssrl/storage-local-artifacts": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",

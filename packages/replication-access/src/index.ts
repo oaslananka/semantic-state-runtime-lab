@@ -8,11 +8,18 @@ import {
   applySemanticReplicationRecords,
   mergeReplicationRecordSets,
   replicationDescriptor,
+  requiredArtifactBlobs,
   replicationRecordEnvelopeBytes,
   verifyReplicationRecord,
   type ReplicationRecord,
   type ReplicationRecordKey,
+  type RequiredArtifactBlob,
 } from "@ssrl/replication";
+import type {
+  ArtifactBlobDescriptor,
+  ArtifactDigest,
+  ArtifactStore,
+} from "@ssrl/artifact-store";
 import {
   buildPrefixMerkleIndex,
   type PrefixMerkleBits,
@@ -23,7 +30,12 @@ import {
   type ReconciliationViewInfo,
 } from "@ssrl/replication/sync";
 
-export type ReplicationAccessOperation = "projection:read" | "record:read" | "record:apply";
+export type ReplicationAccessOperation =
+  | "projection:read"
+  | "record:read"
+  | "record:apply"
+  | "artifact-blob:read"
+  | "artifact-blob:apply";
 
 export interface ReplicationAccessRequest {
   readonly operation: ReplicationAccessOperation;
@@ -34,6 +46,7 @@ export interface ReplicationAccessRequest {
   readonly key: ReplicationRecordKey;
   readonly recordId: string;
   readonly payloadDigest: string;
+  readonly blob?: RequiredArtifactBlob;
 }
 
 export interface ReplicationAccessPolicy {
@@ -46,6 +59,8 @@ export type ReplicationAccessAuditOperation =
   | "projection.open"
   | "record.read"
   | "record.apply"
+  | "artifact-blob.read"
+  | "artifact-blob.apply"
   | "view.expired"
   | "view.revoked";
 
@@ -58,6 +73,8 @@ export interface ReplicationAccessEvent {
   readonly code?: string;
   readonly recordKind?: ReplicationRecord["kind"];
   readonly recordKey?: ReplicationRecordKey;
+  readonly blobDigest?: ArtifactDigest;
+  readonly blobSize?: number;
 }
 
 export interface ReplicationAccessEventSink {
@@ -113,6 +130,8 @@ export interface ReplicationAccessGatewayOptions {
   readonly maxReadBytes?: number;
   readonly maxApplyRecords?: number;
   readonly maxApplyBytes?: number;
+  readonly maxBlobReadBytes?: number;
+  readonly maxBlobApplyBytes?: number;
   readonly maxLeaseMs?: number;
   readonly now?: () => string;
 }
@@ -152,6 +171,27 @@ export class ReplicationApplyDeniedError extends Error {
   }
 }
 
+export class ReplicationArtifactBlobUnavailableError extends Error {
+  constructor() {
+    super("Requested replication artifact blob is unavailable");
+    this.name = "ReplicationArtifactBlobUnavailableError";
+  }
+}
+
+export class ReplicationArtifactBlobApplyDeniedError extends Error {
+  constructor(readonly code: string) {
+    super("Replication artifact blob apply is not authorized");
+    this.name = "ReplicationArtifactBlobApplyDeniedError";
+  }
+}
+
+export class ReplicationArtifactBlobIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReplicationArtifactBlobIntegrityError";
+  }
+}
+
 interface AuthorizedViewState {
   readonly view: FrozenPrefixMerkleView;
   readonly principal: AccessPrincipal;
@@ -168,6 +208,8 @@ const DEFAULT_MAX_READ_RECORDS = 256;
 const DEFAULT_MAX_READ_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_APPLY_RECORDS = 1_000;
 const DEFAULT_MAX_APPLY_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_BLOB_READ_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_BLOB_APPLY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_LEASE_MS = 5 * 60 * 1_000;
 const MAX_CONFIGURED_COUNT = 1_000_000;
 const MAX_CONFIGURED_BYTES = 1024 * 1024 * 1024;
@@ -224,6 +266,7 @@ function accessRequest(
   principal: AccessPrincipal,
   projection: string,
   record: ReplicationRecord,
+  blob?: RequiredArtifactBlob,
 ): ReplicationAccessRequest {
   return {
     operation,
@@ -234,6 +277,7 @@ function accessRequest(
     key: record.key,
     recordId: record.recordId,
     payloadDigest: record.payloadDigest,
+    ...(blob === undefined ? {} : { blob }),
   };
 }
 
@@ -335,6 +379,121 @@ function emitAllowedApplyBatch(
   }
 }
 
+
+function emitBlobEvent(
+  sink: ReplicationAccessEventSink | undefined,
+  now: () => string,
+  input: {
+    readonly operation: "artifact-blob.read" | "artifact-blob.apply";
+    readonly outcome: "allow" | "deny";
+    readonly principal: AccessPrincipal;
+    readonly projectionId: string;
+    readonly record?: ReplicationRecord;
+    readonly digest: ArtifactDigest;
+    readonly size?: number;
+    readonly code?: string;
+    readonly bestEffort?: boolean;
+  },
+): void {
+  const event: Omit<ReplicationAccessEvent, "at"> = {
+    operation: input.operation,
+    outcome: input.outcome,
+    subject: input.principal.subject,
+    projectionId: input.projectionId,
+    ...(input.code === undefined ? {} : { code: input.code }),
+    ...(input.record === undefined ? {} : {
+      recordKind: input.record.kind,
+      recordKey: input.record.key,
+    }),
+    blobDigest: input.digest,
+    ...(input.size === undefined ? {} : { blobSize: input.size }),
+  };
+  if (input.bestEffort === true) {
+    emitBestEffort(sink, now, event);
+    return;
+  }
+  emit(sink, now, event);
+}
+
+export interface ReplicationArtifactBlobAccounting {
+  readonly referencingRecords: number;
+  readonly recordPolicyEvaluations: number;
+  readonly blobPolicyEvaluations: number;
+  readonly transferredBytes: number;
+}
+
+export interface ReplicationArtifactBlobReadResult {
+  readonly digest: ArtifactDigest;
+  readonly size: number;
+  readonly mediaType: string;
+  readonly bytes: Uint8Array;
+  readonly accounting: ReplicationArtifactBlobAccounting;
+}
+
+export interface ReplicationArtifactBlobInstallResult {
+  readonly descriptor: ArtifactBlobDescriptor;
+  readonly accounting: ReplicationArtifactBlobAccounting;
+}
+
+interface ArtifactBlobReference {
+  readonly record: ReplicationRecord;
+  readonly blob: RequiredArtifactBlob;
+}
+
+function ownedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Digest(bytes: Uint8Array): Promise<ArtifactDigest> {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", ownedArrayBuffer(bytes));
+  return `sha256:${hex(new Uint8Array(digest))}` as ArtifactDigest;
+}
+
+async function artifactBlobReference(record: ReplicationRecord): Promise<ArtifactBlobReference | undefined> {
+  if (record.kind !== "artifact-mutation") return undefined;
+  const required = await requiredArtifactBlobs([record]);
+  const blob = required[0];
+  if (blob === undefined) return undefined;
+  return { record, blob };
+}
+
+async function artifactBlobReferences(
+  records: Iterable<ReplicationRecord>,
+  digest: ArtifactDigest,
+): Promise<ArtifactBlobReference[]> {
+  const references: ArtifactBlobReference[] = [];
+  for (const record of [...records].toSorted((left, right) => left.key.localeCompare(right.key))) {
+    const reference = await artifactBlobReference(record);
+    if (reference?.blob.digest === digest) references.push(reference);
+  }
+  return references;
+}
+
+function blobMediaType(blob: RequiredArtifactBlob): string {
+  const mediaType = blob.mediaTypes[0];
+  if (mediaType === undefined) {
+    throw new ReplicationArtifactBlobIntegrityError(`Artifact blob ${blob.digest} has no media type`);
+  }
+  return mediaType;
+}
+
+async function verifyBlobBytes(blob: RequiredArtifactBlob, bytes: Uint8Array): Promise<void> {
+  if (bytes.byteLength !== blob.size) {
+    throw new ReplicationArtifactBlobIntegrityError(
+      `Artifact blob ${blob.digest} expected ${blob.size} bytes but received ${bytes.byteLength}`,
+    );
+  }
+  if (await sha256Digest(bytes) !== blob.digest) {
+    throw new ReplicationArtifactBlobIntegrityError(`Artifact blob ${blob.digest} failed SHA-256 verification`);
+  }
+}
+
 export class ReplicationAccessGateway {
   readonly #source: ReplicationRecordSource;
   readonly #policy: ReplicationAccessPolicy;
@@ -348,6 +507,8 @@ export class ReplicationAccessGateway {
   readonly #maxReadBytes: number;
   readonly #maxApplyRecords: number;
   readonly #maxApplyBytes: number;
+  readonly #maxBlobReadBytes: number;
+  readonly #maxBlobApplyBytes: number;
   readonly #maxLeaseMs: number;
   readonly #now: () => string;
   readonly #views = new Map<string, AuthorizedViewState>();
@@ -392,6 +553,16 @@ export class ReplicationAccessGateway {
     this.#maxApplyBytes = positiveLimit(
       options.maxApplyBytes ?? DEFAULT_MAX_APPLY_BYTES,
       "maxApplyBytes",
+      MAX_CONFIGURED_BYTES,
+    );
+    this.#maxBlobReadBytes = positiveLimit(
+      options.maxBlobReadBytes ?? DEFAULT_MAX_BLOB_READ_BYTES,
+      "maxBlobReadBytes",
+      MAX_CONFIGURED_BYTES,
+    );
+    this.#maxBlobApplyBytes = positiveLimit(
+      options.maxBlobApplyBytes ?? DEFAULT_MAX_BLOB_APPLY_BYTES,
+      "maxBlobApplyBytes",
       MAX_CONFIGURED_BYTES,
     );
     this.#maxLeaseMs = positiveLimit(
@@ -600,6 +771,204 @@ export class ReplicationAccessGateway {
       });
     }
     return result;
+  }
+
+  async readArtifactBlob(
+    store: ArtifactStore,
+    input: {
+      readonly principal: AccessPrincipal;
+      readonly projectionId: string;
+      readonly viewId: string;
+      readonly digest: ArtifactDigest;
+      readonly maxBytes?: number;
+    },
+  ): Promise<ReplicationArtifactBlobReadResult> {
+    const principal = normalizeAccessPrincipal(input.principal);
+    const projection = this.#configuredProjection(input.projectionId);
+    const state = this.#authorizedView(principal, projection, input.viewId);
+    const maxBytes = requestLimit(input.maxBytes, this.#maxBlobReadBytes, "maxBytes");
+    const references = await artifactBlobReferences(state.records.values(), input.digest);
+    let recordPolicyEvaluations = 0;
+    let blobPolicyEvaluations = 0;
+    let authorized: ArtifactBlobReference | undefined;
+
+    for (const reference of references) {
+      recordPolicyEvaluations += 1;
+      const recordDecision = await authorize(
+        this.#policy,
+        accessRequest("record:read", principal, projection, reference.record),
+      );
+      if (recordDecision.effect === "deny") continue;
+      blobPolicyEvaluations += 1;
+      const blobDecision = await authorize(
+        this.#policy,
+        accessRequest("artifact-blob:read", principal, projection, reference.record, reference.blob),
+      );
+      if (blobDecision.effect === "allow") {
+        authorized = reference;
+        break;
+      }
+    }
+
+    if (authorized === undefined) {
+      emitBlobEvent(this.#events, this.#now, {
+        operation: "artifact-blob.read",
+        outcome: "deny",
+        principal,
+        projectionId: projection,
+        code: "blob-unavailable",
+        digest: input.digest,
+        bestEffort: true,
+      });
+      throw new ReplicationArtifactBlobUnavailableError();
+    }
+    if (authorized.blob.size > maxBytes) {
+      throw new ReplicationAccessLimitError(`Artifact blob exceeds maxBytes=${maxBytes}`);
+    }
+    const head = await store.headBlob(input.digest);
+    if (head === undefined) {
+      emitBlobEvent(this.#events, this.#now, {
+        operation: "artifact-blob.read",
+        outcome: "deny",
+        principal,
+        projectionId: projection,
+        code: "blob-unavailable",
+        digest: input.digest,
+        bestEffort: true,
+      });
+      throw new ReplicationArtifactBlobUnavailableError();
+    }
+    if (head.size !== authorized.blob.size) {
+      throw new ReplicationArtifactBlobIntegrityError(
+        `Artifact blob ${input.digest} store size does not match authorized metadata`,
+      );
+    }
+    const read = await store.readBlobRange(input.digest, {
+      offset: 0,
+      length: authorized.blob.size,
+      maxBytes,
+    });
+    if (
+      !read.complete
+      || read.offset !== 0
+      || read.digest !== authorized.blob.digest
+      || read.size !== authorized.blob.size
+    ) {
+      throw new ReplicationArtifactBlobIntegrityError(
+        `Artifact blob ${input.digest} returned inconsistent store metadata`,
+      );
+    }
+    await verifyBlobBytes(authorized.blob, read.bytes);
+    emitBlobEvent(this.#events, this.#now, {
+      operation: "artifact-blob.read",
+      outcome: "allow",
+      principal,
+      projectionId: projection,
+      record: authorized.record,
+      digest: authorized.blob.digest,
+      size: authorized.blob.size,
+    });
+    return {
+      digest: authorized.blob.digest,
+      size: authorized.blob.size,
+      mediaType: blobMediaType(authorized.blob),
+      bytes: read.bytes,
+      accounting: {
+        referencingRecords: references.length,
+        recordPolicyEvaluations,
+        blobPolicyEvaluations,
+        transferredBytes: read.bytes.byteLength,
+      },
+    };
+  }
+
+  async installArtifactBlob(
+    store: ArtifactStore,
+    input: {
+      readonly principal: AccessPrincipal;
+      readonly projectionId: string;
+      readonly record: ReplicationRecord;
+      readonly bytes: Uint8Array;
+      readonly maxBytes?: number;
+    },
+  ): Promise<ReplicationArtifactBlobInstallResult> {
+    const principal = normalizeAccessPrincipal(input.principal);
+    const projection = this.#configuredProjection(input.projectionId);
+    const maxBytes = requestLimit(input.maxBytes, this.#maxBlobApplyBytes, "maxBytes");
+    const record = await verifyReplicationRecord(input.record);
+    const reference = await artifactBlobReference(record);
+    if (reference === undefined) {
+      throw new ReplicationArtifactBlobIntegrityError("Artifact blob install requires an artifact upsert record");
+    }
+    if (reference.blob.size > maxBytes || input.bytes.byteLength > maxBytes) {
+      throw new ReplicationAccessLimitError(`Artifact blob install exceeds maxBytes=${maxBytes}`);
+    }
+    const recordDecision = await authorize(
+      this.#policy,
+      accessRequest("record:apply", principal, projection, record),
+    );
+    if (recordDecision.effect === "deny") {
+      emitBlobEvent(this.#events, this.#now, {
+        operation: "artifact-blob.apply",
+        outcome: "deny",
+        principal,
+        projectionId: projection,
+        record,
+        code: recordDecision.code,
+        digest: reference.blob.digest,
+        size: reference.blob.size,
+        bestEffort: true,
+      });
+      throw new ReplicationArtifactBlobApplyDeniedError(recordDecision.code);
+    }
+    const blobDecision = await authorize(
+      this.#policy,
+      accessRequest("artifact-blob:apply", principal, projection, record, reference.blob),
+    );
+    if (blobDecision.effect === "deny") {
+      emitBlobEvent(this.#events, this.#now, {
+        operation: "artifact-blob.apply",
+        outcome: "deny",
+        principal,
+        projectionId: projection,
+        record,
+        code: blobDecision.code,
+        digest: reference.blob.digest,
+        size: reference.blob.size,
+        bestEffort: true,
+      });
+      throw new ReplicationArtifactBlobApplyDeniedError(blobDecision.code);
+    }
+    await verifyBlobBytes(reference.blob, input.bytes);
+    const mediaType = blobMediaType(reference.blob);
+    emitBlobEvent(this.#events, this.#now, {
+      operation: "artifact-blob.apply",
+      outcome: "allow",
+      principal,
+      projectionId: projection,
+      record,
+      digest: reference.blob.digest,
+      size: reference.blob.size,
+    });
+    const descriptor = await store.putBlob(input.bytes, mediaType);
+    if (
+      descriptor.digest !== reference.blob.digest
+      || descriptor.size !== reference.blob.size
+      || descriptor.mediaType !== mediaType
+    ) {
+      throw new ReplicationArtifactBlobIntegrityError(
+        `Installed artifact blob ${reference.blob.digest} did not match target descriptor`,
+      );
+    }
+    return {
+      descriptor,
+      accounting: {
+        referencingRecords: 1,
+        recordPolicyEvaluations: 1,
+        blobPolicyEvaluations: 1,
+        transferredBytes: input.bytes.byteLength,
+      },
+    };
   }
 
   async #authorizedApply(input: ReplicationApplyRequest): Promise<AuthorizedApplyBatch> {

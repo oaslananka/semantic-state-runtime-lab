@@ -74,3 +74,6 @@ jobs:
 
       - name: Policy-scoped replication access benchmark smoke test
         run: pnpm benchmark:replication:access:v1
+
+      - name: Principal-scoped artifact blob replication benchmark smoke test
+        run: pnpm benchmark:replication:blob-access:v1

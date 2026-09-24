@@ -3,7 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AccessPrincipal } from "@ssrl/access";
-import { artifactMutationJson } from "@ssrl/artifact-store";
+import {
+  artifactMutationJson,
+  type ArtifactBlobDescriptor,
+  type ArtifactDigest,
+  type ArtifactStore,
+} from "@ssrl/artifact-store";
 import {
   BoundedReconciliationSession,
   FrozenPrefixMerkleView,
@@ -25,11 +30,16 @@ import {
   MutableReplicationRecordSource,
   ReplicationAccessGateway,
   ReplicationAccessLimitError,
+  ReplicationArtifactBlobApplyDeniedError,
+  ReplicationArtifactBlobIntegrityError,
+  ReplicationArtifactBlobUnavailableError,
   ReplicationApplyDeniedError,
   ReplicationAuthorizationViewError,
   ReplicationRecordUnavailableError,
+  type ReplicationAccessEvent,
   type ReplicationAccessOperation,
   type ReplicationAccessPolicy,
+  type ReplicationAccessRequest,
 } from "../src/index.js";
 
 const roots: string[] = [];
@@ -99,34 +109,89 @@ async function artifactDeleteRecord(id: string): Promise<ReplicationRecord> {
   });
 }
 
+
+async function artifactUpsertRecord(
+  id: string,
+  blob: ArtifactBlobDescriptor,
+): Promise<ReplicationRecord> {
+  return createReplicationRecord({
+    kind: "artifact-mutation",
+    recordId: id,
+    payload: artifactMutationJson({
+      id,
+      kind: "upsert",
+      resource: {
+        sourceKey: "fixture",
+        externalType: "note",
+        externalId: id,
+      },
+      effectiveAt: "2026-01-01T00:00:00Z",
+      recordedAt: "2026-01-01T00:00:00Z",
+      blob,
+    }),
+  });
+}
+
+async function artifactBlobFixture(
+  prefix: string,
+  id = "artifact-upsert",
+  content = "authorized artifact blob",
+) {
+  const store = await artifactStore(prefix);
+  const bytes = new TextEncoder().encode(content);
+  const descriptor = await store.putBlob(bytes, "text/plain");
+  const record = await artifactUpsertRecord(id, descriptor);
+  return { store, bytes, descriptor, record };
+}
+
+function artifactStoreFacade(
+  base: ArtifactStore,
+  overrides: Partial<ArtifactStore>,
+): ArtifactStore {
+  return {
+    putBlob: (bytes, mediaType) => base.putBlob(bytes, mediaType),
+    headBlob: (digest) => base.headBlob(digest),
+    readBlobRange: (digest, request) => base.readBlobRange(digest, request),
+    append: (mutations) => base.append(mutations),
+    mutation: (id) => base.mutation(id),
+    mutationsForResource: (resource) => base.mutationsForResource(resource),
+    snapshot: () => base.snapshot(),
+    ...overrides,
+  };
+}
+
 class MutablePolicy implements ReplicationAccessPolicy {
   version = "policy-v1";
   readonly projection = new Map<string, Set<string>>();
   readonly reads = new Map<string, Set<string>>();
   readonly applies = new Map<string, Set<string>>();
+  readonly blobReads = new Map<string, Set<string>>();
+  readonly blobApplies = new Map<string, Set<string>>();
+  readonly requests: ReplicationAccessRequest[] = [];
   evaluations = 0;
+
+  #table(operation: ReplicationAccessOperation): Map<string, Set<string>> {
+    switch (operation) {
+      case "projection:read": return this.projection;
+      case "record:read": return this.reads;
+      case "record:apply": return this.applies;
+      case "artifact-blob:read": return this.blobReads;
+      case "artifact-blob:apply": return this.blobApplies;
+    }
+  }
 
   allow(
     operation: ReplicationAccessOperation,
     subject: string,
     ...recordIds: readonly string[]
   ): void {
-    const table = operation === "projection:read"
-      ? this.projection
-      : operation === "record:read"
-        ? this.reads
-        : this.applies;
-    table.set(subject, new Set(recordIds));
+    this.#table(operation).set(subject, new Set(recordIds));
   }
 
   evaluate(request: Parameters<ReplicationAccessPolicy["evaluate"]>[0]) {
     this.evaluations += 1;
-    const table = request.operation === "projection:read"
-      ? this.projection
-      : request.operation === "record:read"
-        ? this.reads
-        : this.applies;
-    return table.get(request.principal.subject)?.has(request.record.recordId)
+    this.requests.push(request);
+    return this.#table(request.operation).get(request.principal.subject)?.has(request.record.recordId)
       ? { effect: "allow" as const }
       : { effect: "deny" as const, code: "not-granted" };
   }
@@ -420,6 +485,447 @@ describe("principal-aware replication transfer", () => {
       keys: [one.key],
       maxBytes: 1,
     })).rejects.toBeInstanceOf(ReplicationAccessLimitError);
+  });
+});
+
+describe("principal-scoped artifact blob transfer", () => {
+  it("does not treat visible/readable artifact metadata as blob-read authorization", async () => {
+    const { store, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-read-separation-",
+    );
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([record]), policy);
+    const opened = await access.openProjection({
+      principal: alice,
+      projectionId: "personal",
+      prefixBits: 8,
+    });
+
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobUnavailableError);
+
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    const result = await access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    });
+    expect(result.bytes).toEqual(bytes);
+    expect(result.mediaType).toBe("text/plain");
+    expect(result.accounting).toEqual({
+      referencingRecords: 1,
+      recordPolicyEvaluations: 1,
+      blobPolicyEvaluations: 1,
+      transferredBytes: bytes.byteLength,
+    });
+    store.close();
+  });
+
+  it("does not treat blob-read authorization as blob-apply authorization", async () => {
+    const { store: source, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-read-not-apply-",
+    );
+    const target = await artifactStore("replication-access-blob-read-not-apply-target-");
+    const policy = new MutablePolicy();
+    policy.allow("record:apply", writer.subject, record.recordId);
+    policy.allow("artifact-blob:read", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([]), policy);
+
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobApplyDeniedError);
+    expect((await target.snapshot()).blobs).toEqual([]);
+    expect(descriptor.size).toBe(bytes.byteLength);
+    source.close();
+    target.close();
+  });
+
+  it("uses one public unavailable shape for hidden, unknown, and physically missing blobs", async () => {
+    const sourceStore = await artifactStore("replication-access-blob-unavailable-source-");
+    const visibleBytes = new TextEncoder().encode("visible blob");
+    const hiddenBytes = new TextEncoder().encode("hidden blob");
+    const visibleDescriptor = await sourceStore.putBlob(visibleBytes, "text/plain");
+    const hiddenDescriptor = await sourceStore.putBlob(hiddenBytes, "text/plain");
+    const visible = await artifactUpsertRecord("visible-artifact", visibleDescriptor);
+    const hidden = await artifactUpsertRecord("hidden-artifact", hiddenDescriptor);
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, visible.recordId);
+    policy.allow("record:read", alice.subject, visible.recordId);
+    policy.allow("artifact-blob:read", alice.subject, visible.recordId);
+    const access = gateway(new MutableReplicationRecordSource([visible, hidden]), policy);
+    const opened = await access.openProjection({
+      principal: alice,
+      projectionId: "personal",
+      prefixBits: 8,
+    });
+    const emptyStore = await artifactStore("replication-access-blob-unavailable-empty-");
+    const unknownDigest = `sha256:${"0".repeat(64)}` as ArtifactDigest;
+
+    for (const [store, digest] of [
+      [sourceStore, hiddenDescriptor.digest],
+      [sourceStore, unknownDigest],
+      [emptyStore, visibleDescriptor.digest],
+    ] as const) {
+      let error: unknown;
+      try {
+        await access.readArtifactBlob(store, {
+          principal: alice,
+          projectionId: "personal",
+          viewId: opened.view.viewId,
+          digest,
+        });
+      } catch (cause) {
+        error = cause;
+      }
+      expect(error).toBeInstanceOf(ReplicationArtifactBlobUnavailableError);
+      expect((error as Error).message).toBe("Requested replication artifact blob is unavailable");
+    }
+    sourceStore.close();
+    emptyStore.close();
+  });
+
+  it("reauthorizes record and blob access after Merkle discovery", async () => {
+    const { store, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-revoke-",
+    );
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([record]), policy);
+    const opened = await access.openProjection({ principal: alice, projectionId: "personal", prefixBits: 8 });
+
+    policy.allow("record:read", alice.subject);
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobUnavailableError);
+
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject);
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobUnavailableError);
+    store.close();
+  });
+
+  it("blocks blob reads when a pinned projection expires or its policy version is revoked", async () => {
+    const { store, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-view-lifetime-",
+    );
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    let now = "2026-09-25T00:00:00Z";
+    const access = gateway(new MutableReplicationRecordSource([record]), policy, {
+      now: () => now,
+      maxLeaseMs: 1_000,
+    });
+    const expiring = await access.openProjection({
+      principal: alice,
+      projectionId: "personal",
+      prefixBits: 8,
+      leaseMs: 1_000,
+    });
+    now = "2026-09-25T00:00:01Z";
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: expiring.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toThrowError(expect.objectContaining({ code: "expired" }));
+
+    now = "2026-09-25T00:00:02Z";
+    const revocable = await access.openProjection({
+      principal: alice,
+      projectionId: "personal",
+      prefixBits: 8,
+      leaseMs: 1_000,
+    });
+    policy.version = "policy-v2";
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: revocable.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toThrowError(expect.objectContaining({ code: "revoked" }));
+    store.close();
+  });
+
+  it("rejects inconsistent source blob metadata or bytes before returning content", async () => {
+    const { store, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-integrity-read-",
+    );
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([record]), policy);
+    const opened = await access.openProjection({ principal: alice, projectionId: "personal", prefixBits: 8 });
+
+    const wrongSize = artifactStoreFacade(store, {
+      headBlob: async () => ({ digest: descriptor.digest, size: descriptor.size + 1 }),
+    });
+    await expect(access.readArtifactBlob(wrongSize, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobIntegrityError);
+
+    const corrupted = new Uint8Array(bytes);
+    corrupted[0] = (corrupted[0] ?? 0) ^ 0xff;
+    const wrongBytes = artifactStoreFacade(store, {
+      readBlobRange: async () => ({
+        digest: descriptor.digest,
+        size: descriptor.size,
+        offset: 0,
+        bytes: corrupted,
+        complete: true,
+      }),
+    });
+    await expect(access.readArtifactBlob(wrongBytes, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobIntegrityError);
+    store.close();
+  });
+
+  it("enforces caller and server blob byte ceilings without allowing callers to raise them", async () => {
+    const { store, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-bounds-",
+    );
+    const target = await artifactStore("replication-access-blob-bounds-target-");
+    const policy = new MutablePolicy();
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    policy.allow("record:apply", writer.subject, record.recordId);
+    policy.allow("artifact-blob:apply", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([record]), policy, {
+      maxBlobReadBytes: descriptor.size,
+      maxBlobApplyBytes: descriptor.size,
+    });
+    const opened = await access.openProjection({ principal: alice, projectionId: "personal", prefixBits: 8 });
+
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+      maxBytes: descriptor.size + 1,
+    })).rejects.toBeInstanceOf(ReplicationAccessLimitError);
+    await expect(access.readArtifactBlob(store, {
+      principal: alice,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+      maxBytes: descriptor.size - 1,
+    })).rejects.toBeInstanceOf(ReplicationAccessLimitError);
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+      maxBytes: descriptor.size + 1,
+    })).rejects.toBeInstanceOf(ReplicationAccessLimitError);
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+      maxBytes: descriptor.size - 1,
+    })).rejects.toBeInstanceOf(ReplicationAccessLimitError);
+    expect((await target.snapshot()).blobs).toEqual([]);
+    store.close();
+    target.close();
+  });
+
+  it("denies blob install without writing and checks record policy before blob policy", async () => {
+    const { store: source, bytes, record } = await artifactBlobFixture(
+      "replication-access-blob-install-deny-",
+    );
+    const target = await artifactStore("replication-access-blob-install-deny-target-");
+    const policy = new MutablePolicy();
+    policy.allow("artifact-blob:apply", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([]), policy);
+
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobApplyDeniedError);
+    expect(policy.requests.filter((request) => request.operation === "artifact-blob:apply")).toEqual([]);
+    expect((await target.snapshot()).blobs).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("rejects malformed envelopes and wrong bytes before any target CAS write", async () => {
+    const { store: source, bytes, record } = await artifactBlobFixture(
+      "replication-access-blob-install-integrity-",
+    );
+    const target = await artifactStore("replication-access-blob-install-integrity-target-");
+    const policy = new MutablePolicy();
+    policy.allow("record:apply", writer.subject, record.recordId);
+    policy.allow("artifact-blob:apply", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([]), policy);
+    const tampered = { ...record, payloadBytes: record.payloadBytes + 1 };
+
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record: tampered,
+      bytes,
+    })).rejects.toThrow(/payload integrity mismatch|inconsistent descriptor metadata/);
+    expect(policy.requests).toEqual([]);
+
+    const corrupted = new Uint8Array(bytes);
+    corrupted[0] = (corrupted[0] ?? 0) ^ 0xff;
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes: corrupted,
+    })).rejects.toBeInstanceOf(ReplicationArtifactBlobIntegrityError);
+    expect((await target.snapshot()).blobs).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("fails closed on allow-audit failure before writing the target blob", async () => {
+    const { store: source, bytes, record } = await artifactBlobFixture(
+      "replication-access-blob-audit-fail-",
+    );
+    const target = await artifactStore("replication-access-blob-audit-fail-target-");
+    const policy = new MutablePolicy();
+    policy.allow("record:apply", writer.subject, record.recordId);
+    policy.allow("artifact-blob:apply", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([]), policy, {
+      events: {
+        emit(event) {
+          if (event.operation === "artifact-blob.apply" && event.outcome === "allow") {
+            throw new Error("blob audit unavailable");
+          }
+        },
+      },
+    });
+
+    await expect(access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+    })).rejects.toThrow(/blob audit unavailable/);
+    expect((await target.snapshot()).blobs).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("installs the same authorized content idempotently without appending the mutation", async () => {
+    const { store: source, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-idempotent-source-",
+    );
+    const target = await artifactStore("replication-access-blob-idempotent-target-");
+    const policy = new MutablePolicy();
+    policy.allow("record:apply", writer.subject, record.recordId);
+    policy.allow("artifact-blob:apply", writer.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([]), policy);
+
+    const first = await access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+    });
+    const second = await access.installArtifactBlob(target, {
+      principal: writer,
+      projectionId: "personal",
+      record,
+      bytes,
+    });
+    expect(first.descriptor).toEqual(descriptor);
+    expect(second.descriptor).toEqual(descriptor);
+    const snapshot = await target.snapshot();
+    expect(snapshot.blobs).toEqual([{ digest: descriptor.digest, size: descriptor.size }]);
+    expect(snapshot.mutations).toEqual([]);
+    source.close();
+    target.close();
+  });
+
+  it("strips credential-like principal fields and emits metadata-only blob audit events", async () => {
+    const secret = "super-secret-bearer-token";
+    const content = "sensitive-blob-content-never-in-audit";
+    const { store, bytes, descriptor, record } = await artifactBlobFixture(
+      "replication-access-blob-metadata-audit-",
+      "audited-artifact",
+      content,
+    );
+    const policy = new MutablePolicy();
+    const events: ReplicationAccessEvent[] = [];
+    const credentialed = {
+      subject: alice.subject,
+      scopes: alice.scopes,
+      bearerToken: secret,
+      rawCredential: { authorization: secret },
+    } as AccessPrincipal;
+    policy.allow("projection:read", alice.subject, record.recordId);
+    policy.allow("record:read", alice.subject, record.recordId);
+    policy.allow("artifact-blob:read", alice.subject, record.recordId);
+    const access = gateway(new MutableReplicationRecordSource([record]), policy, {
+      events: { emit: (event) => events.push(event) },
+    });
+    const opened = await access.openProjection({
+      principal: credentialed,
+      projectionId: "personal",
+      prefixBits: 8,
+    });
+    await access.readArtifactBlob(store, {
+      principal: credentialed,
+      projectionId: "personal",
+      viewId: opened.view.viewId,
+      digest: descriptor.digest,
+    });
+
+    for (const request of policy.requests) {
+      expect(request.principal).toEqual({ subject: alice.subject, scopes: alice.scopes });
+      expect(Object.keys(request.principal)).toEqual(["subject", "scopes"]);
+    }
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(secret);
+    expect(serialized).not.toContain(content);
+    expect(serialized).not.toContain(record.payload);
+    expect(serialized).not.toContain(JSON.stringify([...bytes]));
+    const allowedBlob = events.find(
+      (event) => event.operation === "artifact-blob.read" && event.outcome === "allow",
+    );
+    expect(allowedBlob).toEqual(expect.objectContaining({
+      subject: alice.subject,
+      blobDigest: descriptor.digest,
+      blobSize: descriptor.size,
+      recordKind: "artifact-mutation",
+      recordKey: record.key,
+    }));
+    store.close();
   });
 });
 
