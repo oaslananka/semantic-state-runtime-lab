@@ -582,6 +582,54 @@ function portableExternalId(root: string, file: string): string {
   return relative(root, file).split(sep).join("/");
 }
 
+interface MarkdownInventoryOptions {
+  readonly root: string;
+  readonly maxFiles: number;
+  readonly externalIds?: ReadonlySet<string>;
+  readonly rejectUnlistedExternalIds: boolean;
+}
+
+function acceptMarkdownInventoryFile(
+  externalId: string,
+  options: MarkdownInventoryOptions,
+): boolean {
+  if (options.externalIds === undefined || options.externalIds.has(externalId)) return true;
+  if (options.rejectUnlistedExternalIds) {
+    throw new UnconfiguredMarkdownIngestionSourceError(externalId);
+  }
+  return false;
+}
+
+function addMarkdownInventoryFile(
+  files: string[],
+  child: string,
+  options: MarkdownInventoryOptions,
+): void {
+  const externalId = portableExternalId(options.root, child);
+  if (!acceptMarkdownInventoryFile(externalId, options)) return;
+  files.push(child);
+  if (files.length > options.maxFiles) {
+    throw new MarkdownScanLimitError(`Markdown scan found more than maxFiles ${options.maxFiles}`);
+  }
+}
+
+async function walkMarkdownInventory(
+  directory: string,
+  files: string[],
+  options: MarkdownInventoryOptions,
+): Promise<void> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.isSymbolicLink()) continue;
+    const child = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      await walkMarkdownInventory(child, files, options);
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+      addMarkdownInventoryFile(files, child, options);
+    }
+  }
+}
+
 async function authoritativeMarkdownFiles(
   root: string,
   maxFiles: number,
@@ -589,33 +637,12 @@ async function authoritativeMarkdownFiles(
   rejectUnlistedExternalIds = false,
 ): Promise<string[]> {
   const files: string[] = [];
-  async function walk(directory: string): Promise<void> {
-    const entries = await readdir(directory, { withFileTypes: true });
-    for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
-      if (entry.isSymbolicLink()) continue;
-      const child = resolve(directory, entry.name);
-      if (entry.isDirectory()) {
-        await walk(child);
-        continue;
-      }
-      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
-        const externalId = portableExternalId(root, child);
-        if (externalIds !== undefined && !externalIds.has(externalId)) {
-          if (rejectUnlistedExternalIds) {
-            throw new UnconfiguredMarkdownIngestionSourceError(externalId);
-          }
-          continue;
-        }
-        files.push(child);
-        if (files.length > maxFiles) {
-          throw new MarkdownScanLimitError(
-            `Markdown scan found more than maxFiles ${maxFiles}`,
-          );
-        }
-      }
-    }
-  }
-  await walk(root);
+  await walkMarkdownInventory(root, files, {
+    root,
+    maxFiles,
+    ...(externalIds === undefined ? {} : { externalIds }),
+    rejectUnlistedExternalIds,
+  });
   return files;
 }
 

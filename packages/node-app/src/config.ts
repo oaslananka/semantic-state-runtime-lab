@@ -397,36 +397,178 @@ function validatePolicyFields(
   }
 }
 
+interface ParsedContextSourceMapping {
+  readonly provider: ParsedProvider;
+  readonly canonicalType: string;
+  readonly externalType: string;
+}
+
+function resolveContextSource(
+  source: NonNullable<ParsedConfig["context"]>["sources"][number],
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): ParsedContextSourceMapping | undefined {
+  const provider = providers.get(source.provider);
+  if (provider === undefined) {
+    issues.push(`context source ${source.provider}/${source.externalType}: unknown provider`);
+    return undefined;
+  }
+  const mappings = provider.manifest.entities.filter(
+    (mapping) => mapping.externalType === source.externalType,
+  );
+  if (mappings.length !== 1) {
+    issues.push(
+      `context source ${source.provider}/${source.externalType}: externalType must match exactly one manifest entity mapping`,
+    );
+    return undefined;
+  }
+  return {
+    provider,
+    canonicalType: mappings[0]!.canonicalType,
+    externalType: source.externalType,
+  };
+}
+
+function contextSourceKey(provider: string, externalType: string): string {
+  return JSON.stringify([provider, externalType]);
+}
+
 function contextSourceMappings(
   config: ParsedConfig,
   providers: ReadonlyMap<string, ParsedProvider>,
   issues: string[],
-): Map<string, { readonly provider: ParsedProvider; readonly canonicalType: string }> {
-  const result = new Map<string, { readonly provider: ParsedProvider; readonly canonicalType: string }>();
-  if (config.context === undefined) return result;
-  for (const source of config.context.sources) {
-    const key = JSON.stringify([source.provider, source.externalType]);
+): Map<string, ParsedContextSourceMapping> {
+  const result = new Map<string, ParsedContextSourceMapping>();
+  for (const source of config.context?.sources ?? []) {
+    const key = contextSourceKey(source.provider, source.externalType);
     if (result.has(key)) {
       issues.push(`context.sources: duplicate source ${source.provider}/${source.externalType}`);
       continue;
     }
-    const provider = providers.get(source.provider);
-    if (provider === undefined) {
-      issues.push(`context source ${source.provider}/${source.externalType}: unknown provider`);
-      continue;
-    }
-    const mappings = provider.manifest.entities.filter(
-      (mapping) => mapping.externalType === source.externalType,
-    );
-    if (mappings.length !== 1) {
-      issues.push(
-        `context source ${source.provider}/${source.externalType}: externalType must match exactly one manifest entity mapping`,
-      );
-      continue;
-    }
-    result.set(key, { provider, canonicalType: mappings[0]!.canonicalType });
+    const resolved = resolveContextSource(source, providers, issues);
+    if (resolved !== undefined) result.set(key, resolved);
   }
   return result;
+}
+
+function registerContextBindingOwner(
+  entity: ParsedEntity,
+  binding: ParsedEntity["bindings"][number],
+  bindingOwners: Map<string, string>,
+  issues: string[],
+): void {
+  const key = JSON.stringify([binding.provider, binding.externalId]);
+  if (bindingOwners.has(key)) {
+    issues.push(`context binding ${binding.provider}/${binding.externalId} is duplicated`);
+    return;
+  }
+  bindingOwners.set(key, entity.entityId);
+}
+
+function sourceKeysForBinding(
+  binding: ParsedEntity["bindings"][number],
+  sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>,
+): string[] {
+  return [...sourceMappings.entries()]
+    .filter(([, source]) => (
+      binding.provider === source.provider.id
+      && binding.canonicalType === source.canonicalType
+    ))
+    .map(([key]) => key);
+}
+
+interface ContextEntityValidationState {
+  readonly sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>;
+  readonly bindingOwners: Map<string, string>;
+  readonly sourceBindingCounts: Map<string, number>;
+  readonly issues: string[];
+}
+
+function contextTypesForEntity(
+  entity: ParsedEntity,
+  state: ContextEntityValidationState,
+): Set<string> {
+  const types = new Set<string>();
+  for (const binding of entity.bindings) {
+    registerContextBindingOwner(entity, binding, state.bindingOwners, state.issues);
+    for (const sourceKey of sourceKeysForBinding(binding, state.sourceMappings)) {
+      types.add(binding.canonicalType);
+      state.sourceBindingCounts.set(
+        sourceKey,
+        (state.sourceBindingCounts.get(sourceKey) ?? 0) + 1,
+      );
+    }
+  }
+  return types;
+}
+
+function validateContextAliases(entity: ParsedEntity, issues: string[]): void {
+  if (entity.aliases.length === 0) {
+    issues.push(`entity ${entity.entityId}: context requires at least one explicit alias`);
+    return;
+  }
+  const normalized = entity.aliases.map(normalizeEntityAlias);
+  if (normalized.some((alias) => alias.length === 0)) {
+    issues.push(`entity ${entity.entityId}: context aliases must contain letters or numbers`);
+  }
+  if (new Set(normalized).size !== normalized.length) {
+    issues.push(`entity ${entity.entityId}: context aliases must be unique after normalization`);
+  }
+}
+
+function validateContextEntity(
+  entity: ParsedEntity,
+  state: ContextEntityValidationState,
+): void {
+  const types = contextTypesForEntity(entity, state);
+  if (types.size === 0) return;
+  if (types.size !== 1) {
+    state.issues.push(`entity ${entity.entityId}: context bindings must resolve to one canonicalType`);
+  }
+  validateContextAliases(entity, state.issues);
+}
+
+function validateContextSourceCoverage(
+  sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>,
+  sourceBindingCounts: ReadonlyMap<string, number>,
+  issues: string[],
+): void {
+  for (const [key, source] of sourceMappings) {
+    if ((sourceBindingCounts.get(key) ?? 0) > 0) continue;
+    issues.push(
+      `context source ${source.provider.id}/${source.externalType}: no configured entity bindings`,
+    );
+  }
+}
+
+function boundedBy(
+  smaller: number | undefined,
+  larger: number | undefined,
+  message: string,
+  issues: string[],
+): void {
+  if (smaller !== undefined && larger !== undefined && smaller > larger) issues.push(message);
+}
+
+function validateContextLimits(context: NonNullable<ParsedConfig["context"]>, issues: string[]): void {
+  boundedBy(
+    context.maxIdentityCandidates,
+    context.maxIdentityScans,
+    "context.maxIdentityCandidates must not exceed maxIdentityScans",
+    issues,
+  );
+  boundedBy(
+    context.maxRelationCandidates,
+    context.maxRelationScans,
+    "context.maxRelationCandidates must not exceed maxRelationScans",
+    issues,
+  );
+  boundedBy(
+    context.maxRelationEdges,
+    context.maxRelationCandidates,
+    "context.maxRelationEdges must not exceed maxRelationCandidates",
+    issues,
+  );
 }
 
 function validateContextEntities(
@@ -436,71 +578,15 @@ function validateContextEntities(
 ): void {
   if (config.context === undefined) return;
   const sourceMappings = contextSourceMappings(config, providers, issues);
-  const bindingOwners = new Map<string, string>();
-  const sourceBindingCounts = new Map<string, number>();
-
-  for (const entity of config.entities) {
-    const participatingTypes = new Set<string>();
-    for (const binding of entity.bindings) {
-      const bindingKey = JSON.stringify([binding.provider, binding.externalId]);
-      if (bindingOwners.has(bindingKey)) {
-        issues.push(`context binding ${binding.provider}/${binding.externalId} is duplicated`);
-      } else {
-        bindingOwners.set(bindingKey, entity.entityId);
-      }
-
-      for (const [sourceKey, source] of sourceMappings) {
-        if (binding.provider !== source.provider.id || binding.canonicalType !== source.canonicalType) continue;
-        participatingTypes.add(binding.canonicalType);
-        sourceBindingCounts.set(sourceKey, (sourceBindingCounts.get(sourceKey) ?? 0) + 1);
-      }
-    }
-
-    if (participatingTypes.size === 0) continue;
-    if (participatingTypes.size !== 1) {
-      issues.push(`entity ${entity.entityId}: context bindings must resolve to one canonicalType`);
-    }
-    if (entity.aliases.length === 0) {
-      issues.push(`entity ${entity.entityId}: context requires at least one explicit alias`);
-    }
-    const normalizedAliases = entity.aliases.map(normalizeEntityAlias);
-    if (normalizedAliases.some((alias) => alias.length === 0)) {
-      issues.push(`entity ${entity.entityId}: context aliases must contain letters or numbers`);
-    }
-    if (new Set(normalizedAliases).size !== normalizedAliases.length) {
-      issues.push(`entity ${entity.entityId}: context aliases must be unique after normalization`);
-    }
-  }
-
-  for (const [sourceKey, source] of sourceMappings) {
-    if ((sourceBindingCounts.get(sourceKey) ?? 0) === 0) {
-      const parsed = JSON.parse(sourceKey) as [string, string];
-      issues.push(`context source ${parsed[0]}/${parsed[1]}: no configured entity bindings`);
-    }
-  }
-
-  const context = config.context;
-  if (
-    context.maxIdentityCandidates !== undefined
-    && context.maxIdentityScans !== undefined
-    && context.maxIdentityCandidates > context.maxIdentityScans
-  ) {
-    issues.push("context.maxIdentityCandidates must not exceed maxIdentityScans");
-  }
-  if (
-    context.maxRelationCandidates !== undefined
-    && context.maxRelationScans !== undefined
-    && context.maxRelationCandidates > context.maxRelationScans
-  ) {
-    issues.push("context.maxRelationCandidates must not exceed maxRelationScans");
-  }
-  if (
-    context.maxRelationEdges !== undefined
-    && context.maxRelationCandidates !== undefined
-    && context.maxRelationEdges > context.maxRelationCandidates
-  ) {
-    issues.push("context.maxRelationEdges must not exceed maxRelationCandidates");
-  }
+  const state: ContextEntityValidationState = {
+    sourceMappings,
+    bindingOwners: new Map(),
+    sourceBindingCounts: new Map(),
+    issues,
+  };
+  for (const entity of config.entities) validateContextEntity(entity, state);
+  validateContextSourceCoverage(sourceMappings, state.sourceBindingCounts, issues);
+  validateContextLimits(config.context, issues);
 }
 
 function validatePrincipalScopes(config: ParsedConfig, issues: string[]): void {
@@ -555,78 +641,79 @@ function validateContextStoragePaths(
   return issues;
 }
 
-export async function loadLocalAppConfig(
-  configPathInput: string,
-): Promise<{
-  readonly config: LocalAppConfig;
-  readonly warnings: readonly string[];
-}> {
-  const configPath = resolve(configPathInput);
-  const [raw, info] = await Promise.all([
-    readFile(configPath, "utf8"),
-    stat(configPath),
-  ]);
-
+function parseConfigJson(raw: string): ParsedConfig {
   let parsedJson: unknown;
   try {
     parsedJson = JSON.parse(raw);
   } catch {
     throw new InvalidLocalAppConfigError(["<root>: config file is not valid JSON"]);
   }
-
   const parsed = configSchema.safeParse(parsedJson);
-  if (!parsed.success) {
-    throw new InvalidLocalAppConfigError(formatZodIssues(parsed.error));
-  }
-
+  if (!parsed.success) throw new InvalidLocalAppConfigError(formatZodIssues(parsed.error));
   const issues = semanticIssues(parsed.data);
-  if (issues.length > 0) {
-    throw new InvalidLocalAppConfigError(issues);
-  }
+  if (issues.length > 0) throw new InvalidLocalAppConfigError(issues);
+  return parsed.data;
+}
 
+function optionalNumber<T extends string>(
+  key: T,
+  value: number | undefined,
+): {} | Readonly<Record<T, number>> {
+  return value === undefined ? {} : { [key]: value } as Readonly<Record<T, number>>;
+}
+
+function localContextConfig(
+  baseDir: string,
+  parsed: NonNullable<ParsedConfig["context"]>,
+): LocalContextConfig {
+  return {
+    semanticStatePath: absoluteFrom(baseDir, parsed.semanticStatePath),
+    ingestionStatePath: absoluteFrom(baseDir, parsed.ingestionStatePath),
+    artifactStoreRoot: absoluteFrom(baseDir, parsed.artifactStoreRoot),
+    sources: parsed.sources.map((source) => ({ ...source })),
+    ...optionalNumber("maxBudgetTokens", parsed.maxBudgetTokens),
+    ...optionalNumber("maxIdentityCandidates", parsed.maxIdentityCandidates),
+    ...optionalNumber("maxIdentityScans", parsed.maxIdentityScans),
+    ...optionalNumber("maxRelationCandidates", parsed.maxRelationCandidates),
+    ...optionalNumber("maxRelationScans", parsed.maxRelationScans),
+    ...optionalNumber("maxRelationEdges", parsed.maxRelationEdges),
+    ...optionalNumber("syncPageSize", parsed.syncPageSize),
+    ...optionalNumber("syncMaxPages", parsed.syncMaxPages),
+  };
+}
+
+function runtimeConfig(
+  configPath: string,
+  parsed: ParsedConfig,
+): LocalAppConfig {
   const baseDir = dirname(configPath);
-  const journalPath = absoluteFrom(baseDir, parsed.data.journalPath);
-  const context: LocalContextConfig | undefined = parsed.data.context === undefined
-    ? undefined
-    : {
-        semanticStatePath: absoluteFrom(baseDir, parsed.data.context.semanticStatePath),
-        ingestionStatePath: absoluteFrom(baseDir, parsed.data.context.ingestionStatePath),
-        artifactStoreRoot: absoluteFrom(baseDir, parsed.data.context.artifactStoreRoot),
-        sources: parsed.data.context.sources.map((source) => ({ ...source })),
-        ...(parsed.data.context.maxBudgetTokens === undefined ? {} : { maxBudgetTokens: parsed.data.context.maxBudgetTokens }),
-        ...(parsed.data.context.maxIdentityCandidates === undefined ? {} : { maxIdentityCandidates: parsed.data.context.maxIdentityCandidates }),
-        ...(parsed.data.context.maxIdentityScans === undefined ? {} : { maxIdentityScans: parsed.data.context.maxIdentityScans }),
-        ...(parsed.data.context.maxRelationCandidates === undefined ? {} : { maxRelationCandidates: parsed.data.context.maxRelationCandidates }),
-        ...(parsed.data.context.maxRelationScans === undefined ? {} : { maxRelationScans: parsed.data.context.maxRelationScans }),
-        ...(parsed.data.context.maxRelationEdges === undefined ? {} : { maxRelationEdges: parsed.data.context.maxRelationEdges }),
-        ...(parsed.data.context.syncPageSize === undefined ? {} : { syncPageSize: parsed.data.context.syncPageSize }),
-        ...(parsed.data.context.syncMaxPages === undefined ? {} : { syncMaxPages: parsed.data.context.syncMaxPages }),
-      };
+  const journalPath = absoluteFrom(baseDir, parsed.journalPath);
+  const context = parsed.context === undefined ? undefined : localContextConfig(baseDir, parsed.context);
   const storageIssues = validateContextStoragePaths(journalPath, context);
   if (storageIssues.length > 0) throw new InvalidLocalAppConfigError(storageIssues);
-  const config: LocalAppConfig = {
+  return {
     schemaVersion: "1",
     configPath,
     journalPath,
     ...(context === undefined ? {} : { context }),
     principal: {
-      subject: parsed.data.principal.subject,
-      scopes: [...parsed.data.principal.scopes],
+      subject: parsed.principal.subject,
+      scopes: [...parsed.principal.scopes],
     },
-    providers: parsed.data.providers.map((provider) => ({
+    providers: parsed.providers.map((provider) => ({
       id: provider.id,
       root: absoluteFrom(baseDir, provider.root),
       manifest: provider.manifest as ConnectorManifest,
     })),
-    entities: parsed.data.entities.map((entity) => ({
+    entities: parsed.entities.map((entity) => ({
       entityId: entity.entityId as EntityId,
       aliases: [...entity.aliases],
       bindings: entity.bindings.map((binding) => ({ ...binding })),
       authority: entity.authority.map((rule) => ({ ...rule })),
     })),
     policy: {
-      operations: { ...parsed.data.policy.operations },
-      fields: parsed.data.policy.fields.map((grant) => ({
+      operations: { ...parsed.policy.operations },
+      fields: parsed.policy.fields.map((grant) => ({
         entityId: grant.entityId as EntityId,
         property: grant.property,
         ...(grant.providers === undefined ? {} : { providers: [...grant.providers] }),
@@ -635,11 +722,24 @@ export async function loadLocalAppConfig(
       })),
     },
   };
+}
 
-  const warnings: string[] = [];
-  if (process.platform !== "win32" && (info.mode & 0o022) !== 0) {
-    warnings.push("config file is group/world writable");
-  }
+function configWarnings(mode: number): string[] {
+  if (process.platform === "win32" || (mode & 0o022) === 0) return [];
+  return ["config file is group/world writable"];
+}
 
-  return { config, warnings };
+export async function loadLocalAppConfig(
+  configPathInput: string,
+): Promise<{
+  readonly config: LocalAppConfig;
+  readonly warnings: readonly string[];
+}> {
+  const configPath = resolve(configPathInput);
+  const [raw, info] = await Promise.all([readFile(configPath, "utf8"), stat(configPath)]);
+  const parsed = parseConfigJson(raw);
+  return {
+    config: runtimeConfig(configPath, parsed),
+    warnings: configWarnings(info.mode),
+  };
 }

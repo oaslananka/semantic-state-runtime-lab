@@ -231,6 +231,72 @@ async function connect(app: LocalRuntimeApp) {
   };
 }
 
+type TestFixture = Awaited<ReturnType<typeof fixture>>;
+type TestConnection = Awaited<ReturnType<typeof connect>>;
+
+async function writeConfig(
+  fx: TestFixture,
+  config: ReturnType<typeof contextConfigObject> | ReturnType<typeof configObject>,
+): Promise<void> {
+  await writeFile(fx.configPath, JSON.stringify(config, null, 2), "utf8");
+}
+
+async function expectInvalidConfig(
+  fx: TestFixture,
+  config: ReturnType<typeof contextConfigObject>,
+  message: string,
+): Promise<void> {
+  await writeConfig(fx, config);
+  await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
+    issues: expect.arrayContaining([expect.stringContaining(message)]),
+  });
+}
+
+async function startContextRuntime(
+  fx: TestFixture,
+  config: ReturnType<typeof contextConfigObject> = contextConfigObject(),
+): Promise<{ readonly app: LocalRuntimeApp; readonly connection: TestConnection }> {
+  await writeConfig(fx, config);
+  const { app } = await loadAndCreateLocalRuntimeApp(fx.configPath);
+  return { app, connection: await connect(app) };
+}
+
+async function compileContext(
+  connection: TestConnection,
+  task = "Project Atlas deadline",
+  budgetTokens = 180,
+) {
+  return connection.client.callTool({
+    name: MCP_TOOL_NAMES.context,
+    arguments: { task, budgetTokens },
+  });
+}
+
+
+async function withContextRuntime(
+  run: (input: {
+    readonly fx: TestFixture;
+    readonly app: LocalRuntimeApp;
+    readonly connection: TestConnection;
+  }) => Promise<void>,
+  config: ReturnType<typeof contextConfigObject> = contextConfigObject(),
+): Promise<void> {
+  const fx = await fixture();
+  let app: LocalRuntimeApp | undefined;
+  let connection: TestConnection | undefined;
+  try {
+    await writeConfig(fx, config);
+    ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+    connection = await connect(app);
+    await run({ fx, app, connection });
+  } finally {
+    if (connection !== undefined) await connection.close();
+    app?.close();
+    await rm(fx.root, { recursive: true, force: true });
+  }
+}
+
+
 describe("local Node composition", () => {
   it("rejects path-escape config before creating persistent journal state", async () => {
     const fx = await fixture();
@@ -253,30 +319,15 @@ describe("local Node composition", () => {
       missingScope.principal.scopes = missingScope.principal.scopes.filter(
         (scope) => scope !== "context:read",
       );
-      await writeFile(fx.configPath, JSON.stringify(missingScope), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("context:read"),
-        ]),
-      });
+      await expectInvalidConfig(fx, missingScope, "context:read");
 
       const missingAliases = contextConfigObject();
       missingAliases.entities[0]!.aliases = [];
-      await writeFile(fx.configPath, JSON.stringify(missingAliases), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("at least one explicit alias"),
-        ]),
-      });
+      await expectInvalidConfig(fx, missingAliases, "at least one explicit alias");
 
       const mixedType = contextConfigObject();
       (mixedType.entities[0]!.bindings[1]! as { canonicalType: string }).canonicalType = "Person";
-      await writeFile(fx.configPath, JSON.stringify(mixedType), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("no configured entity bindings"),
-        ]),
-      });
+      await expectInvalidConfig(fx, mixedType, "no configured entity bindings");
 
       const duplicateBinding = contextConfigObject();
       duplicateBinding.entities.push({
@@ -284,60 +335,30 @@ describe("local Node composition", () => {
         entityId: "entity://project/atlas-copy",
         aliases: ["Atlas Copy"],
       });
-      await writeFile(fx.configPath, JSON.stringify(duplicateBinding), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("is duplicated"),
-        ]),
-      });
+      await expectInvalidConfig(fx, duplicateBinding, "is duplicated");
 
       const duplicateSource = contextConfigObject();
       duplicateSource.context.sources.push({ provider: "primary", externalType: "markdown" });
-      await writeFile(fx.configPath, JSON.stringify(duplicateSource), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("duplicate source primary/markdown"),
-        ]),
-      });
+      await expectInvalidConfig(fx, duplicateSource, "duplicate source primary/markdown");
 
       const unknownSource = contextConfigObject();
       unknownSource.context.sources[0] = { provider: "missing", externalType: "markdown" };
-      await writeFile(fx.configPath, JSON.stringify(unknownSource), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("unknown provider"),
-        ]),
-      });
+      await expectInvalidConfig(fx, unknownSource, "unknown provider");
 
       const wrongExternalType = contextConfigObject();
       wrongExternalType.context.sources[0] = { provider: "primary", externalType: "unknown-type" };
-      await writeFile(fx.configPath, JSON.stringify(wrongExternalType), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("must match exactly one manifest entity mapping"),
-        ]),
-      });
+      await expectInvalidConfig(fx, wrongExternalType, "must match exactly one manifest entity mapping");
 
       const noBindingSource = contextConfigObject();
       noBindingSource.context.sources = [{ provider: "primary", externalType: "markdown" }];
       noBindingSource.entities[0]!.bindings = noBindingSource.entities[0]!.bindings.filter(
         (binding) => binding.provider !== "primary",
       );
-      await writeFile(fx.configPath, JSON.stringify(noBindingSource), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("no configured entity bindings"),
-        ]),
-      });
+      await expectInvalidConfig(fx, noBindingSource, "no configured entity bindings");
 
       const sharedStorage = contextConfigObject();
       sharedStorage.context.semanticStatePath = sharedStorage.journalPath;
-      await writeFile(fx.configPath, JSON.stringify(sharedStorage), "utf8");
-      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
-        issues: expect.arrayContaining([
-          expect.stringContaining("dedicated storage"),
-        ]),
-      });
+      await expectInvalidConfig(fx, sharedStorage, "dedicated storage");
     } finally {
       await rm(fx.root, { recursive: true, force: true });
     }
@@ -399,10 +420,7 @@ describe("local Node composition", () => {
         MCP_TOOL_NAMES.plan,
       ].sort());
 
-      const initial = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      const initial = await compileContext(connection);
       const initialOutput = mcpContextCompileOutputSchema.parse(initial.structuredContent);
       const initialJson = JSON.stringify(initial);
       expect(initial.isError).not.toBe(true);
@@ -438,10 +456,7 @@ describe("local Node composition", () => {
         before.replace('deadline: "2026-11-20"', 'deadline: "2026-12-01"'),
         "utf8",
       );
-      const refreshed = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      const refreshed = await compileContext(connection);
       const refreshedOutput = mcpContextCompileOutputSchema.parse(refreshed.structuredContent);
       expect(refreshedOutput.records.some((record) => record.text.includes("2026-12-01"))).toBe(true);
       expect(refreshedOutput.records.every((record) => !record.text.includes("2026-11-20"))).toBe(true);
@@ -456,10 +471,7 @@ describe("local Node composition", () => {
 
       ({ app: second } = await loadAndCreateLocalRuntimeApp(fx.configPath));
       connection = await connect(second);
-      const restarted = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      const restarted = await compileContext(connection);
       const restartedOutput = mcpContextCompileOutputSchema.parse(restarted.structuredContent);
       expect(restartedOutput.records.some((record) => record.text.includes("2026-12-01"))).toBe(true);
     } finally {
@@ -471,17 +483,8 @@ describe("local Node composition", () => {
   });
 
   it("fails closed when an authoritative context root contains an unconfigured Markdown file", async () => {
-    const fx = await fixture();
-    await writeFile(fx.configPath, JSON.stringify(contextConfigObject(), null, 2), "utf8");
-    let app: LocalRuntimeApp | undefined;
-    let connection: Awaited<ReturnType<typeof connect>> | undefined;
-    try {
-      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
-      connection = await connect(app);
-      const before = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+    await withContextRuntime(async ({ fx, connection }) => {
+      const before = await compileContext(connection);
       expect(before.isError).not.toBe(true);
       expect(JSON.stringify(before)).toContain("2026-11-20");
 
@@ -490,10 +493,7 @@ describe("local Node composition", () => {
         "---\ndeadline: 2099-01-01\nsecret: UNCONFIGURED-SECRET\n---\n# Unknown\n",
         "utf8",
       );
-      const result = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      const result = await compileContext(connection);
       expect(result.isError).toBe(true);
       const errorJson = JSON.stringify(result);
       expect(errorJson).toContain("internal_error");
@@ -501,74 +501,34 @@ describe("local Node composition", () => {
       expect(errorJson).not.toContain("2099-01-01");
       expect(errorJson).not.toContain("UNCONFIGURED-SECRET");
       expect(errorJson).not.toContain("unconfigured.md");
-    } finally {
-      if (connection !== undefined) await connection.close();
-      app?.close();
-      await rm(fx.root, { recursive: true, force: true });
-    }
+    });
   });
 
   it("retracts a removed authoritative frontmatter field instead of falling back to stale replica state", async () => {
-    const fx = await fixture();
-    await writeFile(fx.configPath, JSON.stringify(contextConfigObject(), null, 2), "utf8");
-    let app: LocalRuntimeApp | undefined;
-    let connection: Awaited<ReturnType<typeof connect>> | undefined;
-    try {
-      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
-      connection = await connect(app);
-      const before = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+    await withContextRuntime(async ({ fx, connection }) => {
+      const before = await compileContext(connection);
       expect(JSON.stringify(before)).toContain("2026-11-20");
 
       const primaryPath = join(fx.primary, "project.md");
       const current = await readFile(primaryPath, "utf8");
-      await writeFile(
-        primaryPath,
-        current.replace('deadline: "2026-11-20"\n', ""),
-        "utf8",
-      );
-      const after = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      await writeFile(primaryPath, current.replace('deadline: "2026-11-20"\n', ""), "utf8");
+      const after = await compileContext(connection);
       const output = mcpContextCompileOutputSchema.parse(after.structuredContent);
       expect(output.records.every((record) => !record.text.includes("2026-11-20"))).toBe(true);
       expect(output.records.every((record) => !record.text.includes("2026-11-15"))).toBe(true);
-    } finally {
-      if (connection !== undefined) await connection.close();
-      app?.close();
-      await rm(fx.root, { recursive: true, force: true });
-    }
+    });
   });
 
   it("retracts deleted configured Markdown state instead of serving ghost context", async () => {
-    const fx = await fixture();
-    await writeFile(fx.configPath, JSON.stringify(contextConfigObject(), null, 2), "utf8");
-    let app: LocalRuntimeApp | undefined;
-    let connection: Awaited<ReturnType<typeof connect>> | undefined;
-    try {
-      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
-      connection = await connect(app);
-      const before = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+    await withContextRuntime(async ({ fx, connection }) => {
+      const before = await compileContext(connection);
       expect(JSON.stringify(before)).toContain("2026-11-20");
 
       await rm(join(fx.primary, "project.md"));
-      const after = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
+      const after = await compileContext(connection);
       expect(JSON.stringify(after)).not.toContain("2026-11-20");
       expect(JSON.stringify(after)).not.toContain("PRIMARY-SECRET");
-    } finally {
-      if (connection !== undefined) await connection.close();
-      app?.close();
-      await rm(fx.root, { recursive: true, force: true });
-    }
+    });
   });
 
   it("allows append-only configured aliases and resolves them after restart", async () => {
@@ -588,10 +548,7 @@ describe("local Node composition", () => {
       await writeFile(fx.configPath, JSON.stringify(extended, null, 2), "utf8");
       ({ app: second } = await loadAndCreateLocalRuntimeApp(fx.configPath));
       connection = await connect(second);
-      const result = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Atlas Initiative deadline", budgetTokens: 180 },
-      });
+      const result = await compileContext(connection, "Atlas Initiative deadline");
       const output = mcpContextCompileOutputSchema.parse(result.structuredContent);
       expect(output.resolution).toEqual({
         status: "resolved",
@@ -738,49 +695,27 @@ describe("local Node composition", () => {
   });
 
   it("honors provider-scoped field grants only when they cover canonical authority", async () => {
-    const fx = await fixture();
-    let app: LocalRuntimeApp | undefined;
-    let connection: Awaited<ReturnType<typeof connect>> | undefined;
-    try {
-      const primaryGranted = contextConfigObject();
-      Object.assign(primaryGranted.policy.fields[0]!, { providers: ["primary"] });
-      await writeFile(fx.configPath, JSON.stringify(primaryGranted, null, 2), "utf8");
-      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
-      connection = await connect(app);
-      const allowed = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
-      const allowedOutput = mcpContextCompileOutputSchema.parse(allowed.structuredContent);
-      expect(allowedOutput.resolution).toEqual({
+    const primaryGranted = contextConfigObject();
+    Object.assign(primaryGranted.policy.fields[0]!, { providers: ["primary"] });
+    await withContextRuntime(async ({ connection }) => {
+      const allowed = await compileContext(connection);
+      const output = mcpContextCompileOutputSchema.parse(allowed.structuredContent);
+      expect(output.resolution).toEqual({
         status: "resolved",
         entityId,
         entityType: "Project",
       });
-      expect(allowedOutput.records.some((record) => record.text.includes("2026-11-20"))).toBe(true);
+      expect(output.records.some((record) => record.text.includes("2026-11-20"))).toBe(true);
+    }, primaryGranted);
 
-      await connection.close();
-      connection = undefined;
-      app.close();
-      app = undefined;
-
-      const replicaOnly = contextConfigObject();
-      Object.assign(replicaOnly.policy.fields[0]!, { providers: ["replica"] });
-      await writeFile(fx.configPath, JSON.stringify(replicaOnly, null, 2), "utf8");
-      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
-      connection = await connect(app);
-      const denied = await connection.client.callTool({
-        name: MCP_TOOL_NAMES.context,
-        arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
-      });
-      const deniedOutput = mcpContextCompileOutputSchema.parse(denied.structuredContent);
-      expect(deniedOutput.resolution).toEqual({ status: "none" });
-      expect(deniedOutput.records).toEqual([]);
-    } finally {
-      if (connection !== undefined) await connection.close();
-      app?.close();
-      await rm(fx.root, { recursive: true, force: true });
-    }
+    const replicaOnly = contextConfigObject();
+    Object.assign(replicaOnly.policy.fields[0]!, { providers: ["replica"] });
+    await withContextRuntime(async ({ connection }) => {
+      const denied = await compileContext(connection);
+      const output = mcpContextCompileOutputSchema.parse(denied.structuredContent);
+      expect(output.resolution).toEqual({ status: "none" });
+      expect(output.records).toEqual([]);
+    }, replicaOnly);
   });
 
   it("reconciles real Markdown, preserves unrelated content, filters denied fields, and journals evidence", async () => {
