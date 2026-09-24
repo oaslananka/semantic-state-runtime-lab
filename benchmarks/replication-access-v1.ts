@@ -59,11 +59,19 @@ const evaluations: Record<ReplicationAccessOperation, number> = {
   "projection:read": 0,
   "record:read": 0,
   "record:apply": 0,
+  "artifact-blob:read": 0,
+  "artifact-blob:apply": 0,
 };
 const policy: ReplicationAccessPolicy = {
   evaluate(request) {
     evaluations[request.operation] += 1;
-    if (request.operation === "record:apply") return { effect: "deny", code: "benchmark-read-only" };
+    if (
+      request.operation === "record:apply"
+      || request.operation === "artifact-blob:read"
+      || request.operation === "artifact-blob:apply"
+    ) {
+      return { effect: "deny", code: "benchmark-read-only" };
+    }
     return allowedIds.has(request.record.recordId)
       ? { effect: "allow" }
       : { effect: "deny", code: "not-in-benchmark-projection" };

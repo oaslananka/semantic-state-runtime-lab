@@ -90,3 +90,12 @@ This benchmark makes no network-latency claim. See `docs/bounded-reconciliation-
 It verifies source scan count, projection policy evaluation count, allowed descriptor count, Merkle root record count, transfer-time policy evaluations, and serialized envelope bytes. Timing fields are observational and explicitly do **not** model network RTT, TLS, credential verification, token parsing, storage I/O, or policy-cache behavior.
 
 See `docs/policy-scoped-replication-v1.md` for the security contract.
+
+
+## Principal-scoped artifact blob replication v1
+
+`pnpm benchmark:replication:blob-access:v1` measures deterministic local work accounting for explicit artifact-blob authorization over an already authorized replication projection.
+
+The fixture uses 64 visible artifact upsert records referencing one 41-byte CAS blob. Every second record is `record:read`-authorized and only the final readable reference is `artifact-blob:read`-authorized, so the successful read must report exactly 64 referencing records examined, 64 record-policy evaluations, 32 blob-policy evaluations, and 41 transferred bytes. The install side must report exactly one record-policy evaluation, one blob-policy evaluation, and 41 transferred bytes.
+
+Elapsed time is observational only. The fixture is in-memory and makes no network, TLS, credential-verification, RTT, remote-store, or production-throughput claim. See `docs/principal-scoped-artifact-blob-replication-v1.md`.

@@ -45,7 +45,9 @@ The policy sees the canonical full `ReplicationRecord` server-side plus immutabl
 ```text
 projection:read  may this record participate in this projection's Merkle tree?
 record:read      may this full envelope be transferred out now?
-record:apply     may this full incoming envelope be applied locally?
+record:apply         may this full incoming envelope be applied locally?
+artifact-blob:read   may raw CAS bytes referenced by this readable artifact record leave the node?
+artifact-blob:apply  may verified raw CAS bytes referenced by this writable artifact record be installed?
 ```
 
 Read and write are independent. There is no read=>apply or apply=>read implication.
@@ -204,11 +206,18 @@ The access layer does not reimplement store collision semantics.
 
 Authorization of an `artifact-mutation` replication record does **not** authorize raw artifact blob bytes.
 
-v1 transfers/applies immutable mutation metadata only through this gateway. Blob reads remain behind the existing artifact access/store boundary. There is no shortcut equivalent to:
+Blob transfer is now an explicit second authorization layer:
 
 ```text
-mutation visible => blob readable
+projection:read -> mutation metadata may participate in this Merkle projection
+record:read     -> full mutation envelope may leave the node now
+artifact-blob:read -> referenced CAS bytes may leave the node now
+
+record:apply        -> incoming mutation envelope may be applied
+artifact-blob:apply -> referenced verified CAS bytes may be installed
 ```
+
+There is no shortcut equivalent to `mutation visible => blob readable`, and blob read does not imply blob apply. See `docs/principal-scoped-artifact-blob-replication-v1.md` for the transfer/integrity/non-enumeration contract.
 
 ## Bounds
 
@@ -221,7 +230,9 @@ v1 enforces configurable ceilings for:
 - record-transfer serialized envelope bytes;
 - apply-record count;
 - apply serialized envelope bytes;
-- authorization lease duration.
+- authorization lease duration;
+- artifact blob read bytes;
+- artifact blob apply bytes.
 
 Caller-provided lower bounds may tighten transfer/apply operations but cannot raise server ceilings.
 
@@ -237,6 +248,7 @@ normalized subject
 projectionId
 optional deny code
 optional record kind/key
+optional blob digest/size
 ```
 
 No record payload, bearer token, device secret or raw credential object is copied into events.
