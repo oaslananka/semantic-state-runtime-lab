@@ -56,3 +56,9 @@ See `docs/entity-graph-context-v1.md` for the contract, policy boundary, results
 `pnpm benchmark:google-calendar:v1` is a deterministic provider-adapter accounting benchmark. It uses scripted Google Calendar responses plus the real SQLite ingestion/semantic stores and existing Context Capsule worker; it does not use live credentials and makes no latency claim.
 
 The fixture covers a multi-page initial sync, an incremental update + sparse delete, and a 410-triggered authoritative full resync with unseen-resource sweep. See `docs/google-calendar-adapter-v1.md` for the current expected counts and semantics.
+
+## Markdown authoritative ingestion v1
+
+`pnpm benchmark:markdown:v1` measures the correctness-first local Markdown full-scan path on deterministic 100-note and 1,000-note fixtures: recursive enumeration, exact byte reads, SHA-256, strict UTF-8 decoding, frontmatter parsing, and configured field extraction.
+
+It also checks checkpoint stability on a byte-identical second scan. Timing is observational only; there is no latency threshold or claim that O(N files + bytes) full scans are suitable for huge vaults. See `docs/markdown-authoritative-ingestion-v1.md`.

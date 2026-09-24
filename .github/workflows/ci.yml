@@ -56,3 +56,6 @@ jobs:
 
       - name: Google Calendar fixture benchmark smoke test
         run: pnpm benchmark:google-calendar:v1
+
+      - name: Markdown authoritative ingestion benchmark smoke test
+        run: pnpm benchmark:markdown:v1

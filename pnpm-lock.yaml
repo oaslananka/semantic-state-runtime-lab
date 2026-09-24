@@ -212,13 +212,25 @@ importers:
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/ingestion':
+        specifier: workspace:*
+        version: link:../ingestion
       yaml:
         specifier: 2.9.1
         version: 2.9.1
     devDependencies:
+      '@ssrl/materializer':
+        specifier: workspace:*
+        version: link:../materializer
       '@ssrl/runtime':
         specifier: workspace:*
         version: link:../runtime
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
