@@ -4,6 +4,8 @@ import {
   ProtocolErrorCode,
   ResourceNotFoundError,
   ResourceTemplate,
+  requireScopes,
+  type ScopeChallengeHandler,
 } from "@modelcontextprotocol/server";
 import {
   ArtifactAccessDeniedError,
@@ -121,10 +123,17 @@ export interface RuntimeMcpArtifactOptions {
   readonly maxResourceBytes?: number;
 }
 
+export interface RuntimeMcpScopeOptions {
+  readonly plan?: readonly string[];
+  readonly apply?: readonly string[];
+  readonly artifacts?: readonly string[];
+}
+
 export interface RuntimeMcpServerOptions {
   readonly host: RuntimeHost;
   readonly principal: RuntimePrincipal;
   readonly artifacts?: RuntimeMcpArtifactOptions;
+  readonly scopes?: RuntimeMcpScopeOptions;
   readonly name?: string;
   readonly version?: string;
 }
@@ -190,6 +199,17 @@ export const MCP_ARTIFACT_CACHE_HINT = {
   cacheScope: "private" as const,
 } as const;
 
+function scopeChallenge(scopes: readonly string[] | undefined): ScopeChallengeHandler | undefined {
+  if (scopes === undefined || scopes.length === 0) return undefined;
+  const normalized = [...new Set(scopes.map((scope) => scope.trim()))]
+    .filter((scope) => scope.length > 0)
+    .toSorted((left, right) => left.localeCompare(right));
+  if (normalized.length === 0) return undefined;
+  const [first, ...rest] = normalized;
+  if (first === undefined) return undefined;
+  return requireScopes(first, ...rest);
+}
+
 function opaqueResourceName(descriptor: ArtifactResourceDescriptor): string {
   return `artifact-${descriptor.uri.slice(-12)}`;
 }
@@ -236,6 +256,7 @@ function registerArtifactResources(
   if (artifactOptions === undefined) return;
   const maxListedResources = artifactOptions.maxListedResources ?? 500;
   const maxResourceBytes = artifactOptions.maxResourceBytes ?? 256 * 1024;
+  const artifactScopeChallenge = scopeChallenge(options.scopes?.artifacts);
   for (const [name, value] of [
     ["maxListedResources", maxListedResources],
     ["maxResourceBytes", maxResourceBytes],
@@ -307,6 +328,9 @@ function registerArtifactResources(
     {
       description: "Policy-filtered current SSRL artifacts.",
       cacheHint: MCP_ARTIFACT_CACHE_HINT,
+      ...(artifactScopeChallenge === undefined
+        ? {}
+        : { scopeChallenge: artifactScopeChallenge }),
     },
     read,
   );
@@ -317,6 +341,9 @@ function registerArtifactResources(
     {
       description: "Policy-filtered immutable SSRL artifact version.",
       cacheHint: MCP_ARTIFACT_CACHE_HINT,
+      ...(artifactScopeChallenge === undefined
+        ? {}
+        : { scopeChallenge: artifactScopeChallenge }),
     },
     read,
   );
@@ -331,6 +358,8 @@ export function createRuntimeMcpServer(
   });
 
   registerArtifactResources(server, options);
+  const planScopeChallenge = scopeChallenge(options.scopes?.plan);
+  const applyScopeChallenge = scopeChallenge(options.scopes?.apply);
 
   server.registerTool(
     MCP_TOOL_NAMES.plan,
@@ -338,6 +367,9 @@ export function createRuntimeMcpServer(
       description: "Plan policy-filtered state reconciliation without applying external mutations.",
       inputSchema: mcpPlanInputSchema,
       outputSchema: mcpPlanOutputSchema,
+      ...(planScopeChallenge === undefined
+        ? {}
+        : { scopeChallenge: planScopeChallenge }),
       annotations: {
         title: "Plan state reconciliation",
         readOnlyHint: true,
@@ -390,6 +422,9 @@ export function createRuntimeMcpServer(
       description: "Apply exactly one previously planned proposal digest after live re-validation.",
       inputSchema: mcpApplyInputSchema,
       outputSchema: mcpApplyOutputSchema,
+      ...(applyScopeChallenge === undefined
+        ? {}
+        : { scopeChallenge: applyScopeChallenge }),
       annotations: {
         title: "Apply state reconciliation",
         readOnlyHint: false,

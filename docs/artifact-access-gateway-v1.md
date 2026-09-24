@@ -312,7 +312,7 @@ For MCP 2026-07-28 resource reads, SSRL declares:
 
 Even immutable version bytes use the conservative hint in v1 because access authorization can be revoked independently from content immutability.
 
-The existing in-memory/stdio SDK test harness speaks the legacy handshake, so the v1 test suite asserts the registered cache-hint constant rather than claiming modern-wire serialization coverage. Modern Streamable HTTP composition is a later integration test.
+The original in-memory/stdio SDK harness speaks the legacy handshake and still asserts the registration constant. `@ssrl/mcp-http` now adds a pinned 2026-07-28 Streamable HTTP integration test that verifies `ttlMs=0` and `cacheScope=private` on the actual modern wire responses.
 
 ## Error posture
 
@@ -365,15 +365,16 @@ v1 does not implement:
 - document extraction/OCR/chunking;
 - cloud multi-tenant authorization.
 
-## Next step
+## Authenticated remote composition
 
-The next security/product checkpoint is authenticated remote composition:
+`@ssrl/mcp-http` now provides the next layer:
 
 ```text
-verified transport auth
+verified bearer auth
+   -> token-stripped verified auth context
    -> AccessPrincipal
    -> RuntimeHost + ArtifactAccessGateway
-   -> stateless Streamable HTTP MCP requests
+   -> stateless 2026-07-28 Streamable HTTP requests
 ```
 
-That layer should also prove modern 2026-07-28 cache hints and per-request principal mapping on the wire.
+Modern integration tests prove per-request principal isolation, scope challenges, and cache hints on the wire. See `docs/authenticated-mcp-http-v1.md`.

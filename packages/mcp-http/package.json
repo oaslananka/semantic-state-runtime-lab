@@ -1,0 +1,28 @@
+{
+  "name": "@ssrl/mcp-http",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.1.0",
+    "@ssrl/access": "workspace:*",
+    "@ssrl/mcp-server": "workspace:*",
+    "@ssrl/runtime-host": "workspace:*"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.1.0",
+    "@ssrl/artifact-access": "workspace:*",
+    "@ssrl/artifact-store": "workspace:*",
+    "@ssrl/core": "workspace:*",
+    "@ssrl/runtime": "workspace:*",
+    "@ssrl/storage-local-artifacts": "workspace:*",
+    "@types/node": "26.6.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}
