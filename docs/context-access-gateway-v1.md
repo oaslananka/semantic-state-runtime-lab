@@ -51,7 +51,7 @@ A query never trusts a cache blindly.
 
 This preserves the earlier invariant that time itself may invalidate current state even when the change feed is empty.
 
-Synchronization is bounded by `pageSize` and `maxPages`. If it cannot catch up, it throws `ContextCapsuleSyncLimitError`; the gateway returns no stale context.
+Synchronization is bounded by `pageSize` and `maxPages`. If the underlying synchronizer cannot catch up, the gateway translates that implementation-specific failure into `ContextAccessSynchronizationLimitError`; callers receive no stale context and do not need to depend on the materializer package.
 
 ## Current-only v1
 
@@ -243,7 +243,6 @@ The v1 integration suite uses real SQLite semantic state, the real incremental m
 
 v1 does not implement:
 
-- MCP `context.compile` transport tool;
 - historical-as-of context access;
 - vector search/embeddings;
 - LLM summaries;
@@ -254,9 +253,9 @@ v1 does not implement:
 - opaque evidence handle registry;
 - cloud tenancy.
 
-## Next step
+## MCP projection
 
-The next adapter should be deliberately thin:
+`@ssrl/mcp-server` now exposes an optional thin `context.compile` tool:
 
 ```text
 MCP context.compile
@@ -266,4 +265,6 @@ MCP context.compile
 ContextAccessGateway.compile()
 ```
 
-MCP must not reimplement identity resolution, context filtering, evidence policy, or ranking.
+The MCP adapter does not reimplement identity resolution, synchronization, context filtering, evidence policy, relation expansion, or ranking. The v1 tool accepts only `task` and `budgetTokens`; historical clocks remain outside the transport surface.
+
+The next composition step is wiring a concrete Context Access Gateway into the local/remote application assembly and then exercising it from a real external client.

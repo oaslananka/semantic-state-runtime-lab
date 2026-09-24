@@ -32,6 +32,7 @@ import { SQLiteSemanticStateStore } from "@ssrl/storage-sqlite";
 import {
   ContextAccessDeniedError,
   ContextAccessGateway,
+  ContextAccessSynchronizationLimitError,
   ContextIdentityCandidateLimitError,
   ContextRelationCandidateLimitError,
   HistoricalContextAccessUnsupportedError,
@@ -598,7 +599,7 @@ describe("ContextAccessGateway", () => {
       principal,
       task: "Project Atlas API style",
       budgetTokens: 120,
-    })).rejects.toBeInstanceOf(ContextCapsuleSyncLimitError);
+    })).rejects.toBeInstanceOf(ContextAccessSynchronizationLimitError);
     sqlite.close();
   });
 

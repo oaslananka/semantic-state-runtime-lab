@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type {
+  EntityId,
   ExternalBinding,
   StateValue,
 } from "@ssrl/core";
+import {
+  ContextAccessDeniedError,
+  ContextAccessSynchronizationLimitError,
+  ContextIdentityCandidateLimitError,
+  ContextRelationCandidateLimitError,
+} from "@ssrl/context-access";
 import {
   InMemoryStateProvider,
   type StateProvider,
@@ -18,7 +25,9 @@ import {
   MCP_TOOL_NAMES,
   createRuntimeMcpServer,
   mcpApplyOutputSchema,
+  mcpContextCompileOutputSchema,
   mcpPlanOutputSchema,
+  type RuntimeMcpContextGateway,
 } from "../src/index.js";
 
 const entityId = "entity://project/atlas" as const;
@@ -153,10 +162,12 @@ function host(
 async function connect(
   runtimeHost: RuntimeHost,
   principal: RuntimePrincipal,
+  context?: RuntimeMcpContextGateway,
 ) {
   const server = createRuntimeMcpServer({
     host: runtimeHost,
     principal,
+    ...(context === undefined ? {} : { context: { gateway: context } }),
     name: "ssrl-test",
     version: "1.0.0",
   });
@@ -190,6 +201,73 @@ function applyOutput(result: { readonly structuredContent?: unknown }) {
   return mcpApplyOutputSchema.parse(result.structuredContent);
 }
 
+function contextOutput(result: { readonly structuredContent?: unknown }) {
+  return mcpContextCompileOutputSchema.parse(result.structuredContent);
+}
+
+interface ContextGatewayCall {
+  readonly principal?: RuntimePrincipal;
+  readonly task: string;
+  readonly budgetTokens: number;
+}
+
+function contextGateway(
+  calls: ContextGatewayCall[] = [],
+): RuntimeMcpContextGateway {
+  return {
+    async compile(request) {
+      calls.push({
+        ...(request.principal === undefined ? {} : { principal: request.principal }),
+        task: request.task,
+        budgetTokens: request.budgetTokens,
+      });
+      return {
+        resolution: {
+          status: "resolved",
+          entityId,
+          entityType: "Project",
+        },
+        context: {
+          records: [
+            {
+              id: "capsule-state:atlas:deadline",
+              entityId,
+              kind: "state",
+              text: "Project deadline: 2026-11-20.",
+              evidenceRefs: ["artifact:visible"],
+            },
+            {
+              id: "capsule-state:alice:timezone",
+              entityId: "entity://person/alice" as EntityId,
+              kind: "state",
+              text: "Timezone: Europe/Istanbul.",
+            },
+          ],
+          resolvedEntityIds: [entityId],
+          estimatedTokens: 29,
+          consideredRecords: 2,
+        },
+        relatedEntityIds: ["entity://person/alice" as EntityId],
+      };
+    },
+  };
+}
+
+function throwingContextGateway(error: unknown): RuntimeMcpContextGateway {
+  return { async compile() { throw error; } };
+}
+
+async function callContext(
+  client: Client,
+  task = "Atlas",
+  budgetTokens = 100,
+) {
+  return client.callTool({
+    name: MCP_TOOL_NAMES.context,
+    arguments: { task, budgetTokens },
+  });
+}
+
 describe("MCP runtime adapter", () => {
   it("exposes exactly plan and apply with safety annotations", async () => {
     const providers = stateProviders();
@@ -215,6 +293,294 @@ describe("MCP runtime adapter", () => {
       destructiveHint: true,
       idempotentHint: false,
     });
+  });
+
+  it("registers context.compile only when a context gateway is configured", async () => {
+    const providers = stateProviders();
+    const client = await connect(host(providers), alice, contextGateway());
+
+    const listed = await client.listTools();
+    const contextTool = listed.tools.find((tool) => tool.name === MCP_TOOL_NAMES.context);
+
+    expect(listed.tools.map((tool) => tool.name).sort()).toEqual([
+      MCP_TOOL_NAMES.apply,
+      MCP_TOOL_NAMES.context,
+      MCP_TOOL_NAMES.plan,
+    ].sort());
+    expect(contextTool?.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+  });
+
+  it("delegates context.compile to the configured gateway with the server principal", async () => {
+    const providers = stateProviders();
+    const calls: ContextGatewayCall[] = [];
+    const client = await connect(host(providers), alice, contextGateway(calls));
+
+    const result = await callContext(client, "Project Atlas deadline", 200);
+    const output = contextOutput(result);
+
+    expect(result.isError).not.toBe(true);
+    expect(calls).toEqual([{
+      principal: alice,
+      task: "Project Atlas deadline",
+      budgetTokens: 200,
+    }]);
+    expect(output).toEqual({
+      schemaVersion: "1",
+      resolution: { status: "resolved", entityId, entityType: "Project" },
+      records: [
+        {
+          id: "capsule-state:atlas:deadline",
+          entityId,
+          kind: "state",
+          text: "Project deadline: 2026-11-20.",
+          evidenceRefs: ["artifact:visible"],
+        },
+        {
+          id: "capsule-state:alice:timezone",
+          entityId: "entity://person/alice",
+          kind: "state",
+          text: "Timezone: Europe/Istanbul.",
+        },
+      ],
+      resolvedEntityIds: [entityId],
+      relatedEntityIds: ["entity://person/alice"],
+      estimatedTokens: 29,
+      consideredRecords: 2,
+    });
+    expect(output.estimatedTokens).toBeLessThanOrEqual(200);
+    expect(JSON.stringify(result.content)).not.toContain("Project Atlas deadline");
+    expect(JSON.stringify(result.content)).not.toContain("2026-11-20");
+    expect(JSON.stringify(result.content)).not.toContain("Europe/Istanbul");
+  });
+
+  it("returns sanitized visible ambiguity from the context gateway", async () => {
+    const providers = stateProviders();
+    const gateway: RuntimeMcpContextGateway = {
+      async compile() {
+        return {
+          resolution: {
+            status: "ambiguous",
+            candidates: [
+              { entityId, entityType: "Project" },
+              { entityId: "entity://person/atlas", entityType: "Person" },
+            ],
+          },
+          context: {
+            records: [],
+            resolvedEntityIds: [],
+            estimatedTokens: 0,
+            consideredRecords: 0,
+          },
+          relatedEntityIds: [],
+        };
+      },
+    };
+    const client = await connect(host(providers), alice, gateway);
+
+    const result = await callContext(client, "Atlas", 80);
+
+    expect(contextOutput(result).resolution).toEqual({
+      status: "ambiguous",
+      candidates: [
+        { entityId, entityType: "Project" },
+        { entityId: "entity://person/atlas", entityType: "Person" },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("evidenceRefs");
+  });
+
+  it("rejects malformed context input before invoking the gateway", async () => {
+    const providers = stateProviders();
+    const calls: ContextGatewayCall[] = [];
+    const client = await connect(host(providers), alice, contextGateway(calls));
+
+    const result = await client.callTool({
+      name: MCP_TOOL_NAMES.context,
+      arguments: { task: "   ", budgetTokens: 0 },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("Input validation error");
+    expect(calls).toEqual([]);
+  });
+
+  it("strips unknown gateway fields from successful context output", async () => {
+    const providers = stateProviders();
+    const gateway: RuntimeMcpContextGateway = {
+      async compile() {
+        return {
+          resolution: {
+            status: "resolved",
+            entityId,
+            entityType: "Project",
+            privateAliasEvidence: "must-not-leak",
+          },
+          context: {
+            records: [{
+              id: "safe-record",
+              entityId,
+              kind: "state",
+              text: "Safe context.",
+              privatePolicyCode: "must-not-leak",
+            }],
+            resolvedEntityIds: [entityId],
+            estimatedTokens: 8,
+            consideredRecords: 1,
+            privateDebug: "must-not-leak",
+          },
+          relatedEntityIds: [],
+          privateGatewayTrace: "must-not-leak",
+        } as never;
+      },
+    };
+    const client = await connect(host(providers), alice, gateway);
+
+    const result = await client.callTool({
+      name: MCP_TOOL_NAMES.context,
+      arguments: { task: "Project Atlas", budgetTokens: 100 },
+    });
+    const serialized = JSON.stringify(result.structuredContent);
+
+    expect(result.isError).not.toBe(true);
+    expect(mcpContextCompileOutputSchema.parse(result.structuredContent).records)
+      .toEqual([expect.objectContaining({ id: "safe-record" })]);
+    expect(serialized).not.toContain("must-not-leak");
+    expect(serialized).not.toContain("privatePolicyCode");
+    expect(serialized).not.toContain("privateGatewayTrace");
+  });
+
+  it("rejects a gateway result that exceeds the caller's requested token budget", async () => {
+    const providers = stateProviders();
+    const gateway: RuntimeMcpContextGateway = {
+      async compile() {
+        return {
+          resolution: { status: "resolved", entityId, entityType: "Project" },
+          context: {
+            records: [],
+            resolvedEntityIds: [entityId],
+            estimatedTokens: 101,
+            consideredRecords: 0,
+          },
+          relatedEntityIds: [],
+        };
+      },
+    };
+    const client = await connect(host(providers), alice, gateway);
+
+    const result = await client.callTool({
+      name: MCP_TOOL_NAMES.context,
+      arguments: { task: "Project Atlas", budgetTokens: 100 },
+    });
+    const serialized = JSON.stringify(result);
+
+    expect(result.isError).toBe(true);
+    expect(serialized).toContain(
+      "context_request_rejected: Context request was rejected by server limits.",
+    );
+    expect(serialized).not.toContain("exceeded requested token budget");
+  });
+
+  it("rejects caller-supplied principal or historical fields before the gateway", async () => {
+    const providers = stateProviders();
+    const calls: ContextGatewayCall[] = [];
+    const client = await connect(host(providers), alice, contextGateway(calls));
+
+    for (const argumentsValue of [
+      {
+        task: "Project Atlas",
+        budgetTokens: 100,
+        principal: { subject: "user:mallory", scopes: ["context:read"] },
+      },
+      {
+        task: "Project Atlas",
+        budgetTokens: 100,
+        validAt: "2025-01-01T00:00:00Z",
+      },
+      {
+        task: "Project Atlas",
+        budgetTokens: 100,
+        knownAt: "2025-01-01T00:00:00Z",
+      },
+    ]) {
+      const result = await client.callTool({
+        name: MCP_TOOL_NAMES.context,
+        arguments: argumentsValue,
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  it("sanitizes context access denials without exposing policy codes or task text", async () => {
+    const providers = stateProviders();
+    const gateway = throwingContextGateway(
+      new ContextAccessDeniedError("private-policy-code-project-atlas"),
+    );
+    const client = await connect(host(providers), alice, gateway);
+
+    const result = await callContext(client, "private task text");
+    const serialized = JSON.stringify(result);
+
+    expect(result.isError).toBe(true);
+    expect(serialized).toContain("access_denied: Access denied.");
+    expect(serialized).not.toContain("private-policy-code-project-atlas");
+    expect(serialized).not.toContain("private task text");
+  });
+
+  it("sanitizes context candidate and synchronization limits", async () => {
+    const providers = stateProviders();
+    const errors = [
+      new ContextIdentityCandidateLimitError(7),
+      new ContextRelationCandidateLimitError(5),
+      new ContextAccessSynchronizationLimitError(),
+    ];
+    for (const error of errors) {
+      const client = await connect(host(providers), alice, throwingContextGateway(error));
+      const result = await callContext(client);
+      const serialized = JSON.stringify(result);
+
+      expect(result.isError).toBe(true);
+      expect(serialized).not.toContain(error.message);
+      expect(serialized).not.toContain(error.name);
+    }
+  });
+
+  it("maps context request-limit and unexpected failures to fixed safe messages", async () => {
+    const providers = stateProviders();
+    const cases = [
+      {
+        error: new RangeError("private configured max=41"),
+        expected: "context_request_rejected: Context request was rejected by server limits.",
+      },
+      {
+        error: Object.assign(new Error("private context backend secret"), {
+          stack: "STACK private context backend secret bearer-token-like-value",
+        }),
+        expected: "internal_error: Internal server error.",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const client = await connect(
+        host(providers),
+        alice,
+        throwingContextGateway(testCase.error),
+      );
+      const result = await callContext(client, "private context task");
+      const serialized = JSON.stringify(result);
+
+      expect(result.isError).toBe(true);
+      expect(serialized).toContain(testCase.expected);
+      expect(serialized).not.toContain(testCase.error.message);
+      expect(serialized).not.toContain("private context task");
+      expect(serialized).not.toContain("STACK");
+      expect(serialized).not.toContain("bearer-token-like-value");
+    }
   });
 
   it("plans policy-filtered state and never returns denied secret values", async () => {

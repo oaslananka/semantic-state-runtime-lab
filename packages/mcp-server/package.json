@@ -10,7 +10,8 @@
     "zod": "4.6.5",
     "@ssrl/core": "workspace:*",
     "@ssrl/artifact-access": "workspace:*",
-    "@ssrl/artifact-store": "workspace:*"
+    "@ssrl/artifact-store": "workspace:*",
+    "@ssrl/context-access": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.1.0",

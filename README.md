@@ -38,7 +38,8 @@ Implemented checkpoints include:
 - policy-enforced artifact access;
 - local stdio MCP composition;
 - authenticated stateless MCP 2026-07-28 HTTP composition;
-- principal-aware, capsule-backed derived context access.
+- principal-aware, capsule-backed derived context access;
+- MCP `context.compile` projection with authenticated `context:read` preflight.
 
 ## Design posture
 
@@ -57,7 +58,6 @@ See `docs/invariants.md` and the versioned design documents under `docs/`.
 
 The lab is not yet a consumer product. Important remaining work includes:
 
-- thin MCP `context.compile` exposure over the Context Access Gateway;
 - durable/search-optimized capsule cache backends;
 - more source connectors and semantic mappings;
 - historical context-access semantics;

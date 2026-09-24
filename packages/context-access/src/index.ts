@@ -20,10 +20,11 @@ import {
   type ContextPropertyDescriptor,
   type ContextRecord,
 } from "@ssrl/context";
-import type {
-  ContextCapsule,
-  ContextCapsuleStore,
-  ContextCapsuleSynchronizer,
+import {
+  ContextCapsuleSyncLimitError,
+  type ContextCapsule,
+  type ContextCapsuleStore,
+  type ContextCapsuleSynchronizer,
 } from "@ssrl/materializer";
 
 export type ContextAccessRequest =
@@ -168,6 +169,13 @@ export class ContextRelationScanLimitError extends Error {
   constructor(readonly limit: number) {
     super(`Context relation scan exceeded ${limit} active relations`);
     this.name = "ContextRelationScanLimitError";
+  }
+}
+
+export class ContextAccessSynchronizationLimitError extends Error {
+  constructor() {
+    super("Context access synchronization could not complete within the configured limit");
+    this.name = "ContextAccessSynchronizationLimitError";
   }
 }
 
@@ -558,7 +566,14 @@ export class ContextAccessGateway {
     const principal = this.#principal(request.principal);
     await this.#authorizeOperation(principal, budgetTokens);
     const at = this.#currentTime(request);
-    await this.#synchronizer.synchronize(at);
+    try {
+      await this.#synchronizer.synchronize(at);
+    } catch (error) {
+      if (error instanceof ContextCapsuleSyncLimitError) {
+        throw new ContextAccessSynchronizationLimitError();
+      }
+      throw error;
+    }
 
     const searched = await this.#capsules.search(request.task, this.#maxIdentityScans + 1);
     if (searched.length > this.#maxIdentityScans) {

@@ -367,6 +367,9 @@ importers:
       '@ssrl/artifact-store':
         specifier: workspace:*
         version: link:../artifact-store
+      '@ssrl/context-access':
+        specifier: workspace:*
+        version: link:../context-access
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
@@ -391,6 +394,9 @@ importers:
       '@ssrl/artifact-store':
         specifier: workspace:*
         version: link:../artifact-store
+      '@ssrl/context-access':
+        specifier: workspace:*
+        version: link:../context-access
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core

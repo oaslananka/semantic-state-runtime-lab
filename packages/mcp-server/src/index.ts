@@ -20,6 +20,16 @@ import type {
   StateValue,
 } from "@ssrl/core";
 import {
+  ContextAccessDeniedError,
+  ContextAccessSynchronizationLimitError,
+  ContextIdentityCandidateLimitError,
+  ContextIdentityScanLimitError,
+  ContextRelationCandidateLimitError,
+  ContextRelationScanLimitError,
+  type ContextAccessCompileRequest,
+  type ContextAccessResult,
+} from "@ssrl/context-access";
+import {
   ReconciliationApplyError,
   ReconciliationBlockedError,
   ReconciliationPlanDriftError,
@@ -36,6 +46,7 @@ import * as z from "zod/v4";
 export const MCP_TOOL_NAMES = {
   plan: "state.plan",
   apply: "state.apply",
+  context: "context.compile",
 } as const;
 
 const entityIdSchema = z.string().regex(/^entity:\/\/.+$/);
@@ -117,6 +128,66 @@ export const mcpApplyOutputSchema = z.object({
   journalRunId: z.string().optional(),
 });
 
+
+const contextKindSchema = z.enum([
+  "state",
+  "decision",
+  "commitment",
+  "event",
+  "artifact",
+  "relationship",
+]);
+
+const contextRecordSchema = z.object({
+  id: z.string(),
+  entityId: entityIdSchema,
+  kind: contextKindSchema,
+  text: z.string(),
+  current: z.boolean().optional(),
+  importance: z.number().finite().optional(),
+  relatedEntityIds: z.array(entityIdSchema).optional(),
+  evidenceRefs: z.array(z.string()).optional(),
+});
+
+const contextResolutionSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("none") }),
+  z.object({
+    status: z.literal("resolved"),
+    entityId: entityIdSchema,
+    entityType: z.string(),
+  }),
+  z.object({
+    status: z.literal("ambiguous"),
+    candidates: z.array(z.object({
+      entityId: entityIdSchema,
+      entityType: z.string(),
+    })),
+  }),
+]);
+
+export const mcpContextCompileInputSchema = z.strictObject({
+  task: z.string().trim().min(1),
+  budgetTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+});
+
+export const mcpContextCompileOutputSchema = z.object({
+  schemaVersion: z.literal("1"),
+  resolution: contextResolutionSchema,
+  records: z.array(contextRecordSchema),
+  resolvedEntityIds: z.array(entityIdSchema),
+  relatedEntityIds: z.array(entityIdSchema),
+  estimatedTokens: z.number().int().nonnegative(),
+  consideredRecords: z.number().int().nonnegative(),
+});
+
+export interface RuntimeMcpContextGateway {
+  compile(request: ContextAccessCompileRequest): Promise<ContextAccessResult>;
+}
+
+export interface RuntimeMcpContextOptions {
+  readonly gateway: RuntimeMcpContextGateway;
+}
+
 export interface RuntimeMcpArtifactOptions {
   readonly gateway: ArtifactAccessGateway;
   readonly maxListedResources?: number;
@@ -127,12 +198,14 @@ export interface RuntimeMcpScopeOptions {
   readonly plan?: readonly string[];
   readonly apply?: readonly string[];
   readonly artifacts?: readonly string[];
+  readonly context?: readonly string[];
 }
 
 export interface RuntimeMcpServerOptions {
   readonly host: RuntimeHost;
   readonly principal: RuntimePrincipal;
   readonly artifacts?: RuntimeMcpArtifactOptions;
+  readonly context?: RuntimeMcpContextOptions;
   readonly scopes?: RuntimeMcpScopeOptions;
   readonly name?: string;
   readonly version?: string;
@@ -176,6 +249,71 @@ function toolError(error: unknown) {
       text: `${code}: ${SAFE_ERROR_MESSAGES[code]}`,
     }],
   };
+}
+
+type ContextToolErrorCode =
+  | "access_denied"
+  | "context_limit_exceeded"
+  | "context_sync_incomplete"
+  | "context_request_rejected"
+  | "internal_error";
+
+const CONTEXT_ERROR_MESSAGES: Readonly<Record<ContextToolErrorCode, string>> = {
+  access_denied: "Access denied.",
+  context_limit_exceeded: "Context request exceeded a server safety limit.",
+  context_sync_incomplete: "Context could not be synchronized within the server limit.",
+  context_request_rejected: "Context request was rejected by server limits.",
+  internal_error: "Internal server error.",
+};
+
+function contextErrorCode(error: unknown): ContextToolErrorCode {
+  if (error instanceof ContextAccessDeniedError) return "access_denied";
+  if (
+    error instanceof ContextIdentityCandidateLimitError
+    || error instanceof ContextIdentityScanLimitError
+    || error instanceof ContextRelationCandidateLimitError
+    || error instanceof ContextRelationScanLimitError
+  ) return "context_limit_exceeded";
+  if (error instanceof ContextAccessSynchronizationLimitError) return "context_sync_incomplete";
+  if (error instanceof RangeError || error instanceof TypeError) return "context_request_rejected";
+  return "internal_error";
+}
+
+function contextToolError(error: unknown) {
+  const code = contextErrorCode(error);
+  return {
+    isError: true,
+    content: [{
+      type: "text" as const,
+      text: `${code}: ${CONTEXT_ERROR_MESSAGES[code]}`,
+    }],
+  };
+}
+
+function contextSummary(result: ContextAccessResult): string {
+  return [
+    `Context resolution: ${result.resolution.status}.`,
+    `Records: ${result.context.records.length}.`,
+    `Estimated tokens: ${result.context.estimatedTokens}.`,
+  ].join(" ");
+}
+
+function safeContextOutput(
+  result: ContextAccessResult,
+  budgetTokens: number,
+): z.infer<typeof mcpContextCompileOutputSchema> {
+  if (result.context.estimatedTokens > budgetTokens) {
+    throw new RangeError("Context gateway exceeded requested token budget");
+  }
+  return mcpContextCompileOutputSchema.parse({
+    schemaVersion: "1",
+    resolution: result.resolution,
+    records: result.context.records,
+    resolvedEntityIds: result.context.resolvedEntityIds,
+    relatedEntityIds: result.relatedEntityIds,
+    estimatedTokens: result.context.estimatedTokens,
+    consideredRecords: result.context.consideredRecords,
+  });
 }
 
 function planText(
@@ -360,6 +498,44 @@ export function createRuntimeMcpServer(
   registerArtifactResources(server, options);
   const planScopeChallenge = scopeChallenge(options.scopes?.plan);
   const applyScopeChallenge = scopeChallenge(options.scopes?.apply);
+  const contextScopeChallenge = scopeChallenge(options.scopes?.context);
+
+  if (options.context !== undefined) {
+    server.registerTool(
+      MCP_TOOL_NAMES.context,
+      {
+        description: "Compile policy-filtered current semantic context for one task and token budget.",
+        inputSchema: mcpContextCompileInputSchema,
+        outputSchema: mcpContextCompileOutputSchema,
+        ...(contextScopeChallenge === undefined
+          ? {}
+          : { scopeChallenge: contextScopeChallenge }),
+        annotations: {
+          title: "Compile current semantic context",
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ task, budgetTokens }) => {
+        try {
+          const result = await options.context!.gateway.compile({
+            principal: options.principal,
+            task,
+            budgetTokens,
+          });
+          const structured = safeContextOutput(result, budgetTokens);
+          return {
+            content: [{ type: "text" as const, text: contextSummary(result) }],
+            structuredContent: structured,
+          };
+        } catch (error) {
+          return contextToolError(error);
+        }
+      },
+    );
+  }
 
   server.registerTool(
     MCP_TOOL_NAMES.plan,

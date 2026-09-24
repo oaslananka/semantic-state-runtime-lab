@@ -16,7 +16,8 @@
     "@ssrl/core": "workspace:*",
     "@ssrl/runtime": "workspace:*",
     "@ssrl/storage-local-artifacts": "workspace:*",
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.2",
+    "@ssrl/context-access": "workspace:*"
   },
   "exports": {
     ".": {

@@ -20,7 +20,13 @@ import {
   type ArtifactResourceIdentity,
 } from "@ssrl/artifact-store";
 import type { ExternalBinding, StateValue } from "@ssrl/core";
-import { MCP_TOOL_NAMES, mcpPlanOutputSchema } from "@ssrl/mcp-server";
+import { ContextAccessDeniedError } from "@ssrl/context-access";
+import {
+  MCP_TOOL_NAMES,
+  mcpContextCompileOutputSchema,
+  mcpPlanOutputSchema,
+  type RuntimeMcpContextGateway,
+} from "@ssrl/mcp-server";
 import {
   InMemoryStateProvider,
   type StateProvider,
@@ -87,6 +93,12 @@ function authRecords(nowSeconds: number): Map<string, TokenRecord> {
     ["alice-write-token", {
       clientId: "client:desktop",
       scopes: ["mcp", "state:read", "state:write", "artifact:read"],
+      expiresAt: nowSeconds + 3_600,
+      sub: "alice",
+    }],
+    ["alice-context-token", {
+      clientId: "client:desktop",
+      scopes: ["mcp", "context:read"],
       expiresAt: nowSeconds + 3_600,
       sub: "alice",
     }],
@@ -231,6 +243,44 @@ async function artifactFixture() {
   return { store, resource, gateway };
 }
 
+interface HttpContextGatewayCall {
+  readonly subject: string;
+  readonly scopes: readonly string[];
+  readonly task: string;
+  readonly budgetTokens: number;
+}
+
+function contextGateway(
+  calls: HttpContextGatewayCall[] = [],
+): RuntimeMcpContextGateway {
+  return {
+    async compile(request) {
+      if (request.principal === undefined) throw new Error("expected authenticated principal");
+      calls.push({
+        subject: request.principal.subject,
+        scopes: request.principal.scopes,
+        task: request.task,
+        budgetTokens: request.budgetTokens,
+      });
+      return {
+        resolution: { status: "resolved", entityId, entityType: "Project" },
+        context: {
+          records: [{
+            id: "http-context-deadline",
+            entityId,
+            kind: "state",
+            text: "Project deadline: 2026-11-20.",
+          }],
+          resolvedEntityIds: [entityId],
+          estimatedTokens: 16,
+          consideredRecords: 1,
+        },
+        relatedEntityIds: [],
+      };
+    },
+  };
+}
+
 function webFetch(handler: AuthenticatedRuntimeMcpHttpHandler): FetchLike {
   return async (input, init) => {
     const request = input instanceof Request
@@ -247,6 +297,7 @@ function buildHandler(options: {
   readonly verifier: OAuthTokenVerifier;
   readonly mapper?: McpAuthPrincipalMapper;
   readonly artifacts?: Awaited<ReturnType<typeof artifactFixture>>["gateway"];
+  readonly context?: RuntimeMcpContextGateway;
   readonly maxRequestBodySize?: number;
 }) {
   const handler = createAuthenticatedRuntimeMcpHttpHandler({
@@ -257,6 +308,7 @@ function buildHandler(options: {
     allowedOriginHostnames: ["localhost"],
     endpointScopes: ["mcp"],
     ...(options.artifacts === undefined ? {} : { artifacts: { gateway: options.artifacts } }),
+    ...(options.context === undefined ? {} : { context: { gateway: options.context } }),
     ...(options.maxRequestBodySize === undefined
       ? {}
       : { maxRequestBodySize: options.maxRequestBodySize }),
@@ -274,6 +326,7 @@ function httpRuntime(options: {
   readonly operations?: string[];
   readonly mapper?: McpAuthPrincipalMapper;
   readonly artifacts?: Awaited<ReturnType<typeof artifactFixture>>["gateway"];
+  readonly context?: RuntimeMcpContextGateway;
   readonly maxRequestBodySize?: number;
 } = {}) {
   const verifier = new FakeVerifier(authRecords(Math.floor(Date.now() / 1000)));
@@ -287,6 +340,7 @@ function httpRuntime(options: {
     verifier,
     ...(options.mapper === undefined ? {} : { mapper: options.mapper }),
     ...(options.artifacts === undefined ? {} : { artifacts: options.artifacts }),
+    ...(options.context === undefined ? {} : { context: options.context }),
     ...(options.maxRequestBodySize === undefined
       ? {}
       : { maxRequestBodySize: options.maxRequestBodySize }),
@@ -472,6 +526,69 @@ describe("authenticated modern MCP HTTP", () => {
 
     expect(applied.isError).not.toBe(true);
     expect(runtime.replica.read("replica-atlas").deadline).toBe("2026-11-20");
+  });
+
+  it("maps the authenticated bearer principal into context.compile over modern HTTP", async () => {
+    const calls: HttpContextGatewayCall[] = [];
+    const { handler } = httpRuntime({ context: contextGateway(calls) });
+    const { client } = await modernClient(handler, "alice-context-token");
+
+    const result = await client.callTool({
+      name: MCP_TOOL_NAMES.context,
+      arguments: { task: "Project Atlas deadline", budgetTokens: 120 },
+    });
+    const output = mcpContextCompileOutputSchema.parse(result.structuredContent);
+
+    expect(result.isError).not.toBe(true);
+    expect(output.resolution).toEqual({ status: "resolved", entityId, entityType: "Project" });
+    expect(output.records).toEqual([
+      expect.objectContaining({ id: "http-context-deadline", entityId }),
+    ]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      subject: "user:alice",
+      task: "Project Atlas deadline",
+      budgetTokens: 120,
+    });
+    expect(calls[0]?.scopes).toEqual(expect.arrayContaining(["context:read", "mcp"]));
+  });
+
+  it("keeps gateway policy authoritative after the HTTP context scope passes", async () => {
+    const gateway: RuntimeMcpContextGateway = {
+      async compile() {
+        throw new ContextAccessDeniedError("private-context-policy-code");
+      },
+    };
+    const { handler } = httpRuntime({ context: gateway });
+    const { client } = await modernClient(handler, "alice-context-token");
+
+    const result = await client.callTool({
+      name: MCP_TOOL_NAMES.context,
+      arguments: { task: "private project task", budgetTokens: 120 },
+    });
+    const serialized = JSON.stringify(result);
+
+    expect(result.isError).toBe(true);
+    expect(serialized).toContain("access_denied: Access denied.");
+    expect(serialized).not.toContain("private-context-policy-code");
+    expect(serialized).not.toContain("private project task");
+  });
+
+  it("returns a wire-level context:read challenge before the context gateway runs", async () => {
+    const calls: HttpContextGatewayCall[] = [];
+    const { handler } = httpRuntime({ context: contextGateway(calls) });
+    const response = await handler.fetch(modernToolCallRequest(
+      "alice-read-token",
+      MCP_TOOL_NAMES.context,
+      { task: "Project Atlas deadline", budgetTokens: 120 },
+    ));
+    const challenge = response.headers.get("www-authenticate") ?? "";
+
+    expect(response.status).toBe(403);
+    expect(challenge).toContain("insufficient_scope");
+    expect(challenge).toContain("context:read");
+    expect(challenge).toContain("resource_metadata");
+    expect(calls).toEqual([]);
   });
 
   it("returns a request-time insufficient_scope challenge before state.apply executes", async () => {
