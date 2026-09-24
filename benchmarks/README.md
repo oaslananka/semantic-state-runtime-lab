@@ -82,3 +82,11 @@ The benchmark is intentionally **not** a production sync performance claim. It v
 The normal fixture is 10,000 records with a 12-bit tree because the 100,000-record parity requirement is already exercised in the test suite; keeping the routine benchmark smaller avoids duplicating a load test in every CI run. The hot-leaf fixture is a real 8-bit prefix collision set, not a fake endpoint. Pagination bounds each response but total hot-leaf work remains linear.
 
 This benchmark makes no network-latency claim. See `docs/bounded-reconciliation-session-v1.md`.
+
+## Policy-scoped replication access v1
+
+`pnpm benchmark:replication:access:v1` is a deterministic local work-accounting fixture for authorization-aware replication projection and record transfer.
+
+It verifies source scan count, projection policy evaluation count, allowed descriptor count, Merkle root record count, transfer-time policy evaluations, and serialized envelope bytes. Timing fields are observational and explicitly do **not** model network RTT, TLS, credential verification, token parsing, storage I/O, or policy-cache behavior.
+
+See `docs/policy-scoped-replication-v1.md` for the security contract.

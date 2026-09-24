@@ -71,3 +71,6 @@ jobs:
 
       - name: Bounded reconciliation session benchmark smoke test
         run: pnpm benchmark:replication:sync:v1
+
+      - name: Policy-scoped replication access benchmark smoke test
+        run: pnpm benchmark:replication:access:v1

@@ -268,6 +268,13 @@ export function replicationDescriptor(
   };
 }
 
+export function replicationRecordEnvelopeBytes(record: ReplicationRecord): number {
+  return utf8Bytes(JSON.stringify({
+    ...replicationDescriptor(record),
+    payload: record.payload,
+  })).byteLength;
+}
+
 function replicationCollision(
   existing: Pick<ReplicationRecordDescriptor, "payloadDigest">,
   incoming: Pick<ReplicationRecordDescriptor, "key" | "payloadDigest">,
@@ -527,6 +534,15 @@ async function assertPayloadDigest(record: ReplicationRecord): Promise<void> {
   }
 }
 
+/**
+ * Verifies a full immutable replication envelope before policy or apply code trusts its payload.
+ */
+export async function verifyReplicationRecord(record: ReplicationRecord): Promise<ReplicationRecord> {
+  assertRecordIdentity(record);
+  await assertPayloadDigest(record);
+  return { ...record };
+}
+
 type MutableSemanticStateBatch = {
   entities: NonNullable<SemanticStateBatch["entities"]>[number][];
   aliases: NonNullable<SemanticStateBatch["aliases"]>[number][];
@@ -600,8 +616,7 @@ export async function applySemanticReplicationRecords(
   };
 
   for (const record of [...records].toSorted(descriptorOrder)) {
-    assertRecordIdentity(record);
-    await assertPayloadDigest(record);
+    await verifyReplicationRecord(record);
     appendSemanticRecordToBatch(batch, record);
   }
   await store.append(batch);
@@ -615,8 +630,7 @@ export async function applyArtifactReplicationRecords(
   assertApplyBatchBound(records, options);
   const mutations: ArtifactMutation[] = [];
   for (const record of [...records].toSorted(descriptorOrder)) {
-    assertRecordIdentity(record);
-    await assertPayloadDigest(record);
+    await verifyReplicationRecord(record);
     if (record.kind !== "artifact-mutation") {
       throw new InvalidReplicationRecordError(`${record.kind} cannot be applied to ArtifactStore`);
     }
