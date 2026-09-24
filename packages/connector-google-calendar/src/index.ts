@@ -348,6 +348,89 @@ function continuationEnvelope(
   };
 }
 
+function eventVersionFields(
+  record: Readonly<Record<string, unknown>>,
+): Pick<GoogleCalendarEventPayload, "etag" | "updated"> {
+  const etag = optionalString(record.etag, "event.etag");
+  const updated = optionalString(record.updated, "event.updated");
+  return {
+    ...(etag === undefined ? {} : { etag }),
+    ...(updated === undefined ? {} : { updated: validDateTime(updated, "event.updated") }),
+  };
+}
+
+function recurrenceField(record: Readonly<Record<string, unknown>>): readonly string[] | undefined {
+  if (record.recurrence === undefined) return undefined;
+  if (!Array.isArray(record.recurrence)) {
+    throw new InvalidGoogleCalendarPayloadError("event.recurrence must be an array");
+  }
+  return record.recurrence.map((item, index) => nonEmpty(item, `event.recurrence[${index}]`));
+}
+
+function privacyFields(
+  record: Readonly<Record<string, unknown>>,
+  projection: Required<GoogleCalendarProjectionOptions>,
+): Pick<GoogleCalendarEventPayload, "description" | "location" | "organizer" | "attendees"> {
+  const description = projection.includeDescription
+    ? optionalString(record.description, "event.description")
+    : undefined;
+  const location = projection.includeLocation
+    ? optionalString(record.location, "event.location")
+    : undefined;
+  const organizer = projection.includeOrganizer ? person(record.organizer, "event.organizer") : undefined;
+  const attendeeList = projection.includeAttendees ? attendees(record.attendees, "event.attendees") : undefined;
+  return {
+    ...(description === undefined ? {} : { description }),
+    ...(location === undefined ? {} : { location }),
+    ...(organizer === undefined ? {} : { organizer }),
+    ...(attendeeList === undefined ? {} : { attendees: attendeeList }),
+  };
+}
+
+function coreEventFields(
+  record: Readonly<Record<string, unknown>>,
+): Omit<GoogleCalendarEventPayload, "id" | "status" | "etag" | "updated" | "description" | "location" | "organizer" | "attendees"> {
+  const summary = optionalString(record.summary, "event.summary");
+  const start = eventDateTime(record.start, "event.start");
+  const end = eventDateTime(record.end, "event.end");
+  const transparency = optionalString(record.transparency, "event.transparency");
+  const visibility = optionalString(record.visibility, "event.visibility");
+  const eventType = optionalString(record.eventType, "event.eventType");
+  const recurrence = recurrenceField(record);
+  const recurringEventId = optionalString(record.recurringEventId, "event.recurringEventId");
+  const originalStartTime = eventDateTime(record.originalStartTime, "event.originalStartTime");
+  const iCalUID = optionalString(record.iCalUID, "event.iCalUID");
+  const sequence = optionalNumber(record.sequence, "event.sequence");
+  return {
+    ...(summary === undefined ? {} : { summary }),
+    ...(start === undefined ? {} : { start }),
+    ...(end === undefined ? {} : { end }),
+    ...(transparency === undefined ? {} : { transparency }),
+    ...(visibility === undefined ? {} : { visibility }),
+    ...(eventType === undefined ? {} : { eventType }),
+    ...(recurrence === undefined ? {} : { recurrence }),
+    ...(recurringEventId === undefined ? {} : { recurringEventId }),
+    ...(originalStartTime === undefined ? {} : { originalStartTime }),
+    ...(iCalUID === undefined ? {} : { iCalUID }),
+    ...(sequence === undefined ? {} : { sequence }),
+  };
+}
+
+function cancelledEvent(
+  id: string,
+  record: Readonly<Record<string, unknown>>,
+): GoogleCalendarEventPayload {
+  const recurringEventId = optionalString(record.recurringEventId, "event.recurringEventId");
+  const originalStartTime = eventDateTime(record.originalStartTime, "event.originalStartTime");
+  return {
+    id,
+    status: "cancelled",
+    ...eventVersionFields(record),
+    ...(recurringEventId === undefined ? {} : { recurringEventId }),
+    ...(originalStartTime === undefined ? {} : { originalStartTime }),
+  };
+}
+
 function normalizedEvent(
   value: unknown,
   projection: Required<GoogleCalendarProjectionOptions>,
@@ -355,58 +438,13 @@ function normalizedEvent(
   const record = object(value, "event");
   const id = nonEmpty(record.id, "event.id");
   const status = optionalString(record.status, "event.status");
-  const recurringEventId = optionalString(record.recurringEventId, "event.recurringEventId");
-  const originalStartTime = eventDateTime(record.originalStartTime, "event.originalStartTime");
-
-  if (status === "cancelled") {
-    const etag = optionalString(record.etag, "event.etag");
-    const updated = optionalString(record.updated, "event.updated");
-    return {
-      id,
-      status,
-      ...(etag === undefined ? {} : { etag }),
-      ...(updated === undefined ? {} : { updated: validDateTime(updated, "event.updated") }),
-      ...(recurringEventId === undefined ? {} : { recurringEventId }),
-      ...(originalStartTime === undefined ? {} : { originalStartTime }),
-    };
-  }
-
-  const recurrence = record.recurrence === undefined
-    ? undefined
-    : (() => {
-        if (!Array.isArray(record.recurrence)) {
-          throw new InvalidGoogleCalendarPayloadError("event.recurrence must be an array");
-        }
-        return record.recurrence.map((item, index) => nonEmpty(item, `event.recurrence[${index}]`));
-      })();
-  const organizer = projection.includeOrganizer ? person(record.organizer, "event.organizer") : undefined;
-  const attendeeList = projection.includeAttendees ? attendees(record.attendees, "event.attendees") : undefined;
+  if (status === "cancelled") return cancelledEvent(id, record);
   return {
     id,
     ...(status === undefined ? {} : { status }),
-    ...(optionalString(record.etag, "event.etag") === undefined ? {} : { etag: record.etag as string }),
-    ...(optionalString(record.updated, "event.updated") === undefined
-      ? {}
-      : { updated: validDateTime(record.updated as string, "event.updated") }),
-    ...(optionalString(record.summary, "event.summary") === undefined ? {} : { summary: record.summary as string }),
-    ...(projection.includeDescription && optionalString(record.description, "event.description") !== undefined
-      ? { description: record.description as string }
-      : {}),
-    ...(projection.includeLocation && optionalString(record.location, "event.location") !== undefined
-      ? { location: record.location as string }
-      : {}),
-    ...(eventDateTime(record.start, "event.start") === undefined ? {} : { start: eventDateTime(record.start, "event.start")! }),
-    ...(eventDateTime(record.end, "event.end") === undefined ? {} : { end: eventDateTime(record.end, "event.end")! }),
-    ...(optionalString(record.transparency, "event.transparency") === undefined ? {} : { transparency: record.transparency as string }),
-    ...(optionalString(record.visibility, "event.visibility") === undefined ? {} : { visibility: record.visibility as string }),
-    ...(optionalString(record.eventType, "event.eventType") === undefined ? {} : { eventType: record.eventType as string }),
-    ...(recurrence === undefined ? {} : { recurrence }),
-    ...(recurringEventId === undefined ? {} : { recurringEventId }),
-    ...(originalStartTime === undefined ? {} : { originalStartTime }),
-    ...(organizer === undefined ? {} : { organizer }),
-    ...(attendeeList === undefined ? {} : { attendees: attendeeList }),
-    ...(optionalString(record.iCalUID, "event.iCalUID") === undefined ? {} : { iCalUID: record.iCalUID as string }),
-    ...(optionalNumber(record.sequence, "event.sequence") === undefined ? {} : { sequence: record.sequence as number }),
+    ...eventVersionFields(record),
+    ...coreEventFields(record),
+    ...privacyFields(record, projection),
   };
 }
 
@@ -464,59 +502,39 @@ function attendeeValue(value: GoogleCalendarEventAttendee): StateValue {
   };
 }
 
-function propertyValue(payload: GoogleCalendarEventPayload, slot: string): StateValue | undefined {
-  switch (slot) {
-    case "status": return payload.status;
-    case "summary": return payload.summary;
-    case "description": return payload.description;
-    case "location": return payload.location;
-    case "start": return payload.start === undefined ? undefined : eventValue(payload.start);
-    case "end": return payload.end === undefined ? undefined : eventValue(payload.end);
-    case "allDay": return payload.start === undefined ? undefined : payload.start.date !== undefined;
-    case "timeZones": {
-      const start = payload.start?.timeZone;
-      const end = payload.end?.timeZone;
-      if (start === undefined && end === undefined) return undefined;
-      return { ...(start === undefined ? {} : { start }), ...(end === undefined ? {} : { end }) };
-    }
-    case "transparency": return payload.transparency;
-    case "visibility": return payload.visibility;
-    case "eventType": return payload.eventType;
-    case "recurrence": return payload.recurrence === undefined ? undefined : [...payload.recurrence];
-    case "recurringEventId": return payload.recurringEventId;
-    case "originalStartTime": return payload.originalStartTime === undefined
-      ? undefined
-      : eventValue(payload.originalStartTime);
-    case "organizer": return payload.organizer === undefined ? undefined : personValue(payload.organizer);
-    case "attendees": return payload.attendees === undefined
-      ? undefined
-      : payload.attendees.map(attendeeValue);
-    case "iCalUID": return payload.iCalUID;
-    case "sequence": return payload.sequence;
-    default: return undefined;
-  }
+function eventTimeZones(payload: GoogleCalendarEventPayload): StateValue | undefined {
+  const start = payload.start?.timeZone;
+  const end = payload.end?.timeZone;
+  if (start === undefined && end === undefined) return undefined;
+  return { ...(start === undefined ? {} : { start }), ...(end === undefined ? {} : { end }) };
 }
 
-const SLOT_PROPERTIES = [
-  ["status", "CalendarEvent.status"],
-  ["summary", "CalendarEvent.summary"],
-  ["description", "CalendarEvent.description"],
-  ["location", "CalendarEvent.location"],
-  ["start", "CalendarEvent.start"],
-  ["end", "CalendarEvent.end"],
-  ["allDay", "CalendarEvent.allDay"],
-  ["timeZones", "CalendarEvent.timeZones"],
-  ["transparency", "CalendarEvent.transparency"],
-  ["visibility", "CalendarEvent.visibility"],
-  ["eventType", "CalendarEvent.eventType"],
-  ["recurrence", "CalendarEvent.recurrence"],
-  ["recurringEventId", "CalendarEvent.recurringEventId"],
-  ["originalStartTime", "CalendarEvent.originalStartTime"],
-  ["organizer", "CalendarEvent.organizer"],
-  ["attendees", "CalendarEvent.attendees"],
-  ["iCalUID", "CalendarEvent.iCalUID"],
-  ["sequence", "CalendarEvent.sequence"],
-] as const;
+interface CalendarSlotDefinition {
+  readonly key: string;
+  readonly property: string;
+  readonly value: (payload: GoogleCalendarEventPayload) => StateValue | undefined;
+}
+
+const SLOT_DEFINITIONS: readonly CalendarSlotDefinition[] = [
+  { key: "status", property: "CalendarEvent.status", value: (payload) => payload.status },
+  { key: "summary", property: "CalendarEvent.summary", value: (payload) => payload.summary },
+  { key: "description", property: "CalendarEvent.description", value: (payload) => payload.description },
+  { key: "location", property: "CalendarEvent.location", value: (payload) => payload.location },
+  { key: "start", property: "CalendarEvent.start", value: (payload) => payload.start === undefined ? undefined : eventValue(payload.start) },
+  { key: "end", property: "CalendarEvent.end", value: (payload) => payload.end === undefined ? undefined : eventValue(payload.end) },
+  { key: "allDay", property: "CalendarEvent.allDay", value: (payload) => payload.start === undefined ? undefined : payload.start.date !== undefined },
+  { key: "timeZones", property: "CalendarEvent.timeZones", value: eventTimeZones },
+  { key: "transparency", property: "CalendarEvent.transparency", value: (payload) => payload.transparency },
+  { key: "visibility", property: "CalendarEvent.visibility", value: (payload) => payload.visibility },
+  { key: "eventType", property: "CalendarEvent.eventType", value: (payload) => payload.eventType },
+  { key: "recurrence", property: "CalendarEvent.recurrence", value: (payload) => payload.recurrence === undefined ? undefined : [...payload.recurrence] },
+  { key: "recurringEventId", property: "CalendarEvent.recurringEventId", value: (payload) => payload.recurringEventId },
+  { key: "originalStartTime", property: "CalendarEvent.originalStartTime", value: (payload) => payload.originalStartTime === undefined ? undefined : eventValue(payload.originalStartTime) },
+  { key: "organizer", property: "CalendarEvent.organizer", value: (payload) => payload.organizer === undefined ? undefined : personValue(payload.organizer) },
+  { key: "attendees", property: "CalendarEvent.attendees", value: (payload) => payload.attendees === undefined ? undefined : payload.attendees.map(attendeeValue) },
+  { key: "iCalUID", property: "CalendarEvent.iCalUID", value: (payload) => payload.iCalUID },
+  { key: "sequence", property: "CalendarEvent.sequence", value: (payload) => payload.sequence },
+];
 
 class GoogleCalendarEventMapper implements ProjectionMapper<GoogleCalendarEventPayload> {
   readonly #accountScope: string;
@@ -539,16 +557,16 @@ class GoogleCalendarEventMapper implements ProjectionMapper<GoogleCalendarEventP
     const entityId = entityIdFor(this.#accountScope, this.#calendarId, payload.id);
     const revision = change.revision ?? change.changeId;
     const slots: DesiredProjection["slots"][number][] = [];
-    for (const [slot, property] of SLOT_PROPERTIES) {
-      const value = propertyValue(payload, slot);
+    for (const definition of SLOT_DEFINITIONS) {
+      const value = definition.value(payload);
       if (value === undefined) continue;
       slots.push({
-        key: slot,
+        key: definition.key,
         kind: "observation",
         record: {
-          id: `gcal-observation:${sha256([this.#fingerprint, payload.id, slot, revision])}`,
+          id: `gcal-observation:${sha256([this.#fingerprint, payload.id, definition.key, revision])}`,
           entityId,
-          property,
+          property: definition.property,
           value,
           source: {
             provider: "google-calendar",
@@ -575,6 +593,69 @@ class GoogleCalendarEventMapper implements ProjectionMapper<GoogleCalendarEventP
       slots,
     };
   }
+}
+
+interface GoogleCalendarReadTokens {
+  readonly syncToken?: string;
+  readonly pageToken?: string;
+}
+
+function readTokens(
+  request: SourceReadRequest,
+  fingerprint: string,
+): GoogleCalendarReadTokens {
+  const checkpointToken = request.mode === "incremental" && request.checkpoint !== undefined
+    ? checkpointEnvelope(request.checkpoint, fingerprint).syncToken
+    : undefined;
+  if (request.continuation === undefined) {
+    return checkpointToken === undefined ? {} : { syncToken: checkpointToken };
+  }
+  const continuation = continuationEnvelope(request.continuation, fingerprint);
+  if (continuation.mode !== request.mode) throw new GoogleCalendarCheckpointMismatchError();
+  if (
+    checkpointToken !== undefined
+    && continuation.syncToken !== undefined
+    && continuation.syncToken !== checkpointToken
+  ) {
+    throw new GoogleCalendarCheckpointMismatchError();
+  }
+  if (request.mode === "full" && continuation.syncToken !== undefined) {
+    throw new GoogleCalendarCheckpointMismatchError();
+  }
+  const syncToken = checkpointToken ?? continuation.syncToken;
+  return {
+    pageToken: continuation.pageToken,
+    ...(syncToken === undefined ? {} : { syncToken }),
+  };
+}
+
+function sourcePageNext(
+  page: GoogleCalendarEventsPage,
+  request: SourceReadRequest,
+  fingerprint: string,
+  syncToken: string | undefined,
+) {
+  if (page.nextPageToken !== undefined) {
+    return {
+      kind: "continue" as const,
+      cursor: sourceContinuation(encodeEnvelope(CONTINUATION_PREFIX, {
+        fingerprint,
+        pageToken: page.nextPageToken,
+        mode: request.mode,
+        ...(syncToken === undefined ? {} : { syncToken }),
+      })),
+    };
+  }
+  if (page.nextSyncToken === undefined) {
+    throw new InvalidGoogleCalendarPayloadError("Google Calendar response lacks next sync token");
+  }
+  return {
+    kind: "complete" as const,
+    checkpoint: sourceCheckpoint(encodeEnvelope(CHECKPOINT_PREFIX, {
+      fingerprint,
+      syncToken: page.nextSyncToken,
+    })),
+  };
 }
 
 class GoogleCalendarEventSource implements IncrementalSource<GoogleCalendarEventPayload> {
@@ -625,41 +706,23 @@ class GoogleCalendarEventSource implements IncrementalSource<GoogleCalendarEvent
   }
 
   async read(request: SourceReadRequest): Promise<SourceReadResult<GoogleCalendarEventPayload>> {
-    let syncToken: string | undefined;
-    let pageToken: string | undefined;
+    let tokens: GoogleCalendarReadTokens;
     try {
-      if (request.mode === "incremental" && request.checkpoint !== undefined) {
-        syncToken = checkpointEnvelope(request.checkpoint, this.#fingerprint).syncToken;
-      }
-      if (request.continuation !== undefined) {
-        const continuation = continuationEnvelope(request.continuation, this.#fingerprint);
-        if (continuation.mode !== request.mode) throw new GoogleCalendarCheckpointMismatchError();
-        if (
-          syncToken !== undefined
-          && continuation.syncToken !== undefined
-          && continuation.syncToken !== syncToken
-        ) {
-          throw new GoogleCalendarCheckpointMismatchError();
-        }
-        if (request.mode === "full" && continuation.syncToken !== undefined) {
-          throw new GoogleCalendarCheckpointMismatchError();
-        }
-        pageToken = continuation.pageToken;
-        syncToken ??= continuation.syncToken;
-      }
+      tokens = readTokens(request, this.#fingerprint);
     } catch (cause) {
       if (cause instanceof GoogleCalendarCheckpointMismatchError) {
         return { kind: "reset-required", reason: "google-calendar-config-changed" };
       }
       throw cause;
     }
+
     const response = await this.#transport.listEvents({
       calendarId: this.#calendarId,
       singleEvents: false,
       showDeleted: true,
       ...(this.#maxResults === undefined ? {} : { maxResults: this.#maxResults }),
-      ...(pageToken === undefined ? {} : { pageToken }),
-      ...(syncToken === undefined ? {} : { syncToken }),
+      ...(tokens.pageToken === undefined ? {} : { pageToken: tokens.pageToken }),
+      ...(tokens.syncToken === undefined ? {} : { syncToken: tokens.syncToken }),
     });
     if (response.status === 410) {
       return { kind: "reset-required", reason: "google-calendar-sync-token-invalid" };
@@ -667,40 +730,17 @@ class GoogleCalendarEventSource implements IncrementalSource<GoogleCalendarEvent
     if (response.status < 200 || response.status >= 300) {
       throw new GoogleCalendarHttpError(response.status, response.body);
     }
+
     const page = pageBody(response.body);
-    const events = (page.items ?? []).map((item) => normalizedEvent(item, this.#projection));
-    const canApplyDeletes = request.mode === "incremental" && syncToken !== undefined;
-    const changes = events
+    const canApplyDeletes = request.mode === "incremental" && tokens.syncToken !== undefined;
+    const changes = (page.items ?? [])
+      .map((item) => normalizedEvent(item, this.#projection))
       .filter((event) => event.status !== "cancelled" || canApplyDeletes)
-      .map((event) => this.#change(event, syncToken));
-    if (page.nextPageToken !== undefined) {
-      return {
-        kind: "page",
-        changes,
-        next: {
-          kind: "continue",
-          cursor: sourceContinuation(encodeEnvelope(CONTINUATION_PREFIX, {
-            fingerprint: this.#fingerprint,
-            pageToken: page.nextPageToken,
-            mode: request.mode,
-            ...(syncToken === undefined ? {} : { syncToken }),
-          })),
-        },
-      };
-    }
-    if (page.nextSyncToken === undefined) {
-      throw new InvalidGoogleCalendarPayloadError("Google Calendar response lacks next sync token");
-    }
+      .map((event) => this.#change(event, tokens.syncToken));
     return {
       kind: "page",
       changes,
-      next: {
-        kind: "complete",
-        checkpoint: sourceCheckpoint(encodeEnvelope(CHECKPOINT_PREFIX, {
-          fingerprint: this.#fingerprint,
-          syncToken: page.nextSyncToken,
-        })),
-      },
+      next: sourcePageNext(page, request, this.#fingerprint, tokens.syncToken),
     };
   }
 }

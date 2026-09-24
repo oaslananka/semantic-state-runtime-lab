@@ -41,7 +41,7 @@ function event(id: string, revision: number, summary: string) {
   return {
     id,
     status: "confirmed",
-    etag: `\"${id}-r${revision}\"`,
+    etag: `"${id}-r${revision}"`,
     updated: `2026-09-${day}T08:00:00Z`,
     summary,
     start: { dateTime: `2026-10-0${revision}T10:00:00+03:00`, timeZone: "Europe/Istanbul" },
