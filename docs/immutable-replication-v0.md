@@ -359,3 +359,7 @@ There are two independent follow-ups; they should not be conflated:
    - reprojection/correction semantics when an earlier receipt witness arrives.
 
 The product can support useful multi-device replication before solving active-active ingestion of the same external source.
+
+## Scalable reconciliation follow-up
+
+The flat v0 inventory remains the correctness baseline. `docs/prefix-merkle-reconciliation-v1.md` adds a derived fixed-prefix Merkle index that preserves the same immutable descriptor/collision law while avoiding full-manifest exchange for small deltas.
