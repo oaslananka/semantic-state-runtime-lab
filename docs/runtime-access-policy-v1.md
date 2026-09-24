@@ -66,6 +66,6 @@ Scopes and other caller credentials are not copied into journal evidence. SQLite
 
 ## MCP mapping
 
-Bearer/OAuth verification belongs at the HTTP boundary. An adapter maps verified auth context into `AccessPrincipal`, then calls the policy-enforced Runtime Host and Artifact Access Gateway.
+Bearer/OAuth verification belongs at the HTTP boundary. `@ssrl/mcp-http` now implements that boundary using the official MCP bearer gate, strips the raw token from mapper input, maps verified auth context into `AccessPrincipal`, then calls the policy-enforced Runtime Host and Artifact Access Gateway.
 
 The stdio/in-process MCP composition already receives its principal explicitly. MCP client/server self-reported identity metadata is not used as an authorization principal. See `docs/artifact-access-gateway-v1.md` for raw Artifact Plane access.

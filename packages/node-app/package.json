@@ -12,10 +12,10 @@
     "@ssrl/runtime-host": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
     "zod": "4.6.5",
-    "@modelcontextprotocol/server": "2.0.0"
+    "@modelcontextprotocol/server": "2.1.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/client": "2.1.0",
     "@types/node": "26.6.2"
   },
   "bin": {

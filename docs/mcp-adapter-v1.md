@@ -4,9 +4,9 @@
 
 ## Dependency posture
 
-The adapter is pinned to `@modelcontextprotocol/server@2.0.0` and `@modelcontextprotocol/client@2.0.0`.
+The adapter is pinned to `@modelcontextprotocol/server@2.1.0` and uses `@modelcontextprotocol/client@2.1.0` in integration tests. The upgrade was made before building remote HTTP because 2.1.0 adds request-time OAuth scope challenges and modern HTTP hardening needed by the authenticated transport boundary.
 
-At implementation time 2.1.0 was newer, but it had been published less than 24 hours earlier and was rejected by the repository's `minimumReleaseAge: 1440` supply-chain policy. The policy was not bypassed.
+The repository supply-chain lockfile policy remains enabled; it was not bypassed.
 
 ## Construction
 
@@ -19,7 +19,7 @@ createRuntimeMcpServer({
 
 `principal` must already be a trusted, normalized `RuntimePrincipal`. This package does not parse bearer tokens, JWTs, OAuth metadata, authorization headers, MCP client metadata, or self-reported client identity.
 
-A future HTTP adapter must verify authentication first, map the verified result to `RuntimePrincipal`, and only then construct the request-scoped MCP server.
+`@ssrl/mcp-http` now implements the authenticated remote composition: bearer verification happens first, verified auth is mapped to `AccessPrincipal`, and then a fresh request-scoped MCP server is constructed. The raw bearer token is stripped before principal mapping.
 
 ## Tool surface
 
@@ -119,16 +119,12 @@ The suite verifies:
 - input validation before Runtime Host evaluation
 - unexpected error redaction
 
+## Transport split
+
+`@ssrl/mcp-server` remains transport-neutral protocol registration. It now also accepts optional coarse `scopeChallenge` configuration for state tools and artifact resources. Without that option, existing stdio/in-process behavior is unchanged.
+
+Authenticated modern Streamable HTTP composition lives in `@ssrl/mcp-http`; see `docs/authenticated-mcp-http-v1.md`.
+
 ## Non-goals
 
-This package does not yet provide:
-
-- a stdio executable
-- a Streamable HTTP listener
-- OAuth/JWT verification
-- MCP resources or prompts
-- async MCP tasks
-- raw filesystem/connector tools
-- a chat UI
-
-Those belong in separate transport packages or entrypoints so protocol concerns do not leak into the runtime core.
+This package does not own OAuth token verification, HTTP deployment, connector passthrough, async MCP tasks, or chat UI. Those remain separate layers so transport/auth concerns do not leak into runtime semantics.

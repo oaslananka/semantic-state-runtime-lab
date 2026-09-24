@@ -25,6 +25,7 @@ export default defineConfig({
       "@ssrl/connector-markdown-fs": source("./packages/connector-markdown-fs/src/index.ts"),
       "@ssrl/storage-sqlite": source("./packages/storage-sqlite/src/index.ts"),
       "@ssrl/mcp-server": source("./packages/mcp-server/src/index.ts"),
+      "@ssrl/mcp-http": source("./packages/mcp-http/src/index.ts"),
       "@ssrl/node-app": source("./packages/node-app/src/index.ts"),
     },
   },
