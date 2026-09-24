@@ -20,6 +20,7 @@ import {
   temporalObservationJson,
   temporalRelationJson,
   typedEntitiesFromStateSnapshot,
+  type SemanticChangeCursor,
   type SemanticStateBatch,
 } from "@ssrl/state-store";
 import {
@@ -581,7 +582,7 @@ describe("SQLiteSemanticStateStore", () => {
   it("rejects malformed or foreign semantic change cursors", async () => {
     const path = await databasePath();
     const store = new SQLiteSemanticStateStore({ path });
-    await expect(store.changesAfter("not-a-cursor")).rejects
+    await expect(store.changesAfter("not-a-cursor" as SemanticChangeCursor)).rejects
       .toBeInstanceOf(InvalidSemanticChangeCursorError);
     store.close();
   });
@@ -608,7 +609,7 @@ describe("SQLiteSemanticStateStore", () => {
     await store.append({ entities: [{ entityId: project, entityType: "Project" }] });
     const cursor = (await store.changesAfter()).nextCursor;
     expect(cursor).toBeDefined();
-    const unknown = cursor!.replace(/:\d+$/, ":999999");
+    const unknown = cursor!.replace(/:\d+$/, ":999999") as SemanticChangeCursor;
 
     await expect(store.changesAfter(unknown)).rejects
       .toBeInstanceOf(InvalidSemanticChangeCursorError);

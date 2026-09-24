@@ -973,8 +973,8 @@ export function contextCorpusFromCapsules(
 
   return {
     entities: [...entityMap.values()]
-      .sort((left, right) => left.id.localeCompare(right.id))
+      .toSorted((left, right) => left.id.localeCompare(right.id))
       .map((entity) => ({ id: entity.id, aliases: entityAliases(entity) })),
-    records: records.sort((left, right) => left.id.localeCompare(right.id)),
+    records: records.toSorted((left, right) => left.id.localeCompare(right.id)),
   };
 }

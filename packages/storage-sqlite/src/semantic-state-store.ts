@@ -230,7 +230,7 @@ function parseAffectedEntityIds(value: string): EntityId[] {
 }
 
 function cursorForSequence(feedId: string, sequenceText: string): SemanticChangeCursor {
-  return `${CHANGE_CURSOR_PREFIX}${feedId}:${sequenceText}`;
+  return `${CHANGE_CURSOR_PREFIX}${feedId}:${sequenceText}` as SemanticChangeCursor;
 }
 
 function sequenceAfter(cursor: SemanticChangeCursor | undefined, feedId: string): bigint {

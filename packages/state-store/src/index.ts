@@ -39,7 +39,10 @@ export interface SemanticAppendCounts {
 
 
 /** Backend-defined opaque cursor. Consumers must not parse or increment it. */
-export type SemanticChangeCursor = string;
+declare const semanticChangeCursorBrand: unique symbol;
+export type SemanticChangeCursor = string & {
+  readonly [semanticChangeCursorBrand]: true;
+};
 
 export interface SemanticChange {
   readonly cursor: SemanticChangeCursor;
