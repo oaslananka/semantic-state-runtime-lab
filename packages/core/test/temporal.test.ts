@@ -5,6 +5,7 @@ import {
   resolveTemporalState,
   type TemporalObservation,
 } from "../src/temporal.js";
+import type { SemanticRetraction } from "../src/retraction.js";
 
 const entityId = "entity://project/atlas" as const;
 const property = "Project.apiStyle";
@@ -35,6 +36,24 @@ const authority: readonly AuthorityRule[] = [{
   strategy: { kind: "provider", provider: "adr" },
 }];
 
+
+function retraction(
+  id: string,
+  targetId: string,
+  effectiveFrom: string,
+  recordedAt: string,
+): SemanticRetraction {
+  return {
+    id,
+    targetKind: "observation",
+    targetId,
+    effectiveFrom,
+    recordedAt,
+    source: { provider: "source-sync", externalId: targetId, revision: id },
+    evidenceRefs: [`event:${id}`],
+  };
+}
+
 const history = [
   observation(
     "rest",
@@ -63,6 +82,29 @@ describe("resolveTemporalState", () => {
 
     expect(state.canonical.properties[property]?.value).toBe("GraphQL");
     expect(state.evidence[property]?.map((item) => item.observationId)).toEqual(["graphql"]);
+  });
+
+  it("applies retractions through the current-state convenience wrapper", () => {
+    const observations = [
+      observation("current-open", "REST", "2026-02-01T00:00:00Z", undefined, "2026-02-01T00:00:00Z"),
+    ];
+    const state = resolveCurrentTemporalState({
+      entityId,
+      observations,
+      retractions: [
+        retraction(
+          "current-delete",
+          "current-open",
+          "2026-09-01T00:00:00Z",
+          "2026-09-02T00:00:00Z",
+        ),
+      ],
+      at: "2026-09-24T00:00:00Z",
+      authority,
+    });
+
+    expect(state.canonical.properties[property]).toBeUndefined();
+    expect(state.appliedRetractions.map((item) => item.id)).toEqual(["current-delete"]);
   });
 
   it("resolves historical state by valid time using knowledge available later", () => {
@@ -200,6 +242,149 @@ describe("resolveTemporalState", () => {
 
     expect(state.canonical.properties[property]?.value).toBe("approved");
     expect(state.conflicts).toHaveLength(0);
+  });
+
+  it("applies a scheduled observation retraction at effectiveFrom without mutating the assertion", () => {
+    const observations = [
+      observation("open-rest", "REST", "2026-02-01T00:00:00Z", undefined, "2026-02-01T00:00:00Z"),
+    ];
+    const retractions = [
+      retraction("delete-rest", "open-rest", "2026-08-01T00:00:00Z", "2026-07-01T00:00:00Z"),
+    ];
+
+    const july = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-07-31T23:59:59Z",
+      knownAt: "2026-07-31T23:59:59Z",
+      authority,
+    });
+    const august = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-08-01T00:00:00Z",
+      knownAt: "2026-08-01T00:00:00Z",
+      authority,
+    });
+
+    expect(july.canonical.properties[property]?.value).toBe("REST");
+    expect(august.canonical.properties[property]).toBeUndefined();
+    expect(august.appliedRetractions.map((item) => item.id)).toEqual(["delete-rest"]);
+    expect(observations[0]?.validTo).toBeUndefined();
+  });
+
+  it("preserves prior knowledge before a late retraction and corrects history after it is learned", () => {
+    const observations = [
+      observation("open-rest", "REST", "2026-02-01T00:00:00Z", undefined, "2026-02-01T00:00:00Z"),
+    ];
+    const retractions = [
+      retraction("late-delete", "open-rest", "2026-08-01T00:00:00Z", "2026-08-10T00:00:00Z"),
+    ];
+
+    const beforeKnowledge = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-08-05T00:00:00Z",
+      knownAt: "2026-08-05T00:00:00Z",
+      authority,
+    });
+    const afterKnowledge = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-08-05T00:00:00Z",
+      knownAt: "2026-08-10T00:00:00Z",
+      authority,
+    });
+
+    expect(beforeKnowledge.canonical.properties[property]?.value).toBe("REST");
+    expect(beforeKnowledge.appliedRetractions).toEqual([]);
+    expect(afterKnowledge.canonical.properties[property]).toBeUndefined();
+    expect(afterKnowledge.appliedRetractions.map((item) => item.id)).toEqual(["late-delete"]);
+  });
+
+  it("can fully void an observation for corrected history after the retraction is known", () => {
+    const observations = [
+      observation("bad-rest", "REST", "2026-02-01T00:00:00Z", undefined, "2026-02-02T00:00:00Z"),
+    ];
+    const retractions = [
+      retraction("void-rest", "bad-rest", "2026-01-01T00:00:00Z", "2026-09-01T00:00:00Z"),
+    ];
+
+    const state = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-03-01T00:00:00Z",
+      knownAt: "2026-09-02T00:00:00Z",
+      authority,
+    });
+
+    expect(state.canonical.properties[property]).toBeUndefined();
+    expect(state.appliedRetractions.map((item) => item.id)).toEqual(["void-rest"]);
+  });
+
+  it("does not extend an assertion whose original validTo precedes the retraction", () => {
+    const observations = [
+      observation(
+        "closed-rest",
+        "REST",
+        "2026-02-01T00:00:00Z",
+        "2026-06-01T00:00:00Z",
+        "2026-02-02T00:00:00Z",
+      ),
+    ];
+    const retractions = [
+      retraction("too-late", "closed-rest", "2026-08-01T00:00:00Z", "2026-05-01T00:00:00Z"),
+    ];
+
+    const state = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-07-01T00:00:00Z",
+      knownAt: "2026-09-01T00:00:00Z",
+      authority,
+    });
+
+    expect(state.canonical.properties[property]).toBeUndefined();
+    expect(state.appliedRetractions).toEqual([]);
+  });
+
+  it("uses the earliest effectiveFrom when multiple known retractions target one observation", () => {
+    const observations = [
+      observation("open-rest", "REST", "2026-02-01T00:00:00Z", undefined, "2026-02-01T00:00:00Z"),
+    ];
+    const retractions = [
+      retraction("later-end", "open-rest", "2026-09-01T00:00:00Z", "2026-07-01T00:00:00Z"),
+      retraction("earlier-end", "open-rest", "2026-08-01T00:00:00Z", "2026-07-15T00:00:00Z"),
+    ];
+
+    const state = resolveTemporalState({
+      entityId,
+      observations,
+      retractions,
+      validAt: "2026-08-15T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+      authority,
+    });
+
+    expect(state.canonical.properties[property]).toBeUndefined();
+    expect(state.appliedRetractions.map((item) => item.id)).toEqual(["earlier-end"]);
+  });
+
+  it("rejects a retraction that does not target an observation in the supplied universe", () => {
+    expect(() => resolveTemporalState({
+      entityId,
+      observations: history,
+      retractions: [retraction("unknown", "missing", "2026-08-01T00:00:00Z", "2026-08-02T00:00:00Z")],
+      validAt: "2026-09-24T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+      authority,
+    })).toThrow(/targets unknown observation/);
   });
 
   it("is deterministic regardless of observation input order", () => {

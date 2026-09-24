@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type {
   AuthorityRule,
+  SemanticRetraction,
   TemporalObservation,
 } from "@ssrl/core";
 import {
@@ -52,10 +53,14 @@ function correctionHistory(): TemporalObservation[] {
   ]);
 }
 
-function compiler(observations: readonly TemporalObservation[] = history) {
+function compiler(
+  observations: readonly TemporalObservation[] = history,
+  retractions: readonly SemanticRetraction[] = [],
+) {
   return new TemporalContextCompiler({
     entities,
     observations,
+    retractions,
     authorityByEntity: new Map([[atlas, authority]]),
   });
 }
@@ -154,6 +159,24 @@ describe("TemporalContextCompiler", () => {
 
     expect(result.records).toEqual([]);
     expect(result.resolvedEntityIds).toEqual([atlas]);
+  });
+
+  it("does not emit state that has been retracted under the requested knowledge cutoff", () => {
+    const result = compiler(history, [{
+      id: "retract-graphql",
+      targetKind: "observation",
+      targetId: "graphql",
+      effectiveFrom: "2026-09-01T00:00:00Z",
+      recordedAt: "2026-09-02T00:00:00Z",
+    }]).compile({
+      query: "What API style does Project Atlas use?",
+      budgetTokens: 120,
+      validAt: "2026-09-24T00:00:00Z",
+      knownAt: "2026-09-24T00:00:00Z",
+    });
+
+    expect(result.resolvedEntityIds).toEqual([atlas]);
+    expect(result.records).toEqual([]);
   });
 
   it("keeps temporal context inside the requested token budget", () => {

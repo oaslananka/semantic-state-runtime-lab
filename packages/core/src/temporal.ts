@@ -8,6 +8,13 @@ import type {
   StateValue,
 } from "./model.js";
 import { planReconciliation, valuesEqual } from "./reconcile.js";
+import {
+  effectiveRetractionEnd,
+  uniqueRetractions,
+  validateUniqueRetractionIds,
+  type SemanticRetraction,
+} from "./retraction.js";
+import { temporalWindowIsActive, timestamp } from "./time.js";
 
 export interface TemporalObservation {
   readonly id: string;
@@ -41,6 +48,7 @@ export interface TemporalStateResolution {
   readonly conflicts: readonly Conflict[];
   readonly evidence: Readonly<Record<PropertyPath, readonly TemporalEvidenceRef[]>>;
   readonly conflictEvidence: Readonly<Record<PropertyPath, readonly TemporalEvidenceRef[]>>;
+  readonly appliedRetractions: readonly SemanticRetraction[];
 }
 
 export interface ResolveTemporalStateInput {
@@ -49,6 +57,7 @@ export interface ResolveTemporalStateInput {
   readonly validAt: string;
   readonly knownAt: string;
   readonly authority?: readonly AuthorityRule[];
+  readonly retractions?: readonly SemanticRetraction[];
 }
 
 export interface ResolveCurrentTemporalStateInput {
@@ -57,12 +66,7 @@ export interface ResolveCurrentTemporalStateInput {
   /** Explicit clock value used for both world-valid and transaction time. */
   readonly at: string;
   readonly authority?: readonly AuthorityRule[];
-}
-
-function timestamp(value: string, label: string): number {
-  const result = Date.parse(value);
-  if (!Number.isFinite(result)) throw new Error(`Invalid ${label} timestamp: ${value}`);
-  return result;
+  readonly retractions?: readonly SemanticRetraction[];
 }
 
 function validateObservation(observation: TemporalObservation): void {
@@ -91,14 +95,15 @@ function activeAt(
   entityId: EntityId,
   validAt: number,
   knownAt: number,
+  effectiveValidTo: number,
 ): boolean {
-  if (observation.entityId !== entityId) return false;
-  const validFrom = Date.parse(observation.validFrom);
-  const validTo = observation.validTo === undefined
-    ? Number.POSITIVE_INFINITY
-    : Date.parse(observation.validTo);
-  const recordedAt = Date.parse(observation.recordedAt);
-  return validFrom <= validAt && validAt < validTo && recordedAt <= knownAt;
+  return observation.entityId === entityId && temporalWindowIsActive({
+    validFrom: observation.validFrom,
+    recordedAt: observation.recordedAt,
+    validAt,
+    knownAt,
+    effectiveValidTo,
+  });
 }
 
 function observationOrder(left: TemporalObservation, right: TemporalObservation): number {
@@ -196,9 +201,28 @@ export function resolveTemporalState(
   const knownAt = timestamp(input.knownAt, "knownAt");
   validateUniqueIds(input.observations);
   for (const observation of input.observations) validateObservation(observation);
+  const retractions = input.retractions ?? [];
+  validateUniqueRetractionIds(retractions);
+  const observationIds = new Set(input.observations.map((observation) => observation.id));
+  for (const retraction of retractions) {
+    if (retraction.targetKind !== "observation" || !observationIds.has(retraction.targetId)) {
+      throw new Error(`Semantic retraction ${retraction.id} targets unknown observation ${retraction.targetId}`);
+    }
+  }
 
+  const appliedRetractions: SemanticRetraction[] = [];
   const active = input.observations
-    .filter((observation) => activeAt(observation, input.entityId, validAt, knownAt))
+    .filter((observation) => {
+      const effective = effectiveRetractionEnd({
+        targetKind: "observation",
+        targetId: observation.id,
+        ...(observation.validTo === undefined ? {} : { originalValidTo: observation.validTo }),
+        retractions,
+        knownAt: input.knownAt,
+      });
+      appliedRetractions.push(...effective.retractions);
+      return activeAt(observation, input.entityId, validAt, knownAt, effective.validTo);
+    })
     .sort(observationOrder);
   const plan = planReconciliation({
     entityId: input.entityId,
@@ -214,6 +238,7 @@ export function resolveTemporalState(
     conflicts: plan.conflicts,
     evidence: canonicalEvidence(active, plan.canonical),
     conflictEvidence: conflictEvidence(active, plan.conflicts),
+    appliedRetractions: uniqueRetractions(appliedRetractions),
   };
 }
 
@@ -226,5 +251,6 @@ export function resolveCurrentTemporalState(
     validAt: input.at,
     knownAt: input.at,
     ...(input.authority === undefined ? {} : { authority: input.authority }),
+    ...(input.retractions === undefined ? {} : { retractions: input.retractions }),
   });
 }

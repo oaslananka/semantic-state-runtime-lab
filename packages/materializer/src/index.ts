@@ -1,9 +1,10 @@
 import {
-  activeRelationEdges,
   canonicalJson,
+  resolveActiveRelationEdges,
   resolveTemporalState,
   type AuthorityRule,
   type EntityId,
+  type SemanticRetraction,
   type TemporalObservation,
   type TemporalRelationEdge,
   type TemporalStateResolution,
@@ -29,6 +30,7 @@ export interface ContextCapsuleMaterial {
   readonly entity: TypedEntity;
   readonly state: ContextCapsuleState;
   readonly activeRelations: readonly TemporalRelationEdge[];
+  readonly appliedRetractions: readonly SemanticRetraction[];
   readonly nextTemporalBoundary?: string;
 }
 
@@ -131,10 +133,37 @@ function temporalBoundaries(window: TemporalWindow, atMillis: number): number[] 
   return candidates;
 }
 
+function targetWindow(
+  retraction: SemanticRetraction,
+  observations: readonly TemporalObservation[],
+  relations: readonly TemporalRelationEdge[],
+): TemporalWindow | undefined {
+  if (retraction.targetKind === "observation") {
+    return observations.find((observation) => observation.id === retraction.targetId);
+  }
+  return relations.find((relation) => relation.id === retraction.targetId);
+}
+
+function retractionBoundary(
+  retraction: SemanticRetraction,
+  target: TemporalWindow,
+  atMillis: number,
+): number | undefined {
+  const effectiveFrom = timestamp(retraction.effectiveFrom, `retraction ${retraction.id} effectiveFrom`);
+  const recordedAt = timestamp(retraction.recordedAt, `retraction ${retraction.id} recordedAt`);
+  const originalEnd = target.validTo === undefined
+    ? Number.POSITIVE_INFINITY
+    : timestamp(target.validTo, "target validTo");
+  if (effectiveFrom >= originalEnd) return undefined;
+  const transition = Math.max(effectiveFrom, recordedAt);
+  return transition > atMillis ? transition : undefined;
+}
+
 function nextTemporalBoundary(
   aliases: readonly EntityAliasRecord[],
   observations: readonly TemporalObservation[],
   relations: readonly TemporalRelationEdge[],
+  retractions: readonly SemanticRetraction[],
   atMillis: number,
 ): string | undefined {
   const candidates: number[] = [];
@@ -147,6 +176,12 @@ function nextTemporalBoundary(
   }
   for (const relation of relations) {
     candidates.push(...temporalBoundaries(relation, atMillis));
+  }
+  for (const retraction of retractions) {
+    const target = targetWindow(retraction, observations, relations);
+    if (target === undefined) continue;
+    const boundary = retractionBoundary(retraction, target, atMillis);
+    if (boundary !== undefined) candidates.push(boundary);
   }
   if (candidates.length === 0) return undefined;
   return new Date(Math.min(...candidates)).toISOString();
@@ -184,25 +219,45 @@ export class ContextCapsuleMaterializer {
     const entity = await this.#stateStore.entity(entityId);
     if (entity === undefined) return undefined;
 
-    const [aliases, observations, relations] = await Promise.all([
+    const [aliases, observations, relations, retractions] = await Promise.all([
       this.#stateStore.aliasesForEntity(entityId),
       this.#stateStore.observationsForEntity(entityId),
       this.#stateStore.relationsFromEntity(entityId),
+      this.#stateStore.retractionsForEntity(entityId),
     ]);
+    const observationRetractions = retractions.filter(
+      (retraction) => retraction.targetKind === "observation",
+    );
+    const relationRetractions = retractions.filter(
+      (retraction) => retraction.targetKind === "relation",
+    );
     const resolution = resolveTemporalState({
       entityId,
       observations,
       validAt: materializedAt,
       knownAt: materializedAt,
       authority: this.#authorityByEntity.get(entityId) ?? [],
+      retractions: observationRetractions,
     });
-    const activeRelations = activeRelationEdges({
+    const relationResolution = resolveActiveRelationEdges({
       edges: relations,
       fromEntityIds: [entityId],
       validAt: materializedAt,
       knownAt: materializedAt,
+      retractions: relationRetractions,
     });
-    const boundary = nextTemporalBoundary(aliases, observations, relations, atMillis);
+    const appliedRetractions = [...new Map(
+      [...resolution.appliedRetractions, ...relationResolution.appliedRetractions]
+        .toSorted((left, right) => left.id.localeCompare(right.id))
+        .map((retraction) => [retraction.id, retraction]),
+    ).values()];
+    const boundary = nextTemporalBoundary(
+      aliases,
+      observations,
+      relations,
+      retractions,
+      atMillis,
+    );
 
     return {
       schema: CONTEXT_CAPSULE_SCHEMA,
@@ -218,7 +273,8 @@ export class ContextCapsuleMaterializer {
           evidence: resolution.evidence,
           conflictEvidence: resolution.conflictEvidence,
         },
-        activeRelations,
+        activeRelations: relationResolution.edges,
+        appliedRetractions,
         ...(boundary === undefined ? {} : { nextTemporalBoundary: boundary }),
       },
     };

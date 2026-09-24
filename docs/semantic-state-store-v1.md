@@ -25,7 +25,7 @@ Backend changes must not redefine append, collision, temporal, identity, or snap
 
 ## Records
 
-v1 persists four record classes.
+v1 persists five record classes.
 
 ### Semantic entity
 
@@ -79,9 +79,13 @@ provenance
 
 Relations remain bitemporal. Persisting a graph does not make edges static.
 
+### Semantic retraction
+
+`SemanticRetraction` is immutable invalidation evidence for an observation or relation. It carries separate `effectiveFrom` (world time) and `recordedAt` (knowledge time) clocks. The target record remains unchanged. See `docs/semantic-retractions-v1.md`.
+
 ## Append-only transaction contract
 
-`append(batch)` is atomic across entities, aliases, observations, and relations.
+`append(batch)` is atomic across entities, aliases, observations, relations, and retractions.
 
 The insertion order inside the transaction is:
 
@@ -90,6 +94,7 @@ entities
   -> aliases
   -> observations
   -> relations
+  -> retractions
 ```
 
 This lets one batch introduce an entity and evidence that references it.
@@ -105,7 +110,7 @@ same ID + different payload
   -> entire transaction rolls back
 ```
 
-Unknown entity references also fail the transaction with `UnknownSemanticEntityError`.
+Unknown entity references fail with `UnknownSemanticEntityError`. Retractions whose target is missing or whose target kind is wrong fail with `UnknownSemanticTargetError`.
 
 There is no UPDATE or DELETE evidence API in v1. New knowledge is represented by new temporal evidence. Historical evidence is not silently rewritten.
 
@@ -140,6 +145,7 @@ entities
 aliases
 observations
 relations
+retractions
 ```
 
 SQLite returns each collection in deterministic stable-ID order.
@@ -157,6 +163,7 @@ semantic_entities
 semantic_aliases
 semantic_observations
 semantic_relations
+semantic_retractions
 semantic_state_meta
 ```
 
@@ -169,6 +176,7 @@ Important choices:
 - aliases have an exact normalized-value index.
 - observations are indexed by entity/property/time.
 - relations are indexed by source entity/relation type/time.
+- retractions are indexed by owning entity and target/time.
 
 A future backend may use a different physical representation as long as public semantics and portable snapshots are preserved.
 
@@ -181,10 +189,12 @@ It uses a component-scoped row:
 ```text
 semantic_state_meta
   component = semantic-state-store
-  schema_version = 2
+  schema_version = 3
 ```
 
-Schema v2 adds a durable store-bound semantic change feed. A v1 database migrates atomically and bootstraps changes for all existing semantic records so incremental consumers can catch up from an empty cursor.
+Schema v2 added the durable store-bound semantic change feed. A v1 database migrates atomically and bootstraps changes for all pre-existing semantic assertions.
+
+Schema v3 adds semantic retractions. The v2 -> v3 migration preserves the existing change-feed identity and explicit sequences, so cursors issued before migration remain valid.
 
 A database with a newer state-store schema fails closed with `UnsupportedSemanticStateSchemaError`.
 
@@ -213,12 +223,13 @@ Examples of detected corruption:
 - alias normalized index disagreeing with the alias record
 - temporal interval columns disagreeing with JSON
 - relation endpoints disagreeing with JSON
+- retraction target metadata disagreeing with its target assertion
 
 Corrupted records fail closed with `CorruptSemanticStateError`.
 
 ## Incremental change feed
 
-Schema v2 writes `semantic_changes` in the same transaction as newly inserted semantic records and persists a database-specific feed identity. `changesAfter()` exposes an opaque cursor for restart-safe incremental materialization. Exact retries produce no duplicate change; failed transactions produce no orphan change.
+Schema v2+ writes `semantic_changes` in the same transaction as newly inserted semantic records and persists a database-specific feed identity. `changesAfter()` exposes an opaque cursor for restart-safe incremental materialization. Exact retries produce no duplicate change; failed transactions produce no orphan change.
 
 See `docs/incremental-context-capsules-v1.md` for cursor, migration, temporal cache-boundary, and materializer semantics.
 
@@ -232,7 +243,8 @@ SQLiteSemanticStateStore.snapshot()
   -> GraphContextCompiler
 
 SQLiteSemanticStateStore.observationsForEntity()
-  -> resolveTemporalState()
+SQLiteSemanticStateStore.retractionsForEntity()
+  -> resolveTemporalState() / resolveActiveRelationEdges()
 ```
 
 The integration test proves that after closing and reopening the SQLite database:
@@ -252,7 +264,7 @@ The state store does not yet provide:
 - FTS5 or vector search
 - cloud replication
 - CRDT merging
-- tombstones/deletion/retention policy
+- entity tombstones / physical deletion / retention policy
 - encryption key management
 - automatic connector ingestion
 - semantic sync reconciliation across applications
@@ -263,14 +275,14 @@ Those can be added around the stable append-only semantic evidence contract inst
 
 ## Next architectural step
 
-The next high-value layer is an **incremental semantic materializer / context capsule cache** driven from durable store changes:
+With durable state, change cursors, incremental capsules, and semantic invalidation in place, the next product-risk layer is **connector ingestion/checkpointing**:
 
 ```text
-connector event
-  -> append immutable semantic evidence
-  -> identify affected entity/project capsules
-  -> recompute only impacted canonical/context materialization
-  -> agent receives a compact fresh ContextPackage
+source event / watcher / webhook
+  -> deterministic assertion + retraction mapping
+  -> atomic SemanticStateStore.append()
+  -> durable change feed
+  -> incremental capsule refresh
 ```
 
-That is the path toward low-latency, low-token personal context without asking an agent to search every connected system at request time.
+The connector layer must preserve source cursors/idempotency and map source deletions to explicit retractions instead of mutating historical semantic evidence.

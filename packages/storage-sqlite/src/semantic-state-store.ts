@@ -4,6 +4,7 @@ import {
   canonicalJson,
   normalizeEntityAlias,
   type EntityId,
+  type SemanticRetraction,
   type TemporalObservation,
   type TemporalRelationEdge,
 } from "@ssrl/core";
@@ -13,16 +14,20 @@ import {
   SEMANTIC_STATE_SNAPSHOT_SCHEMA,
   SemanticRecordCollisionError,
   UnknownSemanticEntityError,
+  UnknownSemanticTargetError,
   entityAliasJson,
   normalizeEntityAliasRecord,
   normalizeSemanticEntity,
+  normalizeSemanticRetraction,
   normalizeTemporalObservation,
   normalizeTemporalRelation,
   parseEntityAliasJson,
   parseSemanticEntityJson,
+  parseSemanticRetractionJson,
   parseTemporalObservationJson,
   parseTemporalRelationJson,
   semanticEntityJson,
+  semanticRetractionJson,
   temporalObservationJson,
   temporalRelationJson,
   type AliasLookupResult,
@@ -39,7 +44,7 @@ import {
 } from "@ssrl/state-store";
 
 const STATE_STORE_COMPONENT = "semantic-state-store";
-const STATE_STORE_SCHEMA_VERSION = 2;
+const STATE_STORE_SCHEMA_VERSION = 3;
 const CHANGE_CURSOR_PREFIX = "sqlite-semantic-v1:";
 
 export interface SQLiteSemanticStateStoreOptions {
@@ -89,6 +94,22 @@ interface RelationRow extends JsonRow {
   readonly valid_from: string;
   readonly valid_to: string | null;
   readonly recorded_at: string;
+}
+
+
+interface RetractionRow extends JsonRow {
+  readonly retraction_id: string;
+  readonly target_kind: string;
+  readonly target_id: string;
+  readonly primary_entity_id: string;
+  readonly affected_entity_ids_json: string;
+  readonly effective_from: string;
+  readonly recorded_at: string;
+}
+
+interface RetractionTarget {
+  readonly primaryEntityId: EntityId;
+  readonly affectedEntityIds: readonly EntityId[];
 }
 
 interface AliasLookupRow {
@@ -195,8 +216,30 @@ function relationRow(row: RelationRow): TemporalRelationEdge {
   return parsed;
 }
 
+function retractionRow(row: RetractionRow): SemanticRetraction {
+  const parsed = parseSemanticRetractionJson(row.record_json);
+  if (
+    parsed.id !== row.retraction_id
+    || parsed.targetKind !== row.target_kind
+    || parsed.targetId !== row.target_id
+    || parsed.effectiveFrom !== row.effective_from
+    || parsed.recordedAt !== row.recorded_at
+  ) {
+    throw new CorruptSemanticStateError(
+      `Semantic retraction row ${row.retraction_id} disagrees with record_json`,
+    );
+  }
+  return parsed;
+}
+
 function semanticRecordKind(value: string): SemanticRecordKind {
-  if (value === "entity" || value === "alias" || value === "observation" || value === "relation") {
+  if (
+    value === "entity"
+    || value === "alias"
+    || value === "observation"
+    || value === "relation"
+    || value === "retraction"
+  ) {
     return value;
   }
   throw new CorruptSemanticStateError(`Unknown semantic change record kind ${value}`);
@@ -262,6 +305,7 @@ function semanticTableNames(): readonly string[] {
     "semantic_aliases",
     "semantic_observations",
     "semantic_relations",
+    "semantic_retractions",
     "semantic_change_feed_meta",
     "semantic_changes",
   ];
@@ -338,6 +382,11 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     if (version === STATE_STORE_SCHEMA_VERSION) return;
     if (version === 1) {
       this.#migrateV1ToV2();
+      this.#migrateV2ToV3();
+      return;
+    }
+    if (version === 2) {
+      this.#migrateV2ToV3();
       return;
     }
     throw new CorruptSemanticStateDatabaseError(`Unsupported semantic state schema version ${version}`);
@@ -348,7 +397,7 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     const existing = this.#db.prepare(`
       SELECT name
       FROM sqlite_master
-      WHERE type = 'table' AND name IN (?, ?, ?, ?, ?, ?)
+      WHERE type = 'table' AND name IN (?, ?, ?, ?, ?, ?, ?)
       ORDER BY name
     `).all(...names) as unknown as { readonly name: string }[];
     if (existing.length > 0) {
@@ -381,16 +430,40 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     return row.feed_id;
   }
 
-  #createChangeTable(): void {
+  #createChangeTable(includeRetractions: boolean): void {
+    const allowedKinds = includeRetractions
+      ? "'entity', 'alias', 'observation', 'relation', 'retraction'"
+      : "'entity', 'alias', 'observation', 'relation'";
     this.#db.exec(`
       CREATE TABLE semantic_changes (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-        record_kind TEXT NOT NULL CHECK(record_kind IN ('entity', 'alias', 'observation', 'relation')),
+        record_kind TEXT NOT NULL CHECK(record_kind IN (${allowedKinds})),
         record_id TEXT NOT NULL,
         primary_entity_id TEXT NOT NULL,
         affected_entity_ids_json TEXT NOT NULL CHECK(json_valid(affected_entity_ids_json)),
         UNIQUE(record_kind, record_id)
       ) STRICT;
+    `);
+  }
+
+  #createRetractionTable(): void {
+    this.#db.exec(`
+      CREATE TABLE semantic_retractions (
+        retraction_id TEXT PRIMARY KEY,
+        target_kind TEXT NOT NULL CHECK(target_kind IN ('observation', 'relation')),
+        target_id TEXT NOT NULL,
+        primary_entity_id TEXT NOT NULL REFERENCES semantic_entities(entity_id),
+        affected_entity_ids_json TEXT NOT NULL CHECK(json_valid(affected_entity_ids_json)),
+        effective_from TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        record_json TEXT NOT NULL CHECK(json_valid(record_json))
+      ) STRICT;
+
+      CREATE INDEX semantic_retractions_entity_time
+        ON semantic_retractions(primary_entity_id, recorded_at, effective_from, retraction_id);
+
+      CREATE INDEX semantic_retractions_target
+        ON semantic_retractions(target_kind, target_id, recorded_at, effective_from, retraction_id);
     `);
   }
 
@@ -451,8 +524,9 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         CREATE INDEX semantic_relations_from_type_time
           ON semantic_relations(from_entity_id, relation_type, valid_from, recorded_at, relation_id);
       `);
+      this.#createRetractionTable();
       this.#createChangeFeedMeta();
-      this.#createChangeTable();
+      this.#createChangeTable(true);
       this.#db.prepare(`
         INSERT INTO semantic_state_meta(component, schema_version)
         VALUES (?, ?)
@@ -527,8 +601,39 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
 
     this.#transaction(() => {
       this.#createChangeFeedMeta();
-      this.#createChangeTable();
+      this.#createChangeTable(false);
       this.#bootstrapV1Changes();
+      this.#db.prepare(`
+        UPDATE semantic_state_meta
+        SET schema_version = 2
+        WHERE component = ?
+      `).run(STATE_STORE_COMPONENT);
+    });
+  }
+
+  #migrateV2ToV3(): void {
+    const retractionTable = this.#db.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_retractions'
+    `).get() as { readonly name: string } | undefined;
+    if (retractionTable !== undefined) {
+      throw new CorruptSemanticStateDatabaseError(
+        "semantic_retractions exists while schema marker is still v2",
+      );
+    }
+
+    this.#transaction(() => {
+      this.#createRetractionTable();
+      this.#db.exec("ALTER TABLE semantic_changes RENAME TO semantic_changes_v2");
+      this.#createChangeTable(true);
+      this.#db.exec(`
+        INSERT INTO semantic_changes(
+          sequence, record_kind, record_id, primary_entity_id, affected_entity_ids_json
+        )
+        SELECT sequence, record_kind, record_id, primary_entity_id, affected_entity_ids_json
+        FROM semantic_changes_v2
+        ORDER BY sequence;
+        DROP TABLE semantic_changes_v2;
+      `);
       this.#db.prepare(`
         UPDATE semantic_state_meta
         SET schema_version = ?
@@ -551,13 +656,43 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
 
   #isReplay(
     existing: JsonRow | undefined,
-    kind: "entity" | "alias" | "observation" | "relation",
+    kind: SemanticRecordKind,
     id: string,
     json: string,
   ): boolean {
     if (existing === undefined) return false;
     if (existing.record_json !== json) throw new SemanticRecordCollisionError(kind, id);
     return true;
+  }
+
+  #retractionTarget(
+    targetKind: "observation" | "relation",
+    targetId: string,
+  ): RetractionTarget | undefined {
+    if (targetKind === "observation") {
+      const row = this.#db.prepare(`
+        SELECT entity_id
+        FROM semantic_observations
+        WHERE observation_id = ?
+      `).get(targetId) as { readonly entity_id: string } | undefined;
+      if (row === undefined) return undefined;
+      const entityId = asEntityId(row.entity_id);
+      return { primaryEntityId: entityId, affectedEntityIds: [entityId] };
+    }
+
+    const row = this.#db.prepare(`
+      SELECT from_entity_id, to_entity_id
+      FROM semantic_relations
+      WHERE relation_id = ?
+    `).get(targetId) as {
+      readonly from_entity_id: string;
+      readonly to_entity_id: string;
+    } | undefined;
+    if (row === undefined) return undefined;
+    return {
+      primaryEntityId: asEntityId(row.from_entity_id),
+      affectedEntityIds: [asEntityId(row.from_entity_id), asEntityId(row.to_entity_id)],
+    };
   }
 
   #appendEntities(entities: readonly SemanticEntity[]): number {
@@ -669,6 +804,46 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     return inserted;
   }
 
+  #appendRetractions(retractions: readonly SemanticRetraction[]): number {
+    const find = this.#db.prepare(
+      "SELECT record_json FROM semantic_retractions WHERE retraction_id = ?",
+    );
+    const insert = this.#db.prepare(`
+      INSERT INTO semantic_retractions(
+        retraction_id, target_kind, target_id, primary_entity_id,
+        affected_entity_ids_json, effective_from, recorded_at, record_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    let inserted = 0;
+    for (const retraction of retractions) {
+      const target = this.#retractionTarget(retraction.targetKind, retraction.targetId);
+      if (target === undefined) {
+        throw new UnknownSemanticTargetError(retraction.targetKind, retraction.targetId);
+      }
+      const json = semanticRetractionJson(retraction);
+      const existing = find.get(retraction.id) as JsonRow | undefined;
+      if (this.#isReplay(existing, "retraction", retraction.id, json)) continue;
+      insert.run(
+        retraction.id,
+        retraction.targetKind,
+        retraction.targetId,
+        target.primaryEntityId,
+        affectedEntityIdsJson(target.affectedEntityIds),
+        retraction.effectiveFrom,
+        retraction.recordedAt,
+        json,
+      );
+      this.#recordChange(
+        "retraction",
+        retraction.id,
+        target.primaryEntityId,
+        target.affectedEntityIds,
+      );
+      inserted += 1;
+    }
+    return inserted;
+  }
+
   async append(batch: SemanticStateBatch): Promise<SemanticAppendCounts> {
     const entities = (batch.entities ?? [])
       .map(normalizeSemanticEntity)
@@ -682,12 +857,16 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     const relations = (batch.relations ?? [])
       .map(normalizeTemporalRelation)
       .sort((left, right) => left.id.localeCompare(right.id));
+    const retractions = (batch.retractions ?? [])
+      .map(normalizeSemanticRetraction)
+      .sort((left, right) => left.id.localeCompare(right.id));
 
     return this.#transaction((): SemanticAppendCounts => ({
       entities: this.#appendEntities(entities),
       aliases: this.#appendAliases(aliases),
       observations: this.#appendObservations(observations),
       relations: this.#appendRelations(relations),
+      retractions: this.#appendRetractions(retractions),
     }));
   }
 
@@ -714,6 +893,12 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       FROM semantic_relations
       ORDER BY relation_id
     `).all() as unknown as RelationRow[];
+    const retractions = this.#db.prepare(`
+      SELECT retraction_id, target_kind, target_id, primary_entity_id,
+             affected_entity_ids_json, effective_from, recorded_at, record_json
+      FROM semantic_retractions
+      ORDER BY retraction_id
+    `).all() as unknown as RetractionRow[];
 
     return {
       schema: SEMANTIC_STATE_SNAPSHOT_SCHEMA,
@@ -721,6 +906,7 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       aliases: aliases.map(aliasRow),
       observations: observations.map(observationRow),
       relations: relations.map(relationRow),
+      retractions: retractions.map((row) => this.#validatedRetractionRow(row)),
     };
   }
 
@@ -763,6 +949,36 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       ORDER BY valid_from, recorded_at, relation_type, to_entity_id, relation_id
     `).all(entityId) as unknown as RelationRow[];
     return rows.map(relationRow);
+  }
+
+  #validatedRetractionRow(row: RetractionRow): SemanticRetraction {
+    const retraction = retractionRow(row);
+    const target = this.#retractionTarget(retraction.targetKind, retraction.targetId);
+    if (target === undefined) {
+      throw new CorruptSemanticStateError(
+        `Semantic retraction ${retraction.id} points to a missing target`,
+      );
+    }
+    if (
+      row.primary_entity_id !== target.primaryEntityId
+      || row.affected_entity_ids_json !== affectedEntityIdsJson(target.affectedEntityIds)
+    ) {
+      throw new CorruptSemanticStateError(
+        `Semantic retraction row ${retraction.id} target metadata disagrees with target`,
+      );
+    }
+    return retraction;
+  }
+
+  async retractionsForEntity(entityId: EntityId): Promise<readonly SemanticRetraction[]> {
+    const rows = this.#db.prepare(`
+      SELECT retraction_id, target_kind, target_id, primary_entity_id,
+             affected_entity_ids_json, effective_from, recorded_at, record_json
+      FROM semantic_retractions
+      WHERE primary_entity_id = ?
+      ORDER BY recorded_at, effective_from, retraction_id
+    `).all(entityId) as unknown as RetractionRow[];
+    return rows.map((row) => this.#validatedRetractionRow(row));
   }
 
   async lookupAlias(value: string): Promise<AliasLookupResult> {

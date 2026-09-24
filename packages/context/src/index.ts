@@ -2,12 +2,14 @@ import {
   TypedEntityResolver,
   activeRelationEdges,
   resolveTemporalState,
+  validateUniqueRetractionIds,
   type AuthorityRule,
   type Conflict,
   type EntityId,
   type EntityResolution,
   type EntityTypeDescriptor,
   type RelationTypeDescriptor,
+  type SemanticRetraction,
   type StateValue,
   type TemporalObservation,
   type TemporalRelationEdge,
@@ -336,6 +338,7 @@ export interface TemporalContextRequest extends ContextRequest {
 export interface TemporalContextCompilerOptions {
   readonly entities: readonly TemporalEntityDescriptor[];
   readonly observations: readonly TemporalObservation[];
+  readonly retractions?: readonly SemanticRetraction[];
   readonly authorityByEntity?: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
 }
 
@@ -412,10 +415,39 @@ function groupTemporalObservations(
   return grouped;
 }
 
+function groupSemanticRetractions(
+  retractions: readonly SemanticRetraction[],
+  observations: readonly TemporalObservation[],
+  relations: readonly TemporalRelationEdge[],
+): Map<EntityId, SemanticRetraction[]> {
+  validateUniqueRetractionIds(retractions);
+  const observationEntities = new Map(observations.map((observation) => [
+    observation.id,
+    observation.entityId,
+  ]));
+  const relationEntities = new Map(relations.map((relation) => [relation.id, relation.from]));
+  const grouped = new Map<EntityId, SemanticRetraction[]>();
+  for (const retraction of retractions) {
+    const entityId = retraction.targetKind === "observation"
+      ? observationEntities.get(retraction.targetId)
+      : relationEntities.get(retraction.targetId);
+    if (entityId === undefined) {
+      throw new Error(
+        `Semantic retraction ${retraction.id} references unknown ${retraction.targetKind} ${retraction.targetId}`,
+      );
+    }
+    const current = grouped.get(entityId) ?? [];
+    current.push(retraction);
+    grouped.set(entityId, current);
+  }
+  return grouped;
+}
+
 function resolveEntityTemporalState(
   entityId: EntityId,
   observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>,
   authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>,
+  retractionsByEntity: ReadonlyMap<EntityId, readonly SemanticRetraction[]>,
   request: TemporalContextRequest,
 ): TemporalStateResolution {
   return resolveTemporalState({
@@ -424,6 +456,9 @@ function resolveEntityTemporalState(
     validAt: request.validAt,
     knownAt: request.knownAt,
     authority: authorityByEntity.get(entityId) ?? [],
+    retractions: (retractionsByEntity.get(entityId) ?? []).filter(
+      (retraction) => retraction.targetKind === "observation",
+    ),
   });
 }
 
@@ -460,6 +495,7 @@ export class TemporalContextCompiler {
   readonly #entities: readonly TemporalEntityDescriptor[];
   readonly #observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>;
   readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly #retractionsByEntity: ReadonlyMap<EntityId, readonly SemanticRetraction[]>;
   readonly #entityResolver: ContextIndex;
 
   constructor(options: TemporalContextCompilerOptions) {
@@ -467,6 +503,11 @@ export class TemporalContextCompiler {
     this.#authorityByEntity = options.authorityByEntity ?? new Map();
     this.#entityResolver = new ContextIndex({ entities: options.entities, records: [] });
     this.#observationsByEntity = groupTemporalObservations(options.observations);
+    this.#retractionsByEntity = groupSemanticRetractions(
+      options.retractions ?? [],
+      options.observations,
+      [],
+    );
   }
 
   compile(request: TemporalContextRequest): ContextPackage {
@@ -479,6 +520,7 @@ export class TemporalContextCompiler {
         entityId,
         this.#observationsByEntity,
         this.#authorityByEntity,
+        this.#retractionsByEntity,
         request,
       ),
     ));
@@ -527,6 +569,7 @@ export interface GraphContextCompilerOptions {
   readonly relationTypes: readonly RelationTypeDescriptor[];
   readonly relations: readonly TemporalRelationEdge[];
   readonly observations: readonly TemporalObservation[];
+  readonly retractions?: readonly SemanticRetraction[];
   readonly properties?: readonly ContextPropertyDescriptor[];
   readonly authorityByEntity?: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
   readonly visibility?: ContextVisibilityPolicy;
@@ -762,6 +805,7 @@ export class GraphContextCompiler {
   readonly #relationTypes: ReadonlyMap<string, RelationTypeDescriptor>;
   readonly #relations: readonly TemporalRelationEdge[];
   readonly #observationsByEntity: ReadonlyMap<EntityId, readonly TemporalObservation[]>;
+  readonly #retractionsByEntity: ReadonlyMap<EntityId, readonly SemanticRetraction[]>;
   readonly #properties: ReadonlyMap<string, ContextPropertyDescriptor>;
   readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
   readonly #visibility: ContextVisibilityPolicy;
@@ -800,6 +844,11 @@ export class GraphContextCompiler {
       options.observations,
       new Set(this.#entityMap.keys()),
     );
+    this.#retractionsByEntity = groupSemanticRetractions(
+      options.retractions ?? [],
+      options.observations,
+      options.relations,
+    );
   }
 
   #visibleEntities(): TypedEntity[] {
@@ -818,6 +867,7 @@ export class GraphContextCompiler {
         entityId,
         this.#observationsByEntity,
         this.#authorityByEntity,
+        this.#retractionsByEntity,
         request,
       ),
       this.#visibility,
@@ -839,6 +889,9 @@ export class GraphContextCompiler {
       fromEntityIds: [directEntityId],
       validAt: request.validAt,
       knownAt: request.knownAt,
+      retractions: (this.#retractionsByEntity.get(directEntityId) ?? []).filter(
+        (retraction) => retraction.targetKind === "relation",
+      ),
     }).filter((edge) => (
       this.#visibility.allow({ kind: "entity", entityId: edge.to })
       && this.#visibility.allow({
