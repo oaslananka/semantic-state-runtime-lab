@@ -237,6 +237,15 @@ function requestLimit(
   return requested;
 }
 
+
+function configuredBlobByteLimit(
+  value: number | undefined,
+  fallback: number,
+  label: string,
+): number {
+  return positiveLimit(value ?? fallback, label, MAX_CONFIGURED_BYTES);
+}
+
 function projectionId(value: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new TypeError("projectionId must not be empty");
@@ -330,31 +339,36 @@ interface AuthorizedApplyBatch {
   readonly records: readonly ReplicationRecord[];
 }
 
-function emitRecordEvent(
+interface ReplicationEventInput {
+  readonly operation: ReplicationAccessAuditOperation;
+  readonly outcome: "allow" | "deny";
+  readonly principal: AccessPrincipal;
+  readonly projectionId: string;
+  readonly record?: ReplicationRecord;
+  readonly recordKey?: ReplicationRecordKey;
+  readonly blob?: { readonly digest: ArtifactDigest; readonly size?: number };
+  readonly code?: string;
+  readonly bestEffort?: boolean;
+}
+
+function emitAccessEvent(
   sink: ReplicationAccessEventSink | undefined,
   now: () => string,
-  input: {
-    readonly operation: "record.read" | "record.apply";
-    readonly outcome: "allow" | "deny";
-    readonly principal: AccessPrincipal;
-    readonly projectionId: string;
-    readonly record?: ReplicationRecord;
-    readonly recordKey?: ReplicationRecordKey;
-    readonly code?: string;
-    readonly bestEffort?: boolean;
-  },
+  input: ReplicationEventInput,
 ): void {
+  const recordKey = input.record?.key ?? input.recordKey;
   const event: Omit<ReplicationAccessEvent, "at"> = {
     operation: input.operation,
     outcome: input.outcome,
     subject: input.principal.subject,
     projectionId: input.projectionId,
     ...(input.code === undefined ? {} : { code: input.code }),
-    ...(input.record === undefined ? {} : {
-      recordKind: input.record.kind,
-      recordKey: input.record.key,
+    ...(input.record === undefined ? {} : { recordKind: input.record.kind }),
+    ...(recordKey === undefined ? {} : { recordKey }),
+    ...(input.blob === undefined ? {} : {
+      blobDigest: input.blob.digest,
+      ...(input.blob.size === undefined ? {} : { blobSize: input.blob.size }),
     }),
-    ...(input.recordKey === undefined ? {} : { recordKey: input.recordKey }),
   };
   if (input.bestEffort === true) {
     emitBestEffort(sink, now, event);
@@ -369,7 +383,7 @@ function emitAllowedApplyBatch(
   batch: AuthorizedApplyBatch,
 ): void {
   for (const record of batch.records) {
-    emitRecordEvent(sink, now, {
+    emitAccessEvent(sink, now, {
       operation: "record.apply",
       outcome: "allow",
       principal: batch.principal,
@@ -377,42 +391,6 @@ function emitAllowedApplyBatch(
       record,
     });
   }
-}
-
-
-function emitBlobEvent(
-  sink: ReplicationAccessEventSink | undefined,
-  now: () => string,
-  input: {
-    readonly operation: "artifact-blob.read" | "artifact-blob.apply";
-    readonly outcome: "allow" | "deny";
-    readonly principal: AccessPrincipal;
-    readonly projectionId: string;
-    readonly record?: ReplicationRecord;
-    readonly digest: ArtifactDigest;
-    readonly size?: number;
-    readonly code?: string;
-    readonly bestEffort?: boolean;
-  },
-): void {
-  const event: Omit<ReplicationAccessEvent, "at"> = {
-    operation: input.operation,
-    outcome: input.outcome,
-    subject: input.principal.subject,
-    projectionId: input.projectionId,
-    ...(input.code === undefined ? {} : { code: input.code }),
-    ...(input.record === undefined ? {} : {
-      recordKind: input.record.kind,
-      recordKey: input.record.key,
-    }),
-    blobDigest: input.digest,
-    ...(input.size === undefined ? {} : { blobSize: input.size }),
-  };
-  if (input.bestEffort === true) {
-    emitBestEffort(sink, now, event);
-    return;
-  }
-  emit(sink, now, event);
 }
 
 export interface ReplicationArtifactBlobAccounting {
@@ -440,19 +418,16 @@ interface ArtifactBlobReference {
   readonly blob: RequiredArtifactBlob;
 }
 
-function ownedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
-}
-
-function hex(bytes: Uint8Array): string {
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 async function sha256Digest(bytes: Uint8Array): Promise<ArtifactDigest> {
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", ownedArrayBuffer(bytes));
-  return `sha256:${hex(new Uint8Array(digest))}` as ArtifactDigest;
+  const owned = Uint8Array.from(bytes);
+  const digest = new Uint8Array(
+    await globalThis.crypto.subtle.digest("SHA-256", owned.buffer),
+  );
+  const encoded = Array.from(
+    digest,
+    (byte) => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return `sha256:${encoded}` as ArtifactDigest;
 }
 
 async function artifactBlobReference(record: ReplicationRecord): Promise<ArtifactBlobReference | undefined> {
@@ -492,6 +467,48 @@ async function verifyBlobBytes(blob: RequiredArtifactBlob, bytes: Uint8Array): P
   if (await sha256Digest(bytes) !== blob.digest) {
     throw new ReplicationArtifactBlobIntegrityError(`Artifact blob ${blob.digest} failed SHA-256 verification`);
   }
+}
+
+
+function unavailableBlobRead(
+  sink: ReplicationAccessEventSink | undefined,
+  now: () => string,
+  principal: AccessPrincipal,
+  projectionId: string,
+  digest: ArtifactDigest,
+): never {
+  emitAccessEvent(sink, now, {
+    operation: "artifact-blob.read",
+    outcome: "deny",
+    principal,
+    projectionId,
+    code: "blob-unavailable",
+    blob: { digest },
+    bestEffort: true,
+  });
+  throw new ReplicationArtifactBlobUnavailableError();
+}
+
+function deniedBlobApply(
+  sink: ReplicationAccessEventSink | undefined,
+  now: () => string,
+  principal: AccessPrincipal,
+  projectionId: string,
+  record: ReplicationRecord,
+  blob: RequiredArtifactBlob,
+  code: string,
+): never {
+  emitAccessEvent(sink, now, {
+    operation: "artifact-blob.apply",
+    outcome: "deny",
+    principal,
+    projectionId,
+    record,
+    code,
+    blob: { digest: blob.digest, size: blob.size },
+    bestEffort: true,
+  });
+  throw new ReplicationArtifactBlobApplyDeniedError(code);
 }
 
 export class ReplicationAccessGateway {
@@ -555,15 +572,11 @@ export class ReplicationAccessGateway {
       "maxApplyBytes",
       MAX_CONFIGURED_BYTES,
     );
-    this.#maxBlobReadBytes = positiveLimit(
-      options.maxBlobReadBytes ?? DEFAULT_MAX_BLOB_READ_BYTES,
-      "maxBlobReadBytes",
-      MAX_CONFIGURED_BYTES,
+    this.#maxBlobReadBytes = configuredBlobByteLimit(
+      options.maxBlobReadBytes, DEFAULT_MAX_BLOB_READ_BYTES, "maxBlobReadBytes",
     );
-    this.#maxBlobApplyBytes = positiveLimit(
-      options.maxBlobApplyBytes ?? DEFAULT_MAX_BLOB_APPLY_BYTES,
-      "maxBlobApplyBytes",
-      MAX_CONFIGURED_BYTES,
+    this.#maxBlobApplyBytes = configuredBlobByteLimit(
+      options.maxBlobApplyBytes, DEFAULT_MAX_BLOB_APPLY_BYTES, "maxBlobApplyBytes",
     );
     this.#maxLeaseMs = positiveLimit(
       options.maxLeaseMs ?? DEFAULT_MAX_LEASE_MS,
@@ -730,7 +743,7 @@ export class ReplicationAccessGateway {
     for (const key of sortedUniqueKeys(input.keys)) {
       const record = state.records.get(key);
       if (record === undefined) {
-        emitRecordEvent(this.#events, this.#now, {
+        emitAccessEvent(this.#events, this.#now, {
           operation: "record.read",
           outcome: "deny",
           principal,
@@ -746,7 +759,7 @@ export class ReplicationAccessGateway {
         accessRequest("record:read", principal, projection, record),
       );
       if (decision.effect === "deny") {
-        emitRecordEvent(this.#events, this.#now, {
+        emitAccessEvent(this.#events, this.#now, {
           operation: "record.read",
           outcome: "deny",
           principal,
@@ -762,7 +775,7 @@ export class ReplicationAccessGateway {
         throw new ReplicationAccessLimitError(`Authorized record transfer exceeds maxBytes=${maxBytes}`);
       }
       result.push({ ...record });
-      emitRecordEvent(this.#events, this.#now, {
+      emitAccessEvent(this.#events, this.#now, {
         operation: "record.read",
         outcome: "allow",
         principal,
@@ -811,32 +824,14 @@ export class ReplicationAccessGateway {
     }
 
     if (authorized === undefined) {
-      emitBlobEvent(this.#events, this.#now, {
-        operation: "artifact-blob.read",
-        outcome: "deny",
-        principal,
-        projectionId: projection,
-        code: "blob-unavailable",
-        digest: input.digest,
-        bestEffort: true,
-      });
-      throw new ReplicationArtifactBlobUnavailableError();
+      unavailableBlobRead(this.#events, this.#now, principal, projection, input.digest);
     }
     if (authorized.blob.size > maxBytes) {
       throw new ReplicationAccessLimitError(`Artifact blob exceeds maxBytes=${maxBytes}`);
     }
     const head = await store.headBlob(input.digest);
     if (head === undefined) {
-      emitBlobEvent(this.#events, this.#now, {
-        operation: "artifact-blob.read",
-        outcome: "deny",
-        principal,
-        projectionId: projection,
-        code: "blob-unavailable",
-        digest: input.digest,
-        bestEffort: true,
-      });
-      throw new ReplicationArtifactBlobUnavailableError();
+      unavailableBlobRead(this.#events, this.#now, principal, projection, input.digest);
     }
     if (head.size !== authorized.blob.size) {
       throw new ReplicationArtifactBlobIntegrityError(
@@ -859,14 +854,13 @@ export class ReplicationAccessGateway {
       );
     }
     await verifyBlobBytes(authorized.blob, read.bytes);
-    emitBlobEvent(this.#events, this.#now, {
+    emitAccessEvent(this.#events, this.#now, {
       operation: "artifact-blob.read",
       outcome: "allow",
       principal,
       projectionId: projection,
       record: authorized.record,
-      digest: authorized.blob.digest,
-      size: authorized.blob.size,
+      blob: { digest: authorized.blob.digest, size: authorized.blob.size },
     });
     return {
       digest: authorized.blob.digest,
@@ -908,47 +902,28 @@ export class ReplicationAccessGateway {
       accessRequest("record:apply", principal, projection, record),
     );
     if (recordDecision.effect === "deny") {
-      emitBlobEvent(this.#events, this.#now, {
-        operation: "artifact-blob.apply",
-        outcome: "deny",
-        principal,
-        projectionId: projection,
-        record,
-        code: recordDecision.code,
-        digest: reference.blob.digest,
-        size: reference.blob.size,
-        bestEffort: true,
-      });
-      throw new ReplicationArtifactBlobApplyDeniedError(recordDecision.code);
+      deniedBlobApply(
+        this.#events, this.#now, principal, projection, record, reference.blob, recordDecision.code,
+      );
     }
     const blobDecision = await authorize(
       this.#policy,
       accessRequest("artifact-blob:apply", principal, projection, record, reference.blob),
     );
     if (blobDecision.effect === "deny") {
-      emitBlobEvent(this.#events, this.#now, {
-        operation: "artifact-blob.apply",
-        outcome: "deny",
-        principal,
-        projectionId: projection,
-        record,
-        code: blobDecision.code,
-        digest: reference.blob.digest,
-        size: reference.blob.size,
-        bestEffort: true,
-      });
-      throw new ReplicationArtifactBlobApplyDeniedError(blobDecision.code);
+      deniedBlobApply(
+        this.#events, this.#now, principal, projection, record, reference.blob, blobDecision.code,
+      );
     }
     await verifyBlobBytes(reference.blob, input.bytes);
     const mediaType = blobMediaType(reference.blob);
-    emitBlobEvent(this.#events, this.#now, {
+    emitAccessEvent(this.#events, this.#now, {
       operation: "artifact-blob.apply",
       outcome: "allow",
       principal,
       projectionId: projection,
       record,
-      digest: reference.blob.digest,
-      size: reference.blob.size,
+      blob: { digest: reference.blob.digest, size: reference.blob.size },
     });
     const descriptor = await store.putBlob(input.bytes, mediaType);
     if (
@@ -996,7 +971,7 @@ export class ReplicationAccessGateway {
         accessRequest("record:apply", principal, projection, record),
       );
       if (decision.effect === "deny") {
-        emitRecordEvent(this.#events, this.#now, {
+        emitAccessEvent(this.#events, this.#now, {
           operation: "record.apply",
           outcome: "deny",
           principal,
