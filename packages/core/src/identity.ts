@@ -115,19 +115,39 @@ function aliasScore(alias: string): number {
   return tokenCount(normalized) * 100 + normalized.length;
 }
 
-function candidateFor(
-  entity: TypedEntity,
-  entityType: EntityTypeDescriptor,
-  normalizedQuery: string,
-): EntityResolutionCandidate | undefined {
+
+export interface EntityAliasQueryMatch {
+  readonly score: number;
+  readonly matchedAliases: readonly string[];
+}
+
+export function matchEntityAliasesForQuery(
+  query: string,
+  entity: Pick<TypedEntity, "aliases">,
+): EntityAliasQueryMatch | undefined {
+  const normalizedQuery = normalizeEntityAlias(query);
   const matchedAliases = matchAliases(
     normalizedQuery,
     entity.aliases.map((alias) => alias.value),
   );
   if (matchedAliases.length === 0) return undefined;
+  return {
+    score: Math.max(...matchedAliases.map(aliasScore)),
+    matchedAliases,
+  };
+}
+
+function candidateFor(
+  entity: TypedEntity,
+  entityType: EntityTypeDescriptor,
+  normalizedQuery: string,
+): EntityResolutionCandidate | undefined {
+  const aliasMatch = matchEntityAliasesForQuery(normalizedQuery, entity);
+  if (aliasMatch === undefined) return undefined;
+  const matchedAliases = aliasMatch.matchedAliases;
 
   const matchedTypeCues = matchAliases(normalizedQuery, entityType.aliases);
-  const strongestAlias = Math.max(...matchedAliases.map(aliasScore));
+  const strongestAlias = aliasMatch.score;
   const typeCueScore = matchedTypeCues.length === 0
     ? 0
     : 10_000 + Math.max(...matchedTypeCues.map(aliasScore));

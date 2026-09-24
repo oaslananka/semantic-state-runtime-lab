@@ -269,6 +269,31 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  packages/context-access:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/context':
+        specifier: workspace:*
+        version: link:../context
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+    devDependencies:
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/core: {}
 
   packages/ingestion:

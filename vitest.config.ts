@@ -20,6 +20,7 @@ export default defineConfig({
       "@ssrl/runtime": source("./packages/runtime/src/index.ts"),
       "@ssrl/runtime-host": source("./packages/runtime-host/src/index.ts"),
       "@ssrl/context": source("./packages/context/src/index.ts"),
+      "@ssrl/context-access": source("./packages/context-access/src/index.ts"),
       "@ssrl/connector-sdk": source("./packages/connector-sdk/src/index.ts"),
       "@ssrl/connector-google-calendar": source("./packages/connector-google-calendar/src/index.ts"),
       "@ssrl/connector-markdown-fs": source("./packages/connector-markdown-fs/src/index.ts"),
