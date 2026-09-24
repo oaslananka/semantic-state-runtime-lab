@@ -427,7 +427,7 @@ export class LocalArtifactStore implements ArtifactStore {
 
   async append(mutations: readonly ArtifactMutation[]): Promise<number> {
     const normalized = mutations
-      .map(normalizeArtifactMutation)
+      .map((mutation) => normalizeArtifactMutation(mutation))
       .toSorted((left, right) => left.id.localeCompare(right.id));
     const seen = new Set<string>();
     for (const mutation of normalized) {
