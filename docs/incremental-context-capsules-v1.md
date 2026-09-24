@@ -320,3 +320,9 @@ Tests cover:
 `@ssrl/ingestion` now produces ordinary semantic assertions/retractions through `SemanticStateStore.append()`. The capsule worker needs no ingestion-specific code: its existing durable semantic change cursor observes those effects and rematerializes only affected entities.
 
 See `docs/connector-ingestion-v1.md`.
+
+## Principal-aware query access
+
+The derived capsule cache is now consumed through `@ssrl/context-access` rather than directly by remote adapters. The cache supports bounded alias search and a bounded synchronizer so request-time context compilation does not require a full semantic snapshot and does not serve stale time-bound materializations.
+
+See `docs/context-access-gateway-v1.md` for authorization ordering, candidate bounds, nested entity-reference filtering, provenance policy, and current-only query semantics.

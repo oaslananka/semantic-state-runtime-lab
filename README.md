@@ -1,32 +1,79 @@
 # Semantic State Runtime Lab
 
-Private engineering lab for testing a protocol-neutral semantic state and reconciliation kernel.
+Private engineering lab for a user-owned, protocol-neutral Personal AI Runtime.
 
-## Current milestone
+The repository is testing the hard infrastructure needed for one person's durable context to remain usable across AI models and agent transports without making any model vendor or source application the canonical owner of that context.
 
-Prove that one canonical entity can be bound to heterogeneous external representations and reconciled deterministically under explicit field authority.
+## Current architecture
 
-## Current scope
+```text
+source systems / local files
+        ↓
+connectors + restart-safe ingestion
+        ↓
+immutable Artifact Plane + Semantic State Store
+        ↓
+bitemporal state / retractions / typed identity / relations
+        ↓
+incremental Context Capsules
+        ↓
+Context Access Gateway
+        ↓
+retrieval / future agent adapters
 
-- canonical entity identity
-- external bindings
-- source observations
-- field-level authority
-- conflict detection
-- deterministic reconciliation plans
-- provider execution with revision preconditions
-- observed convergence and transparent partial-apply reporting
-- provenance of selected canonical values
+AI side effects:
+agent -> RuntimeHost plan/apply -> provider preconditions -> journal
+```
 
-## Explicit non-goals
+Implemented checkpoints include:
 
-No UI, cloud service, graph database, vector database, MCP server, connector catalog, or product branding yet.
+- canonical entity identity and typed alias resolution;
+- bitemporal semantic observations and immutable retractions;
+- explicit field authority and conflict detection;
+- deterministic reconciliation planning and proposal digests;
+- durable SQLite semantic state + ordered change feed;
+- incremental, time-aware context capsules;
+- Markdown filesystem and Google Calendar ingestion adapters;
+- immutable content-addressed Artifact Plane;
+- policy-enforced artifact access;
+- local stdio MCP composition;
+- authenticated stateless MCP 2026-07-28 HTTP composition;
+- principal-aware, capsule-backed derived context access.
+
+## Design posture
+
+Core constraints are intentionally stricter than a conventional "RAG over personal files" system:
+
+- source evidence remains auditable;
+- derived caches/indexes are rebuildable and never define truth;
+- authorization happens before identity resolution/ranking when disclosure could leak hidden state;
+- agents receive bounded semantic context rather than unrestricted source-system search;
+- transport authentication and domain authorization are separate layers;
+- protocol adapters such as MCP do not define canonical semantics.
+
+See `docs/invariants.md` and the versioned design documents under `docs/`.
+
+## Near-term gaps
+
+The lab is not yet a consumer product. Important remaining work includes:
+
+- thin MCP `context.compile` exposure over the Context Access Gateway;
+- durable/search-optimized capsule cache backends;
+- more source connectors and semantic mappings;
+- historical context-access semantics;
+- opaque provenance/evidence expansion handles;
+- deployment composition, real IdP verifier integration, operational limits, and observability;
+- product UX, onboarding, sync/encryption strategy, and commercial packaging.
 
 ## Commands
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm benchmark:context:v2
+pnpm benchmark:google-calendar:v1
+pnpm benchmark:markdown:v1
+pnpm test:stdio
 ```

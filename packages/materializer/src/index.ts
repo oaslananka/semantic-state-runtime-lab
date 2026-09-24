@@ -1,5 +1,6 @@
 import {
   canonicalJson,
+  matchEntityAliasesForQuery,
   resolveActiveRelationEdges,
   resolveTemporalState,
   type AuthorityRule,
@@ -47,6 +48,7 @@ export type CapsuleWriteResult = "inserted" | "updated" | "unchanged";
 
 export interface ContextCapsuleStore {
   get(entityId: EntityId): Promise<ContextCapsule | undefined>;
+  search(query: string, limit: number): Promise<readonly ContextCapsule[]>;
   put(capsule: ContextCapsule): Promise<CapsuleWriteResult>;
   delete(entityId: EntityId): Promise<boolean>;
   checkpoint(): Promise<SemanticChangeCursor | undefined>;
@@ -80,6 +82,31 @@ export interface CapsuleWorkerRunResult {
   readonly writes: Readonly<Record<CapsuleWriteResult, number>>;
   readonly checkpoint?: SemanticChangeCursor;
   readonly hasMoreChanges: boolean;
+}
+
+
+export interface ContextCapsuleSynchronizer {
+  synchronize(at: string): Promise<ContextCapsuleSyncResult>;
+}
+
+export interface ContextCapsuleSyncResult {
+  readonly pages: number;
+  readonly changesRead: number;
+  readonly materializedEntityIds: readonly EntityId[];
+  readonly checkpoint?: SemanticChangeCursor;
+}
+
+export interface IncrementalContextCapsuleSynchronizerOptions {
+  readonly worker: IncrementalContextCapsuleWorker;
+  readonly pageSize?: number;
+  readonly maxPages?: number;
+}
+
+export class ContextCapsuleSyncLimitError extends Error {
+  constructor(readonly maxPages: number) {
+    super(`Context capsule synchronization exceeded ${maxPages} pages`);
+    this.name = "ContextCapsuleSyncLimitError";
+  }
 }
 
 function timestamp(value: string, label: string): number {
@@ -289,6 +316,28 @@ export class InMemoryContextCapsuleStore implements ContextCapsuleStore {
     return this.#capsules.get(entityId);
   }
 
+
+  async search(query: string, limit: number): Promise<readonly ContextCapsule[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new RangeError("Context capsule search limit must be an integer between 1 and 1000");
+    }
+    return [...this.#capsules.values()]
+      .map((capsule) => ({
+        capsule,
+        match: matchEntityAliasesForQuery(query, capsule.material.entity),
+      }))
+      .filter((candidate): candidate is {
+        readonly capsule: ContextCapsule;
+        readonly match: NonNullable<typeof candidate.match>;
+      } => candidate.match !== undefined)
+      .toSorted((left, right) => (
+        right.match.score - left.match.score
+        || left.capsule.entityId.localeCompare(right.capsule.entityId)
+      ))
+      .slice(0, limit)
+      .map((candidate) => candidate.capsule);
+  }
+
   async put(capsule: ContextCapsule): Promise<CapsuleWriteResult> {
     const previous = this.#capsules.get(capsule.entityId);
     let result: CapsuleWriteResult = "inserted";
@@ -386,5 +435,45 @@ export class IncrementalContextCapsuleWorker {
       ...(page.nextCursor === undefined ? {} : { checkpoint: page.nextCursor }),
       hasMoreChanges: page.hasMore,
     };
+  }
+}
+
+
+export class IncrementalContextCapsuleSynchronizer implements ContextCapsuleSynchronizer {
+  readonly #worker: IncrementalContextCapsuleWorker;
+  readonly #pageSize: number;
+  readonly #maxPages: number;
+
+  constructor(options: IncrementalContextCapsuleSynchronizerOptions) {
+    this.#worker = options.worker;
+    this.#pageSize = options.pageSize ?? 100;
+    this.#maxPages = options.maxPages ?? 100;
+    if (!Number.isSafeInteger(this.#pageSize) || this.#pageSize < 1 || this.#pageSize > 1_000) {
+      throw new RangeError("Context capsule sync pageSize must be an integer between 1 and 1000");
+    }
+    if (!Number.isSafeInteger(this.#maxPages) || this.#maxPages < 1) {
+      throw new RangeError("Context capsule sync maxPages must be a positive safe integer");
+    }
+  }
+
+  async synchronize(at: string): Promise<ContextCapsuleSyncResult> {
+    const materialized = new Set<EntityId>();
+    let changesRead = 0;
+    let checkpoint: SemanticChangeCursor | undefined;
+    for (let page = 1; page <= this.#maxPages; page += 1) {
+      const result = await this.#worker.runOnce({ at, limit: this.#pageSize });
+      changesRead += result.changesRead;
+      checkpoint = result.checkpoint ?? checkpoint;
+      for (const entityId of result.materializedEntityIds) materialized.add(entityId);
+      if (!result.hasMoreChanges) {
+        return {
+          pages: page,
+          changesRead,
+          materializedEntityIds: [...materialized].toSorted((left, right) => left.localeCompare(right)),
+          ...(checkpoint === undefined ? {} : { checkpoint }),
+        };
+      }
+    }
+    throw new ContextCapsuleSyncLimitError(this.#maxPages);
   }
 }

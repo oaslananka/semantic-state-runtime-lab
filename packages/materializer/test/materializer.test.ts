@@ -11,6 +11,8 @@ import { SQLiteSemanticStateStore } from "@ssrl/storage-sqlite";
 import { bm25Baseline, contextCorpusFromCapsules } from "@ssrl/context";
 import {
   ContextCapsuleMaterializer,
+  ContextCapsuleSyncLimitError,
+  IncrementalContextCapsuleSynchronizer,
   IncrementalContextCapsuleWorker,
   InMemoryContextCapsuleStore,
   contextCapsuleMaterialJson,
@@ -117,6 +119,10 @@ class FailOnceCapsuleStore implements ContextCapsuleStore {
 
   async get(entityId: EntityId): Promise<ContextCapsule | undefined> {
     return this.inner.get(entityId);
+  }
+
+  async search(query: string, limit: number): Promise<readonly ContextCapsule[]> {
+    return this.inner.search(query, limit);
   }
 
   async put(capsule: ContextCapsule): Promise<CapsuleWriteResult> {
@@ -408,6 +414,48 @@ describe("incremental context capsules", () => {
     expect(text).toContain("Alice");
     expect(text).toContain("Europe/Istanbul");
     expect(result.estimatedTokens).toBeLessThanOrEqual(160);
+    state.close();
+  });
+
+  it("searches only materialized capsule aliases with deterministic bounds", async () => {
+    const { state, cache, worker } = await seededRuntime();
+    await worker.runOnce({ at: "2026-09-24T00:00:00Z" });
+
+    expect((await cache.search("Continue Project Atlas please", 10)).map((item) => item.entityId))
+      .toEqual([project]);
+    expect((await cache.search("Alice and Project Atlas", 1)).map((item) => item.entityId))
+      .toEqual([project]);
+    expect(await cache.search("Unknown thing", 10)).toEqual([]);
+    state.close();
+  });
+
+  it("synchronizes every pending change page and refreshes time-stale capsules", async () => {
+    const { state, cache, worker } = await seededRuntime();
+    const sync = new IncrementalContextCapsuleSynchronizer({
+      worker,
+      pageSize: 2,
+      maxPages: 10,
+    });
+    const first = await sync.synchronize("2026-03-01T00:00:00Z");
+    expect(first.pages).toBeGreaterThan(1);
+    expect(first.materializedEntityIds).toEqual([alice, project]);
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("REST");
+
+    const second = await sync.synchronize("2026-09-01T00:00:00Z");
+    expect(second.changesRead).toBe(0);
+    expect(second.materializedEntityIds).toEqual([project]);
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("GraphQL");
+    state.close();
+  });
+
+  it("fails closed when bounded synchronization cannot drain pending changes", async () => {
+    const { state, worker } = await seededRuntime();
+    const sync = new IncrementalContextCapsuleSynchronizer({ worker, pageSize: 1, maxPages: 1 });
+
+    await expect(sync.synchronize("2026-09-24T00:00:00Z"))
+      .rejects.toBeInstanceOf(ContextCapsuleSyncLimitError);
     state.close();
   });
 
