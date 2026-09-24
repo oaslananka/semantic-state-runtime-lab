@@ -205,6 +205,10 @@ class NoSnapshotSemanticStore implements SemanticStateStore {
     return this.inner.lookupAlias(value);
   }
 
+  bootstrapView() {
+    return this.inner.bootstrapView();
+  }
+
   changesAfter(cursor?: SemanticChangeCursor, limit?: number): Promise<SemanticChangePage> {
     return this.inner.changesAfter(cursor, limit);
   }
@@ -237,6 +241,10 @@ class CountingCapsuleStore implements ContextCapsuleStore {
 
   setCheckpoint(cursor: SemanticChangeCursor): Promise<void> {
     return this.inner.setCheckpoint(cursor);
+  }
+
+  reset(): Promise<void> {
+    return this.inner.reset();
   }
 
   staleEntityIds(at: string, configurationVersion: string): Promise<readonly EntityId[]> {

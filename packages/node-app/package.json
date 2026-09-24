@@ -18,7 +18,8 @@
     "@ssrl/materializer": "workspace:*",
     "@ssrl/storage-local-artifacts": "workspace:*",
     "@ssrl/state-store": "workspace:*",
-    "@ssrl/artifact-access": "workspace:*"
+    "@ssrl/artifact-access": "workspace:*",
+    "@ssrl/storage-sqlite-capsules": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.1.0",

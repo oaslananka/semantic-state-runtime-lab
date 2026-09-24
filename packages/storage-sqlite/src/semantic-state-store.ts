@@ -1010,6 +1010,34 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
     };
   }
 
+  async bootstrapView(): Promise<{
+    readonly entityIds: readonly EntityId[];
+    readonly cursor?: SemanticChangeCursor;
+  }> {
+    this.#db.exec("BEGIN");
+    try {
+      const entities = this.#db.prepare(`
+        SELECT entity_id
+        FROM semantic_entities
+        ORDER BY entity_id
+      `).all() as unknown as { readonly entity_id: string }[];
+      const tail = this.#db.prepare(`
+        SELECT CAST(MAX(sequence) AS TEXT) AS sequence_text
+        FROM semantic_changes
+      `).get() as { readonly sequence_text: string | null };
+      this.#db.exec("COMMIT");
+      return {
+        entityIds: entities.map((row) => asEntityId(row.entity_id)),
+        ...(tail.sequence_text === null
+          ? {}
+          : { cursor: cursorForSequence(this.#feedId, tail.sequence_text) }),
+      };
+    } catch (cause) {
+      this.#db.exec("ROLLBACK");
+      throw cause;
+    }
+  }
+
   async changesAfter(
     cursor?: SemanticChangeCursor,
     limit = 100,

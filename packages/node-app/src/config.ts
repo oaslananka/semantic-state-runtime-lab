@@ -106,6 +106,7 @@ const contextSourceSchema = z.object({
 const contextSchema = z.object({
   semanticStatePath: nonEmptyString,
   ingestionStatePath: nonEmptyString,
+  capsuleCachePath: nonEmptyString.optional(),
   artifactStoreRoot: nonEmptyString,
   sources: z.array(contextSourceSchema).min(1),
   maxBudgetTokens: positiveSafeInteger.optional(),
@@ -178,6 +179,7 @@ export interface LocalContextSourceConfig {
 export interface LocalContextConfig {
   readonly semanticStatePath: string;
   readonly ingestionStatePath: string;
+  readonly capsuleCachePath: string;
   readonly artifactStoreRoot: string;
   readonly sources: readonly LocalContextSourceConfig[];
   readonly maxBudgetTokens?: number;
@@ -627,6 +629,7 @@ function validateContextStoragePaths(
     ["journalPath", journalPath],
     ["context.semanticStatePath", context.semanticStatePath],
     ["context.ingestionStatePath", context.ingestionStatePath],
+    ["context.capsuleCachePath", context.capsuleCachePath],
     ["context.artifactStoreRoot", context.artifactStoreRoot],
     ["context artifact metadata", artifactMetadata],
   ] as const;
@@ -666,9 +669,14 @@ function localContextConfig(
   baseDir: string,
   parsed: NonNullable<ParsedConfig["context"]>,
 ): LocalContextConfig {
+  const semanticStatePath = absoluteFrom(baseDir, parsed.semanticStatePath);
+  const capsuleCachePath = parsed.capsuleCachePath === undefined
+    ? `${semanticStatePath}.capsules.sqlite`
+    : absoluteFrom(baseDir, parsed.capsuleCachePath);
   return {
-    semanticStatePath: absoluteFrom(baseDir, parsed.semanticStatePath),
+    semanticStatePath,
     ingestionStatePath: absoluteFrom(baseDir, parsed.ingestionStatePath),
+    capsuleCachePath,
     artifactStoreRoot: absoluteFrom(baseDir, parsed.artifactStoreRoot),
     sources: parsed.sources.map((source) => ({ ...source })),
     ...optionalNumber("maxBudgetTokens", parsed.maxBudgetTokens),

@@ -35,14 +35,15 @@ import {
   type IngestionSourceKey,
 } from "@ssrl/ingestion";
 import {
+  ContextCapsuleBootstrapper,
   ContextCapsuleMaterializer,
   IncrementalContextCapsuleSynchronizer,
   IncrementalContextCapsuleWorker,
-  InMemoryContextCapsuleStore,
 } from "@ssrl/materializer";
 import type { RuntimeMcpContextGateway } from "@ssrl/mcp-server";
 import type { EntityAliasRecord } from "@ssrl/state-store";
 import { LocalArtifactStore } from "@ssrl/storage-local-artifacts";
+import { SQLiteContextCapsuleStore } from "@ssrl/storage-sqlite-capsules";
 import {
   SQLiteIngestionStateStore,
   SQLiteSemanticStateStore,
@@ -115,6 +116,7 @@ function contextCanonicalType(config: LocalAppConfig, entity: LocalEntityConfig)
 export interface LocalContextRuntime {
   readonly semanticState: SQLiteSemanticStateStore;
   readonly ingestionState: SQLiteIngestionStateStore;
+  readonly capsuleStore: SQLiteContextCapsuleStore;
   readonly artifactStore: LocalArtifactStore;
   readonly gateway: RuntimeMcpContextGateway;
   readonly artifactGateway: ArtifactAccessGateway;
@@ -582,14 +584,21 @@ async function createPersistentStores(config: LocalAppConfig) {
   await Promise.all([
     mkdir(dirname(context.semanticStatePath), { recursive: true }),
     mkdir(dirname(context.ingestionStatePath), { recursive: true }),
+    mkdir(dirname(context.capsuleCachePath), { recursive: true }),
     mkdir(context.artifactStoreRoot, { recursive: true, mode: 0o700 }),
   ]);
   const semanticState = new SQLiteSemanticStateStore({ path: context.semanticStatePath, wal: true });
   try {
     const ingestionState = new SQLiteIngestionStateStore({ path: context.ingestionStatePath, wal: true });
     try {
-      const artifactStore = new LocalArtifactStore({ root: context.artifactStoreRoot });
-      return { semanticState, ingestionState, artifactStore };
+      const capsuleStore = new SQLiteContextCapsuleStore({ path: context.capsuleCachePath, wal: true });
+      try {
+        const artifactStore = new LocalArtifactStore({ root: context.artifactStoreRoot });
+        return { semanticState, ingestionState, capsuleStore, artifactStore };
+      } catch (error) {
+        capsuleStore.close();
+        throw error;
+      }
     } catch (error) {
       ingestionState.close();
       throw error;
@@ -617,7 +626,7 @@ export async function createLocalContextRuntime(
       artifactStore: stores.artifactStore,
       now,
     });
-    const capsules = new InMemoryContextCapsuleStore();
+    const capsules = stores.capsuleStore;
     const materializer = new ContextCapsuleMaterializer({
       stateStore: stores.semanticState,
       authorityByEntity: authorityByEntity(config),
@@ -630,6 +639,11 @@ export async function createLocalContextRuntime(
     });
     const synchronizer = new IncrementalContextCapsuleSynchronizer({
       worker,
+      bootstrapper: new ContextCapsuleBootstrapper({
+        stateStore: stores.semanticState,
+        capsuleStore: capsules,
+        materializer,
+      }),
       ...(context.syncPageSize === undefined ? {} : { pageSize: context.syncPageSize }),
       ...(context.syncMaxPages === undefined ? {} : { maxPages: context.syncMaxPages }),
     });
@@ -683,12 +697,14 @@ export async function createLocalContextRuntime(
         if (closed) return;
         closed = true;
         stores.artifactStore.close();
+        stores.capsuleStore.close();
         stores.ingestionState.close();
         stores.semanticState.close();
       },
     };
   } catch (error) {
     stores.artifactStore.close();
+    stores.capsuleStore.close();
     stores.ingestionState.close();
     stores.semanticState.close();
     throw error;

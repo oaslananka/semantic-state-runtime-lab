@@ -255,6 +255,14 @@ export class TestSemanticStateStore implements SemanticStateStore {
     return { normalizedValue, matches };
   }
 
+  async bootstrapView(): Promise<{ readonly entityIds: readonly EntityId[] }> {
+    return {
+      entityIds: [...this.#entities.keys()]
+        .map((value) => value as EntityId)
+        .toSorted((left, right) => left.localeCompare(right)),
+    };
+  }
+
   async changesAfter(): Promise<{ readonly changes: readonly []; readonly hasMore: false }> {
     return { changes: [], hasMore: false };
   }

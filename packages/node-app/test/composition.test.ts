@@ -199,6 +199,7 @@ async function fixture() {
     configPath,
     journalPath: join(root, "journal", "runtime.sqlite"),
     semanticStatePath: join(root, "context", "semantic.sqlite"),
+    capsuleCachePath: join(root, "context", "semantic.sqlite.capsules.sqlite"),
     ingestionStatePath: join(root, "context", "ingestion.sqlite"),
     artifactStoreRoot: join(root, "context", "artifacts"),
   };
@@ -401,6 +402,30 @@ describe("local Node composition", () => {
     }
   });
 
+  it("derives a dedicated capsule cache path and rejects cache path collisions", async () => {
+    const fx = await fixture();
+    try {
+      await writeFile(fx.configPath, JSON.stringify(contextConfigObject(), null, 2), "utf8");
+      const loaded = await loadLocalAppConfig(fx.configPath);
+      expect(loaded.config.context?.capsuleCachePath).toBe(fx.capsuleCachePath);
+
+      const base = contextConfigObject();
+      const colliding = {
+        ...base,
+        context: {
+          ...base.context,
+          capsuleCachePath: base.context.semanticStatePath,
+        },
+      };
+      await writeFile(fx.configPath, JSON.stringify(colliding, null, 2), "utf8");
+      await expect(loadLocalAppConfig(fx.configPath)).rejects.toMatchObject({
+        name: "InvalidLocalAppConfigError",
+      });
+    } finally {
+      await rm(fx.root, { recursive: true, force: true });
+    }
+  });
+
   it("runs durable Markdown context through real local MCP and refreshes after source edits/restart", async () => {
     const fx = await fixture();
     await writeFile(fx.configPath, JSON.stringify(contextConfigObject(), null, 2), {
@@ -461,12 +486,18 @@ describe("local Node composition", () => {
       expect(refreshedOutput.records.some((record) => record.text.includes("2026-12-01"))).toBe(true);
       expect(refreshedOutput.records.every((record) => !record.text.includes("2026-11-20"))).toBe(true);
 
+      const warmCapsule = await first.context!.capsuleStore.get(entityId);
+      const warmCheckpoint = await first.context!.capsuleStore.checkpoint();
+      expect(warmCapsule).toBeDefined();
+      expect(warmCheckpoint).toBeDefined();
+
       await connection.close();
       connection = undefined;
       first.close();
       first = undefined;
       expect(await exists(fx.semanticStatePath)).toBe(true);
       expect(await exists(fx.ingestionStatePath)).toBe(true);
+      expect(await exists(fx.capsuleCachePath)).toBe(true);
       expect(await exists(join(fx.artifactStoreRoot, "artifacts.sqlite"))).toBe(true);
 
       ({ app: second } = await loadAndCreateLocalRuntimeApp(fx.configPath));
@@ -474,6 +505,9 @@ describe("local Node composition", () => {
       const restarted = await compileContext(connection);
       const restartedOutput = mcpContextCompileOutputSchema.parse(restarted.structuredContent);
       expect(restartedOutput.records.some((record) => record.text.includes("2026-12-01"))).toBe(true);
+      const reopenedCapsule = await second.context!.capsuleStore.get(entityId);
+      expect(reopenedCapsule?.materializedAt).toBe(warmCapsule?.materializedAt);
+      expect(await second.context!.capsuleStore.checkpoint()).toBe(warmCheckpoint);
     } finally {
       if (connection !== undefined) await connection.close();
       first?.close();

@@ -62,3 +62,9 @@ The fixture covers a multi-page initial sync, an incremental update + sparse del
 `pnpm benchmark:markdown:v1` measures the correctness-first local Markdown full-scan path on deterministic 100-note and 1,000-note fixtures: recursive enumeration, exact byte reads, SHA-256, strict UTF-8 decoding, frontmatter parsing, and configured field extraction.
 
 It also checks checkpoint stability on a byte-identical second scan. Timing is observational only; there is no latency threshold or claim that O(N files + bytes) full scans are suitable for huge vaults. See `docs/markdown-authoritative-ingestion-v1.md`.
+
+## Context capsule cache v1
+
+`pnpm benchmark:capsule-cache:v1` compares `InMemoryContextCapsuleStore` full alias scanning with the durable SQLite capsule cache's indexed alias candidate selection at 100 / 1,000 / 10,000 synthetic capsules.
+
+It is an observational local benchmark, not a production SLA. See `docs/durable-capsule-cache-v1.md` for fixture details, measured values, caveats, and architecture.
