@@ -478,6 +478,34 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/replication:
+    dependencies:
+      '@ssrl/artifact-store':
+        specifier: workspace:*
+        version: link:../artifact-store
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+    devDependencies:
+      '@ssrl/connector-markdown-fs':
+        specifier: workspace:*
+        version: link:../connector-markdown-fs
+      '@ssrl/ingestion':
+        specifier: workspace:*
+        version: link:../ingestion
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/runtime:
     dependencies:
       '@ssrl/core':

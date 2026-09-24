@@ -1,0 +1,25 @@
+{
+  "name": "@ssrl/replication",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ssrl/artifact-store": "workspace:*",
+    "@ssrl/core": "workspace:*",
+    "@ssrl/state-store": "workspace:*"
+  },
+  "devDependencies": {
+    "@ssrl/connector-markdown-fs": "workspace:*",
+    "@ssrl/ingestion": "workspace:*",
+    "@ssrl/storage-local-artifacts": "workspace:*",
+    "@ssrl/storage-sqlite": "workspace:*",
+    "@types/node": "26.6.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}

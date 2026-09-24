@@ -12,3 +12,9 @@ These are design constraints, not implementation details.
 8. A mutation carries the external revision observed during planning when available.
 9. Derived indexes and transport protocols must not define canonical semantics.
 10. Provider-specific concepts stay behind bindings/adapters unless promoted intentionally.
+11. Backend-local cursors, WAL/pages, caches, and indexes never define portable replication identity.
+12. Immutable replication records merge by stable typed key: identical canonical payload is idempotent; different payload for the same key fails closed.
+13. Raw artifact bytes replicate by verified content digest and remain separate from metadata inventories.
+14. Until source receipt clocks become replica-stable, one sourceKey has one logical ingestion authority per replication namespace; independent active-active ingestion must not be hidden by LWW.
+15. Replication inventories contain descriptors only, never canonical payload bodies; externally supplied roots/fingerprints are verified before reconciliation decisions.
+16. Replication apply operations are bounded; large reconciliation sets are chunked above the immutable record semantics rather than applied as one unbounded transaction.

@@ -62,3 +62,6 @@ jobs:
 
       - name: Markdown authoritative ingestion benchmark smoke test
         run: pnpm benchmark:markdown:v1
+
+      - name: Immutable replication benchmark smoke test
+        run: pnpm benchmark:replication:v0

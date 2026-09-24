@@ -15,6 +15,7 @@ export default defineConfig({
       "@ssrl/storage-local-artifacts": source("./packages/storage-local-artifacts/src/index.ts"),
       "@ssrl/state-store": source("./packages/state-store/src/index.ts"),
       "@ssrl/materializer": source("./packages/materializer/src/index.ts"),
+      "@ssrl/replication": source("./packages/replication/src/index.ts"),
       "@ssrl/ingestion": source("./packages/ingestion/src/index.ts"),
       "@ssrl/journal": source("./packages/journal/src/index.ts"),
       "@ssrl/runtime": source("./packages/runtime/src/index.ts"),
