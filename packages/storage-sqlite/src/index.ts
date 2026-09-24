@@ -207,3 +207,5 @@ export class SQLiteEventJournal implements RuntimeEventJournal {
   }
 }
 export * from "./semantic-state-store.js";
+
+export * from "./ingestion-state-store.js";

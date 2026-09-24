@@ -266,23 +266,23 @@ The state store does not yet provide:
 - CRDT merging
 - entity tombstones / physical deletion / retention policy
 - encryption key management
-- automatic connector ingestion
+- vendor-specific connector ingestion/adapters
 - semantic sync reconciliation across applications
 - persisted authority policy
 - persisted entity/relation/property ontology descriptors
 
 Those can be added around the stable append-only semantic evidence contract instead of changing it.
 
-## Next architectural step
+## Ingestion integration
 
-With durable state, change cursors, incremental capsules, and semantic invalidation in place, the next product-risk layer is **connector ingestion/checkpointing**:
+`@ssrl/ingestion` now sits above this store. It maps replayable source changes into deterministic assertions/retractions and commits provider checkpoints only after semantic + projection state is durable.
 
 ```text
-source event / watcher / webhook
-  -> deterministic assertion + retraction mapping
-  -> atomic SemanticStateStore.append()
-  -> durable change feed
+source delta/full page
+  -> durable ingestion receipt + mapped plan
+  -> SemanticStateStore.append()
+  -> semantic change feed
   -> incremental capsule refresh
 ```
 
-The connector layer must preserve source cursors/idempotency and map source deletions to explicit retractions instead of mutating historical semantic evidence.
+See `docs/connector-ingestion-v1.md`. The next product-risk step is a real provider adapter and measured end-to-end behavior, not another persistence abstraction.
