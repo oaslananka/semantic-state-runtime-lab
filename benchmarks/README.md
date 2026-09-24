@@ -68,3 +68,9 @@ It also measures the watcher-hint verification gate: 25 clean requests must prod
 `pnpm benchmark:capsule-cache:v1` compares `InMemoryContextCapsuleStore` full alias scanning with the durable SQLite capsule cache's indexed alias candidate selection at 100 / 1,000 / 10,000 synthetic capsules.
 
 It is an observational local benchmark, not a production SLA. See `docs/durable-capsule-cache-v1.md` for fixture details, measured values, caveats, and architecture.
+
+## Immutable replication records v0
+
+`pnpm benchmark:replication:v0` measures the correctness-baseline flat inventory on 1k / 10k / 100k canonical immutable records. It measures record hashing, deterministic inventory-root construction, equal-set comparison, a 10-record-per-side delta, one collision, descriptor JSON size, and observational heap growth.
+
+The benchmark is intentionally **not** a production sync performance claim. It verifies descriptor fingerprints and inventory roots before diffing. At 100k records the payload-free flat descriptor inventory is still roughly 34.3 MB and verified comparison is roughly 6.5 s on the recorded local run, which is evidence that a real WAN protocol needs authenticated Merkle/range set reconciliation while preserving the same record/merge semantics. See `docs/immutable-replication-v0.md`.
