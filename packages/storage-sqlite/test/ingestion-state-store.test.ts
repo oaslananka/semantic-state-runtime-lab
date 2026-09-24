@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -26,18 +26,21 @@ import {
   SQLiteSemanticStateStore,
 } from "../src/index.js";
 
-const roots: string[] = [];
+const roots = new Set<string>();
 const source = ingestionSourceKey("synthetic/account-1/projects:all");
 const otherSource = ingestionSourceKey("synthetic/account-1/projects:favorites");
 
 async function databasePath(name = "ingestion.sqlite"): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "ssrl-ingestion-state-"));
-  roots.push(root);
+  const root = await fsPromises.mkdtemp(join(tmpdir(), "ssrl-ingestion-state-"));
+  roots.add(root);
   return join(root, name);
 }
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  for (const root of roots) {
+    await fsPromises.rm(root, { recursive: true, force: true });
+  }
+  roots.clear();
 });
 
 function projection(
@@ -405,8 +408,9 @@ describe("SQLiteIngestionStateStore", () => {
       ...generation,
       observedAt: "2026-10-01T00:00:00.000Z",
     });
-    expect((await reopened.unseenProjections(generation.id)).map((item) => item.externalId))
-      .toEqual(["zeus"]);
+    const unseenAfterReopen = await reopened.unseenProjections(generation.id);
+    expect(unseenAfterReopen).toHaveLength(1);
+    expect(unseenAfterReopen[0]?.externalId).toBe("zeus");
     reopened.close();
   });
 
