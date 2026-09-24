@@ -65,3 +65,6 @@ jobs:
 
       - name: Immutable replication benchmark smoke test
         run: pnpm benchmark:replication:v0
+
+      - name: Prefix Merkle replication benchmark smoke test
+        run: pnpm benchmark:replication:merkle:v1

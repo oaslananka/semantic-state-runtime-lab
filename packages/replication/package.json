@@ -20,6 +20,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./merkle": {
+      "types": "./src/merkle.ts",
+      "import": "./dist/merkle.js",
+      "default": "./dist/merkle.js"
     }
   }
 }

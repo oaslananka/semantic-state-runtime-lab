@@ -17,7 +17,8 @@
     "benchmark:google-calendar:v1": "node benchmarks/google-calendar-v1.ts",
     "benchmark:markdown:v1": "node benchmarks/markdown-ingestion-v1.ts",
     "benchmark:capsule-cache:v1": "node benchmarks/capsule-cache-v1.ts",
-    "benchmark:replication:v0": "node benchmarks/replication-v0.ts"
+    "benchmark:replication:v0": "node benchmarks/replication-v0.ts",
+    "benchmark:replication:merkle:v1": "node benchmarks/replication-merkle-v1.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.2",

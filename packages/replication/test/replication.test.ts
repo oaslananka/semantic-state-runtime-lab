@@ -113,6 +113,21 @@ function markdownAdapter() {
 }
 
 describe("portable immutable replication records", () => {
+  it("rejects same-key same-digest descriptors with inconsistent immutable metadata", async () => {
+    const base = await observationRecord(observation(
+      "metadata-mismatch",
+      "Project.status",
+      "active",
+      "2026-01-01T00:00:00Z",
+    ));
+    const tampered = { ...base, payloadBytes: base.payloadBytes + 1 };
+    const local = await replicationInventory([base]);
+    const remote = await replicationInventory([tampered]);
+
+    await expect(diffReplicationInventories(local, remote))
+      .rejects.toThrow(/inconsistent descriptor metadata/);
+  });
+
   it("canonicalizes equivalent payload JSON before hashing", async () => {
     const canonical = temporalObservationJson(observation(
       "obs-canonical",

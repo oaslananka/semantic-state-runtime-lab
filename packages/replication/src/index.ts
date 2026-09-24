@@ -255,7 +255,7 @@ function assertRecordKeyIdentity(
   }
 }
 
-function replicationDescriptor(
+export function replicationDescriptor(
   record: Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>,
 ): ReplicationRecordDescriptor {
   return {
@@ -279,7 +279,7 @@ function replicationCollision(
   });
 }
 
-function assertSameDescriptorKey(
+export function assertSameReplicationDescriptor(
   existing: ReplicationRecordDescriptor,
   incoming: Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>,
 ): void {
@@ -318,6 +318,15 @@ function assertSameRecordEnvelope(
   }
 }
 
+async function validateDescriptorBatch(
+  records: readonly Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>[],
+  batchSize = 256,
+): Promise<void> {
+  for (let offset = 0; offset < records.length; offset += batchSize) {
+    await Promise.all(records.slice(offset, offset + batchSize).map(validateReplicationDescriptor));
+  }
+}
+
 async function validateReplicationDescriptor(
   record: Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>,
 ): Promise<void> {
@@ -339,23 +348,30 @@ function inventoryRootMaterial(records: readonly ReplicationRecordDescriptor[]):
   return canonicalJson(records.map(replicationDescriptor));
 }
 
-export async function replicationInventory(
+export async function normalizeReplicationDescriptors(
   records: readonly Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>[],
-): Promise<ReplicationInventory> {
+): Promise<ReplicationRecordDescriptor[]> {
   const sorted = [...records].toSorted(descriptorOrder);
+  await validateDescriptorBatch(sorted);
   const unique: ReplicationRecordDescriptor[] = [];
   const seen = new Map<ReplicationRecordKey, ReplicationRecordDescriptor>();
   for (const record of sorted) {
-    await validateReplicationDescriptor(record);
     const existing = seen.get(record.key);
     if (existing !== undefined) {
-      assertSameDescriptorKey(existing, record);
+      assertSameReplicationDescriptor(existing, record);
       continue;
     }
     const descriptor = replicationDescriptor(record);
     seen.set(record.key, descriptor);
     unique.push(descriptor);
   }
+  return unique;
+}
+
+export async function replicationInventory(
+  records: readonly Pick<ReplicationRecord, keyof ReplicationRecordDescriptor>[],
+): Promise<ReplicationInventory> {
+  const unique = await normalizeReplicationDescriptors(records);
   const rootMaterial = inventoryRootMaterial(unique);
   return {
     schema: REPLICATION_INVENTORY_SCHEMA,
@@ -381,25 +397,12 @@ export async function verifyReplicationInventory(
   return rebuilt;
 }
 
-function descriptorMap(
-  inventory: ReplicationInventory,
-): ReadonlyMap<ReplicationRecordKey, ReplicationRecordDescriptor> {
-  return new Map(inventory.records.map((record) => [record.key, record]));
-}
-
-export async function diffReplicationInventories(
-  local: ReplicationInventory,
-  remote: ReplicationInventory,
-): Promise<ReplicationInventoryDiff> {
-  const [verifiedLocal, verifiedRemote] = await Promise.all([
-    verifyReplicationInventory(local),
-    verifyReplicationInventory(remote),
-  ]);
-  if (verifiedLocal.rootDigest === verifiedRemote.rootDigest) {
-    return { localOnly: [], remoteOnly: [], collisions: [], equal: true };
-  }
-  const localMap = descriptorMap(verifiedLocal);
-  const remoteMap = descriptorMap(verifiedRemote);
+export function diffReplicationDescriptors(
+  local: readonly ReplicationRecordDescriptor[],
+  remote: readonly ReplicationRecordDescriptor[],
+): ReplicationInventoryDiff {
+  const localMap = new Map(local.map((record) => [record.key, record]));
+  const remoteMap = new Map(remote.map((record) => [record.key, record]));
   const keys = [...new Set([...localMap.keys(), ...remoteMap.keys()])]
     .toSorted((left, right) => left.localeCompare(right));
   const localOnly: ReplicationRecordKey[] = [];
@@ -418,7 +421,9 @@ export async function diffReplicationInventories(
     }
     if (left.payloadDigest !== right.payloadDigest) {
       collisions.push({ key, localDigest: left.payloadDigest, remoteDigest: right.payloadDigest });
+      continue;
     }
+    assertSameReplicationDescriptor(left, right);
   }
   return {
     localOnly,
@@ -426,6 +431,20 @@ export async function diffReplicationInventories(
     collisions,
     equal: localOnly.length === 0 && remoteOnly.length === 0 && collisions.length === 0,
   };
+}
+
+export async function diffReplicationInventories(
+  local: ReplicationInventory,
+  remote: ReplicationInventory,
+): Promise<ReplicationInventoryDiff> {
+  const [verifiedLocal, verifiedRemote] = await Promise.all([
+    verifyReplicationInventory(local),
+    verifyReplicationInventory(remote),
+  ]);
+  if (verifiedLocal.rootDigest === verifiedRemote.rootDigest) {
+    return { localOnly: [], remoteOnly: [], collisions: [], equal: true };
+  }
+  return diffReplicationDescriptors(verifiedLocal.records, verifiedRemote.records);
 }
 
 export function assertCollisionFreeReplicationDiff(diff: ReplicationInventoryDiff): void {
