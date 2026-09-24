@@ -10,6 +10,7 @@ import * as z from "zod/v4";
 const entityIdSchema = z.string().regex(/^entity:\/\/.+$/);
 const nonEmptyString = z.string().trim().min(1);
 const positiveSafeInteger = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const nonNegativeSafeInteger = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 
 const externalIdSchema = nonEmptyString.superRefine((value, ctx) => {
   if (value.includes("\0")) {
@@ -117,6 +118,7 @@ const contextSchema = z.object({
   maxRelationEdges: positiveSafeInteger.optional(),
   syncPageSize: positiveSafeInteger.max(1_000).optional(),
   syncMaxPages: positiveSafeInteger.optional(),
+  sourceVerificationMaxAgeMs: nonNegativeSafeInteger.optional(),
 }).strict();
 
 const configSchema = z.object({
@@ -190,6 +192,7 @@ export interface LocalContextConfig {
   readonly maxRelationEdges?: number;
   readonly syncPageSize?: number;
   readonly syncMaxPages?: number;
+  readonly sourceVerificationMaxAgeMs: number;
 }
 
 export interface LocalAppConfig {
@@ -687,6 +690,7 @@ function localContextConfig(
     ...optionalNumber("maxRelationEdges", parsed.maxRelationEdges),
     ...optionalNumber("syncPageSize", parsed.syncPageSize),
     ...optionalNumber("syncMaxPages", parsed.syncMaxPages),
+    sourceVerificationMaxAgeMs: parsed.sourceVerificationMaxAgeMs ?? 0,
   };
 }
 

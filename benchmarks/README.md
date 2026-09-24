@@ -59,9 +59,9 @@ The fixture covers a multi-page initial sync, an incremental update + sparse del
 
 ## Markdown authoritative ingestion v1
 
-`pnpm benchmark:markdown:v1` measures the correctness-first local Markdown full-scan path on deterministic 100-note and 1,000-note fixtures: recursive enumeration, exact byte reads, SHA-256, strict UTF-8 decoding, frontmatter parsing, and configured field extraction.
+`pnpm benchmark:markdown:v1` measures the correctness-first local Markdown full-scan path on deterministic 100 / 1,000 / 10,000-note fixtures: recursive enumeration, exact byte reads, SHA-256, strict UTF-8 decoding, frontmatter parsing, and configured field extraction.
 
-It also checks checkpoint stability on a byte-identical second scan. Timing is observational only; there is no latency threshold or claim that O(N files + bytes) full scans are suitable for huge vaults. See `docs/markdown-authoritative-ingestion-v1.md`.
+It also measures the watcher-hint verification gate: 25 clean requests must produce zero additional scans, while an explicit dirty hint must trigger one authoritative verification. Timing is observational only; there is no production latency threshold. See `docs/markdown-authoritative-ingestion-v1.md` and `docs/source-verification-v1.md`.
 
 ## Context capsule cache v1
 

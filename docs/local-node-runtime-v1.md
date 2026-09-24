@@ -209,11 +209,15 @@ The in-memory capsule cache is derived and rebuildable. Restarting with the same
 
 ### Freshness and authoritative inventory
 
-Before `context.compile` is delegated to the Context Access Gateway, the local runtime synchronizes every configured context source. Concurrent requests coalesce one in-flight synchronization round. Artifact list/read uses the same shared source synchronizer.
+Before `context.compile` or artifact list/read is delegated, the local runtime passes every configured source through the same coalesced source-verification gate. The default `context.sourceVerificationMaxAgeMs = 0` preserves the original correctness-first behavior: every access performs the authoritative recursive Markdown scan.
 
-For Markdown v1 this synchronization is correctness-first: the connector performs an authoritative recursive full scan. Files under a configured authoritative root that are not present in the configured external-ID inventory cause the local context synchronization to fail closed. The MCP boundary returns a sanitized internal error and does not fall back to stale cached context.
+With an explicit positive `sourceVerificationMaxAgeMs`, one recursive `fs.watch` handle per configured root is used only as a **dirty hint**. Clean sources may skip rescanning until the verification-age bound expires. A dirty hint, age expiry, startup, watcher setup failure, watcher runtime error, or unexpected watcher close causes an authoritative scan. Watcher failure degrades to scan-on-every-access rather than stale-cache fallback.
 
-This means request latency is currently O(configured Markdown inventory). Filesystem watchers may later be used as wake-up or dirty hints, but they are not a correctness source and no production latency claim is made for request-time full scans.
+The event filename/type is never interpreted as source truth. Any scan still executes the existing strict configured external-ID inventory, full-generation deletion sweep, revision checks, and ingestion/retraction logic. Concurrent accesses coalesce one in-flight verification round. Separate clean roots are not rescanned merely because another root is dirty.
+
+A restart never trusts prior watcher state: the first access verifies all configured sources even when the durable Context Capsule cache is warm. Changing only `sourceVerificationMaxAgeMs` is runtime tuning and does not change persistent source-topology identity.
+
+See `docs/source-verification-v1.md` for failure semantics, bounded-staleness tradeoffs, and benchmark measurements.
 
 ## Policy
 
