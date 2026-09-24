@@ -340,8 +340,8 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
     expect(projection.slots.map((slot) => slot.key)).toEqual(["Project.status"]);
   });
 
-  it("excludes symlinked Markdown entries from authoritative inventory", async () => {
-    if (process.platform === "win32") return;
+  it("excludes symlinked Markdown entries from authoritative inventory", async (context) => {
+    if (process.platform === "win32") context.skip();
     const root = await vault();
     const outside = await vault();
     await note(root, "Real.md", "active");
