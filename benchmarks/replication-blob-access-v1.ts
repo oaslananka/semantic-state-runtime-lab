@@ -115,16 +115,16 @@ if (finalRecord === undefined || !recordReadable.has(finalRecord.recordId)) {
   throw new Error("blob benchmark fixture must end on a record-readable reference");
 }
 
-const evaluations: Record<ReplicationAccessOperation, number> = {
-  "projection:read": 0,
-  "record:read": 0,
-  "record:apply": 0,
-  "artifact-blob:read": 0,
-  "artifact-blob:apply": 0,
-};
-const policy: ReplicationAccessPolicy = {
+const evaluationCounts = new Map<ReplicationAccessOperation, number>();
+function countEvaluation(operation: ReplicationAccessOperation): void {
+  evaluationCounts.set(operation, (evaluationCounts.get(operation) ?? 0) + 1);
+}
+function evaluationCount(operation: ReplicationAccessOperation): number {
+  return evaluationCounts.get(operation) ?? 0;
+}
+const policy = {
   evaluate(request) {
-    evaluations[request.operation] += 1;
+    countEvaluation(request.operation);
     switch (request.operation) {
       case "projection:read": return { effect: "allow" };
       case "record:read":
@@ -142,7 +142,7 @@ const policy: ReplicationAccessPolicy = {
           : { effect: "deny", code: "benchmark-apply-deny" };
     }
   },
-};
+} satisfies ReplicationAccessPolicy;
 const gateway = new ReplicationAccessGateway({
   source: new MutableReplicationRecordSource(records),
   policy,
@@ -214,5 +214,11 @@ console.log(JSON.stringify({
     elapsedMs: round(installMs),
     ...installed.accounting,
   },
-  policyEvaluations: evaluations,
+  policyEvaluations: {
+    "projection:read": evaluationCount("projection:read"),
+    "record:read": evaluationCount("record:read"),
+    "record:apply": evaluationCount("record:apply"),
+    "artifact-blob:read": evaluationCount("artifact-blob:read"),
+    "artifact-blob:apply": evaluationCount("artifact-blob:apply"),
+  },
 }, null, 2));
