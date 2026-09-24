@@ -326,6 +326,14 @@ function rawArtifactMapper(
   };
 }
 
+const semanticMapperMustNotRun: ProjectionMapper<ProjectPayload> = {
+  project() { throw new Error("semantic mapper must not rerun"); },
+};
+
+const artifactMapperMustNotRun: ArtifactProjectionMapper<ProjectPayload> = {
+  projectArtifact() { throw new Error("artifact mapper must not rerun"); },
+};
+
 async function runtime(
   ingestionState: IngestionStateStore = new InMemoryIngestionStateStore(),
   options: { readonly artifactStore?: ArtifactStore; readonly semantic?: TestSemanticStateStore } = {},
@@ -339,6 +347,19 @@ async function runtime(
     now: () => "2026-09-24T12:00:00Z",
   });
   return { semantic, ingestionState, engine };
+}
+
+async function localArtifactRuntime(
+  ingestionState: IngestionStateStore = new InMemoryIngestionStateStore(),
+  semantic?: TestSemanticStateStore,
+) {
+  const root = await artifactRoot();
+  const artifacts = new LocalArtifactStore({ root });
+  const configured = await runtime(ingestionState, {
+    artifactStore: artifacts,
+    ...(semantic === undefined ? {} : { semantic }),
+  });
+  return { ...configured, artifacts, root };
 }
 
 function singlePageSource(
@@ -805,15 +826,7 @@ describe("IngestionEngine", () => {
   it("safely retries when the process crashes after blob installation but before plan persistence", async () => {
     const innerState = new InMemoryIngestionStateStore();
     const failingPlan = new FailMappedPlanOnceState(innerState);
-    const root = await artifactRoot();
-    const localArtifacts = new LocalArtifactStore({ root });
-    const semantic = new TestSemanticStateStore();
-    const engine = new IngestionEngine({
-      semanticState: semantic,
-      ingestionState: failingPlan,
-      artifactStore: localArtifacts,
-      now: () => "2026-09-24T12:00:00Z",
-    });
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(failingPlan);
     const source = singlePageSource([
       change("blob-before-plan", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
     ]);
@@ -857,14 +870,7 @@ describe("IngestionEngine", () => {
   it("replays a persisted artifact plan without rerunning semantic or artifact mappers", async () => {
     const innerState = new InMemoryIngestionStateStore();
     const failingProjection = new FailProjectionOnceState(innerState);
-    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
-    const semantic = new TestSemanticStateStore();
-    const engine = new IngestionEngine({
-      semanticState: semantic,
-      ingestionState: failingProjection,
-      artifactStore: localArtifacts,
-      now: () => "2026-09-24T12:00:00Z",
-    });
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(failingProjection);
     const source = singlePageSource([
       change("artifact-plan-replay", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
     ]);
@@ -887,17 +893,11 @@ describe("IngestionEngine", () => {
     expect(artifactCalls.count).toBe(1);
     expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
 
-    const mustNotRunMapper: ProjectionMapper<ProjectPayload> = {
-      project() { throw new Error("semantic mapper must not rerun"); },
-    };
-    const mustNotRunArtifact: ArtifactProjectionMapper<ProjectPayload> = {
-      projectArtifact() { throw new Error("artifact mapper must not rerun"); },
-    };
     const replay = await engine.sync({
       sourceKey,
       source,
-      mapper: mustNotRunMapper,
-      artifactMapper: mustNotRunArtifact,
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
     });
     expect(replay.artifactMutationsAppended).toBe(0);
     expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
@@ -934,8 +934,8 @@ describe("IngestionEngine", () => {
     const result = await engine.sync({
       sourceKey,
       source,
-      mapper: { project() { throw new Error("stored plan should bypass semantic mapper"); } },
-      artifactMapper: { projectArtifact() { throw new Error("stored plan should bypass artifact mapper"); } },
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
     });
     expect(events).toEqual(["artifact", "semantic", "projection", "checkpoint"]);
     expect(result.artifactMutationsAppended).toBe(1);
@@ -976,8 +976,8 @@ describe("IngestionEngine", () => {
     await expect(engine.sync({
       sourceKey,
       source,
-      mapper: { project() { throw new Error("semantic mapper must not rerun"); } },
-      artifactMapper: { projectArtifact() { throw new Error("artifact mapper must not rerun"); } },
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
     })).rejects.toBeInstanceOf(ArtifactBlobCorruptError);
     expect((await semantic.snapshot()).observations).toEqual([]);
     expect(await innerState.projection(sourceKey, "project", "atlas")).toBeUndefined();
@@ -988,10 +988,9 @@ describe("IngestionEngine", () => {
 
   it("leaves durable artifact evidence but no projection/checkpoint when semantic append fails", async () => {
     const innerState = new InMemoryIngestionStateStore();
-    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
     const semantic = new RecordingSemanticStore([]);
     semantic.failNextAppend();
-    const { engine } = await runtime(innerState, { artifactStore: localArtifacts, semantic });
+    const { artifacts: localArtifacts, engine } = await localArtifactRuntime(innerState, semantic);
     const source = singlePageSource([
       change("semantic-fail-after-artifact", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
     ]);
@@ -1009,8 +1008,8 @@ describe("IngestionEngine", () => {
     const replay = await engine.sync({
       sourceKey,
       source,
-      mapper: { project() { throw new Error("stored plan should bypass semantic mapper"); } },
-      artifactMapper: { projectArtifact() { throw new Error("stored plan should bypass artifact mapper"); } },
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
     });
     expect(replay.artifactMutationsAppended).toBe(0);
     expect((await semantic.snapshot()).observations).toHaveLength(1);
@@ -1020,8 +1019,7 @@ describe("IngestionEngine", () => {
 
   it("deletes a live artifact when configured mapper later returns no raw content", async () => {
     const innerState = new InMemoryIngestionStateStore();
-    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
-    const { semantic, engine } = await runtime(innerState, { artifactStore: localArtifacts });
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(innerState);
     await engine.sync({
       sourceKey,
       source: singlePageSource([
@@ -1058,8 +1056,7 @@ describe("IngestionEngine", () => {
 
   it("preserves a live artifact on structured-only upsert and deletes it on provider delete", async () => {
     const innerState = new InMemoryIngestionStateStore();
-    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
-    const { semantic, engine } = await runtime(innerState, { artifactStore: localArtifacts });
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(innerState);
     await engine.sync({
       sourceKey,
       source: singlePageSource([
@@ -1095,8 +1092,7 @@ describe("IngestionEngine", () => {
 
   it("full-sync sweep deletes an unseen live artifact without requiring the artifact mapper", async () => {
     const state = new InMemoryIngestionStateStore();
-    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
-    const { semantic, engine } = await runtime(state, { artifactStore: localArtifacts });
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(state);
     await engine.sync({
       sourceKey,
       source: singlePageSource([
