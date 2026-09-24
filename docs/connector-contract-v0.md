@@ -32,6 +32,12 @@ A connector advertises provider-wide support for:
 
 Each entity mapping then binds canonical property paths to external field paths and declares read/write access plus an optional authority hint.
 
+## Incremental ingestion is a separate contract
+
+`ConnectorManifest` describes capabilities and canonical field mappings. It does not define provider pagination, replay, checkpoint expiry, full-resync generations, or source deletion semantics.
+
+Those reliability semantics live in `@ssrl/ingestion` and `docs/connector-ingestion-v1.md`. A connector may implement both the state-provider contract and the incremental-source contract, but neither is forced to masquerade as the other.
+
 ## Non-goals
 
 v0 does not define network transport, authentication, retries, webhook payloads, provider-specific API calls, universal ontologies, or distributed transaction semantics.

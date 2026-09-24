@@ -315,17 +315,8 @@ Tests cover:
 - background cloud scheduler
 - entity tombstone propagation / physical privacy erasure
 
-## Next step
+## Ingestion integration
 
-The next major product layer is **connector ingestion/checkpointing**:
+`@ssrl/ingestion` now produces ordinary semantic assertions/retractions through `SemanticStateStore.append()`. The capsule worker needs no ingestion-specific code: its existing durable semantic change cursor observes those effects and rematerializes only affected entities.
 
-```text
-connector event / file watcher / webhook
-  -> deterministic semantic extraction/normalization
-  -> map source updates/deletes to assertions + retractions
-  -> SemanticStateStore.append()
-  -> durable change feed
-  -> incremental capsule refresh
-```
-
-For deterministic fields this can be schema/rule based. LLM extraction, when used, should produce proposed claims with provenance rather than silently writing truth.
+See `docs/connector-ingestion-v1.md`.

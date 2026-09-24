@@ -6,7 +6,8 @@
   "dependencies": {
     "@ssrl/journal": "workspace:*",
     "@ssrl/core": "workspace:*",
-    "@ssrl/state-store": "workspace:*"
+    "@ssrl/state-store": "workspace:*",
+    "@ssrl/ingestion": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "26.6.2",

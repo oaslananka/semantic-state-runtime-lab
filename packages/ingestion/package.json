@@ -1,5 +1,5 @@
 {
-  "name": "@ssrl/materializer",
+  "name": "@ssrl/ingestion",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -8,10 +8,7 @@
     "@ssrl/state-store": "workspace:*"
   },
   "devDependencies": {
-    "@ssrl/storage-sqlite": "workspace:*",
-    "@types/node": "26.6.2",
-    "@ssrl/context": "workspace:*",
-    "@ssrl/ingestion": "workspace:*"
+    "@types/node": "26.6.2"
   },
   "exports": {
     ".": {
