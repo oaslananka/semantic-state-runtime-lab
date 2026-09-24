@@ -29,7 +29,7 @@ function validateSource(source: SourceRef, retractionId: string): void {
   if (source.externalId.length === 0) {
     throw new Error(`Semantic retraction ${retractionId} source externalId must not be empty`);
   }
-  if (source.revision !== undefined && source.revision.length === 0) {
+  if (source.revision?.length === 0) {
     throw new Error(`Semantic retraction ${retractionId} source revision must not be empty`);
   }
 }
