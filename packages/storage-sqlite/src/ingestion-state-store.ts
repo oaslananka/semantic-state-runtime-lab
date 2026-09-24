@@ -117,17 +117,22 @@ function generation(row: GenerationRow): FullSyncGeneration {
   return { id: row.generation_id, sourceKey, observedAt };
 }
 
+function openIngestionDatabase(options: SQLiteIngestionStateStoreOptions): DatabaseSync {
+  const db = new DatabaseSync(options.path, {
+    timeout: options.timeoutMs ?? 5_000,
+    defensive: true,
+  });
+  db.exec("PRAGMA foreign_keys = ON");
+  if (options.wal === true) db.exec("PRAGMA journal_mode = WAL");
+  return db;
+}
+
 export class SQLiteIngestionStateStore implements IngestionStateStore {
   readonly #db: DatabaseSync;
 
   constructor(options: SQLiteIngestionStateStoreOptions) {
-    this.#db = new DatabaseSync(options.path, {
-      timeout: options.timeoutMs ?? 5_000,
-      defensive: true,
-    });
+    this.#db = openIngestionDatabase(options);
     try {
-      this.#db.exec("PRAGMA foreign_keys = ON");
-      if (options.wal === true) this.#db.exec("PRAGMA journal_mode = WAL");
       this.#initialize();
     } catch (cause) {
       this.#db.close();

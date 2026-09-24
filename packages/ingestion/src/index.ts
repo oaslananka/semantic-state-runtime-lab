@@ -1,5 +1,4 @@
 import {
-  artifactMutationJson,
   normalizeArtifactMediaType,
   normalizeArtifactMutation,
   type ArtifactMutation,
@@ -476,17 +475,22 @@ export function parseMappedIngestionPlanJson(value: string): MappedIngestionPlan
   return normalizeMappedIngestionPlan(plan as MappedIngestionPlan);
 }
 
+function projectedArtifact(
+  previous: ResourceProjection | undefined,
+  action: ArtifactPlanAction,
+): ResourceArtifactProjection | undefined {
+  if (action.kind === "preserve") return previous?.artifact;
+  if (action.mutation.kind === "delete") return undefined;
+  return { latestMutationId: action.mutation.id };
+}
+
 function nextProjection(
   sourceKey: IngestionSourceKey,
   change: SourceChange,
   previous: ResourceProjection | undefined,
   plan: MappedIngestionPlan,
 ): ResourceProjection {
-  const artifact = plan.artifactAction.kind === "preserve"
-    ? previous?.artifact
-    : plan.artifactAction.mutation.kind === "upsert"
-      ? { latestMutationId: plan.artifactAction.mutation.id }
-      : undefined;
+  const artifact = projectedArtifact(previous, plan.artifactAction);
   return {
     sourceKey,
     externalType: change.externalType,
