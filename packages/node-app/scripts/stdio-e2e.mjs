@@ -30,13 +30,24 @@ const connector = (id, writable) => ({
 const config = {
   schemaVersion: "1",
   journalPath: "./journal/runtime.sqlite",
-  principal: { subject: "user:local", scopes: ["state:read", "state:write"] },
+  context: {
+    semanticStatePath: "./context/semantic.sqlite",
+    ingestionStatePath: "./context/ingestion.sqlite",
+    artifactStoreRoot: "./context/artifacts",
+    sources: [
+      { provider: "primary", externalType: "markdown" },
+      { provider: "replica", externalType: "markdown" },
+    ],
+    maxBudgetTokens: 512,
+  },
+  principal: { subject: "user:local", scopes: ["state:read", "state:write", "context:read"] },
   providers: [
     { id: "primary", root: "./primary", manifest: connector("primary", false) },
     { id: "replica", root: "./replica", manifest: connector("replica", true) },
   ],
   entities: [{
     entityId,
+    aliases: ["Project Atlas", "Atlas"],
     bindings: [
       { provider: "primary", externalId: "project.md", canonicalType: "Project" },
       { provider: "replica", externalId: "project.md", canonicalType: "Project" },
@@ -95,7 +106,24 @@ try {
   const first = await connectClient();
   try {
     const tools = await first.client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), ["state.apply", "state.plan"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
+      "context.compile",
+      "state.apply",
+      "state.plan",
+    ]);
+
+    const context = await first.client.callTool({
+      name: "context.compile",
+      arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
+    });
+    assert.notEqual(context.isError, true);
+    assert.equal(context.structuredContent?.resolution?.status, "resolved");
+    assert.equal(context.structuredContent?.resolution?.entityId, entityId);
+    const contextJson = JSON.stringify(context);
+    assert.match(contextJson, /2026-11-20/);
+    assert.equal(contextJson.includes("PRIMARY-SECRET"), false);
+    assert.equal(contextJson.includes("Primary body"), false);
+    assert.equal(contextJson.includes("evidenceRefs"), false);
 
     const planned = await first.client.callTool({ name: "state.plan", arguments: { entityId } });
     assert.notEqual(planned.isError, true);
@@ -140,6 +168,12 @@ try {
   try {
     const result = await restarted.client.callTool({ name: "state.plan", arguments: { entityId } });
     assert.notEqual(result.isError, true);
+    const context = await restarted.client.callTool({
+      name: "context.compile",
+      arguments: { task: "Project Atlas deadline", budgetTokens: 180 },
+    });
+    assert.notEqual(context.isError, true);
+    assert.match(JSON.stringify(context), /2026-11-20/);
   } finally {
     await restarted.client.close();
   }

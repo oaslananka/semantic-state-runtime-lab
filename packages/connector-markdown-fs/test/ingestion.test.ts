@@ -163,6 +163,30 @@ function closePersistentRuntime(runtime: ReturnType<typeof openPersistentRuntime
 }
 
 
+async function vaultWithNotes(
+  notes: readonly (readonly [externalId: string, status: string])[],
+): Promise<string> {
+  const root = await vault();
+  for (const [externalId, status] of notes) await note(root, externalId, status);
+  return root;
+}
+
+const configuredAtlasIds = ["Projects/Atlas.md"] as const;
+
+async function scopedInventoryVault(): Promise<string> {
+  return vaultWithNotes([
+    ["Projects/Atlas.md", "active"],
+    ["Private/Unconfigured.md", "secret"],
+  ]);
+}
+
+async function twoPageVault(): Promise<string> {
+  return vaultWithNotes([
+    ["A.md", "active"],
+    ["B.md", "active"],
+  ]);
+}
+
 function persistentPaths(storageRoot: string) {
   return {
     semantic: join(storageRoot, "semantic.sqlite"),
@@ -255,6 +279,35 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
     expect(third.changes[0]?.changeId).not.toBe(first.changes[0]?.changeId);
   });
 
+  it("scopes authoritative inventory to explicit configured external ids", async () => {
+    const root = await scopedInventoryVault();
+    const source = adapter(root, {
+      externalIds: configuredAtlasIds,
+      maxFiles: 1,
+      entityIdForExternalId: (externalId) => {
+        if (externalId !== "Projects/Atlas.md") throw new Error("unconfigured identity reached mapper");
+        return atlas;
+      },
+    });
+
+    const page = await fullPage(source);
+    expect(page.changes.map((change) => change.externalId)).toEqual(["Projects/Atlas.md"]);
+  });
+
+  it("can fail closed when an authoritative root contains an unconfigured Markdown id", async () => {
+    const root = await scopedInventoryVault();
+    const source = adapter(root, {
+      externalIds: configuredAtlasIds,
+      rejectUnlistedExternalIds: true,
+      entityIdForExternalId: () => atlas,
+    });
+
+    await expect(fullPage(source)).rejects.toMatchObject({
+      name: "UnconfiguredMarkdownIngestionSourceError",
+      externalId: "Private/Unconfigured.md",
+    });
+  });
+
   it("keeps raw body and unmapped frontmatter out of SourceChange payload", async () => {
     const root = await vault();
     await note(root, "Projects/Atlas.md", "active", {
@@ -273,9 +326,7 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
   });
 
   it("freezes structured pagination in one scan session and revalidates bytes before artifact mapping", async () => {
-    const root = await vault();
-    await note(root, "A.md", "active");
-    await note(root, "B.md", "active");
+    const root = await twoPageVault();
     const source = adapter(root, { pageSize: 1 });
 
     const first = await source.read({ mode: "full" });
@@ -363,9 +414,7 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
   });
 
   it("fails closed when maxFiles or maxRawBytes is exceeded", async () => {
-    const root = await vault();
-    await note(root, "A.md", "active");
-    await note(root, "B.md", "active");
+    const root = await twoPageVault();
 
     await expect(adapter(root, { maxFiles: 1 }).read({ mode: "full" }))
       .rejects.toBeInstanceOf(MarkdownScanLimitError);
@@ -374,9 +423,7 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
   });
 
   it("rejects foreign or expired full-scan continuations", async () => {
-    const root = await vault();
-    await note(root, "A.md", "active");
-    await note(root, "B.md", "active");
+    const root = await twoPageVault();
     const source = adapter(root, { pageSize: 1 });
 
     await expect(source.read({
@@ -494,14 +541,7 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
     expect([...(await runtime.artifacts.readBlobRange(atlasLatest.blob.digest, {
       maxBytes: atlasBytesV2.byteLength,
     })).bytes]).toEqual([...atlasBytesV2]);
-    worker = new IncrementalContextCapsuleWorker({
-      stateStore: runtime.semantic,
-      capsuleStore: cache,
-      materializer: new ContextCapsuleMaterializer({
-        stateStore: runtime.semantic,
-        configurationVersion: "markdown-e2e-v1",
-      }),
-    });
+    worker = capsuleWorker(runtime, cache);
     const update = await worker.runOnce({ at: "2026-09-25T10:01:00Z" });
     expect(update.changedEntityIds).toEqual([atlas]);
     expect((await cache.get(atlas))?.material.state.canonical.properties["Project.status"]?.value)
@@ -518,14 +558,7 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
     expect(third.semanticAppends.retractions).toBe(1);
     const betaArtifactsV3 = await artifactMutations(runtime, "Projects/Beta.md");
     expect(betaArtifactsV3.map((mutation) => mutation.kind)).toEqual(["upsert", "delete"]);
-    worker = new IncrementalContextCapsuleWorker({
-      stateStore: runtime.semantic,
-      capsuleStore: cache,
-      materializer: new ContextCapsuleMaterializer({
-        stateStore: runtime.semantic,
-        configurationVersion: "markdown-e2e-v1",
-      }),
-    });
+    worker = capsuleWorker(runtime, cache);
     const deletion = await worker.runOnce({ at: "2026-09-26T10:01:00Z" });
     expect(deletion.changedEntityIds).toEqual([beta]);
     expect((await cache.get(beta))?.material.state.canonical.properties["Project.status"])

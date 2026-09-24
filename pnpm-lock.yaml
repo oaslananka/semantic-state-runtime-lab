@@ -425,15 +425,27 @@ importers:
       '@modelcontextprotocol/server':
         specifier: 2.1.0
         version: 2.1.0
+      '@ssrl/artifact-access':
+        specifier: workspace:*
+        version: link:../artifact-access
       '@ssrl/connector-markdown-fs':
         specifier: workspace:*
         version: link:../connector-markdown-fs
       '@ssrl/connector-sdk':
         specifier: workspace:*
         version: link:../connector-sdk
+      '@ssrl/context-access':
+        specifier: workspace:*
+        version: link:../context-access
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/ingestion':
+        specifier: workspace:*
+        version: link:../ingestion
+      '@ssrl/materializer':
+        specifier: workspace:*
+        version: link:../materializer
       '@ssrl/mcp-server':
         specifier: workspace:*
         version: link:../mcp-server
@@ -443,6 +455,12 @@ importers:
       '@ssrl/runtime-host':
         specifier: workspace:*
         version: link:../runtime-host
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
       '@ssrl/storage-sqlite':
         specifier: workspace:*
         version: link:../storage-sqlite

@@ -1,14 +1,15 @@
 import { readFile, stat } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   validateConnectorManifest,
   type ConnectorManifest,
 } from "@ssrl/connector-sdk";
-import type { EntityId } from "@ssrl/core";
+import { normalizeEntityAlias, type EntityId } from "@ssrl/core";
 import * as z from "zod/v4";
 
 const entityIdSchema = z.string().regex(/^entity:\/\/.+$/);
 const nonEmptyString = z.string().trim().min(1);
+const positiveSafeInteger = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
 
 const externalIdSchema = nonEmptyString.superRefine((value, ctx) => {
   if (value.includes("\0")) {
@@ -82,6 +83,9 @@ const authoritySchema = z.object({
 
 const entitySchema = z.object({
   entityId: entityIdSchema,
+  aliases: z.array(nonEmptyString)
+    .refine((value) => new Set(value).size === value.length, "entity aliases must be unique")
+    .default([]),
   bindings: z.array(bindingSchema).min(1),
   authority: z.array(authoritySchema).default([]),
 }).strict();
@@ -94,9 +98,30 @@ const policyFieldSchema = z.object({
   write: z.boolean(),
 }).strict();
 
+const contextSourceSchema = z.object({
+  provider: nonEmptyString,
+  externalType: nonEmptyString,
+}).strict();
+
+const contextSchema = z.object({
+  semanticStatePath: nonEmptyString,
+  ingestionStatePath: nonEmptyString,
+  artifactStoreRoot: nonEmptyString,
+  sources: z.array(contextSourceSchema).min(1),
+  maxBudgetTokens: positiveSafeInteger.optional(),
+  maxIdentityCandidates: positiveSafeInteger.optional(),
+  maxIdentityScans: positiveSafeInteger.optional(),
+  maxRelationCandidates: positiveSafeInteger.optional(),
+  maxRelationScans: positiveSafeInteger.optional(),
+  maxRelationEdges: positiveSafeInteger.optional(),
+  syncPageSize: positiveSafeInteger.max(1_000).optional(),
+  syncMaxPages: positiveSafeInteger.optional(),
+}).strict();
+
 const configSchema = z.object({
   schemaVersion: z.literal("1"),
   journalPath: nonEmptyString,
+  context: contextSchema.optional(),
   principal: z.object({
     subject: nonEmptyString,
     scopes: z.array(nonEmptyString)
@@ -129,6 +154,7 @@ export interface LocalEntityBindingConfig {
 
 export interface LocalEntityConfig {
   readonly entityId: EntityId;
+  readonly aliases: readonly string[];
   readonly bindings: readonly LocalEntityBindingConfig[];
   readonly authority: readonly {
     readonly property: string;
@@ -144,10 +170,31 @@ export interface LocalPolicyFieldGrant {
   readonly write: boolean;
 }
 
+export interface LocalContextSourceConfig {
+  readonly provider: string;
+  readonly externalType: string;
+}
+
+export interface LocalContextConfig {
+  readonly semanticStatePath: string;
+  readonly ingestionStatePath: string;
+  readonly artifactStoreRoot: string;
+  readonly sources: readonly LocalContextSourceConfig[];
+  readonly maxBudgetTokens?: number;
+  readonly maxIdentityCandidates?: number;
+  readonly maxIdentityScans?: number;
+  readonly maxRelationCandidates?: number;
+  readonly maxRelationScans?: number;
+  readonly maxRelationEdges?: number;
+  readonly syncPageSize?: number;
+  readonly syncMaxPages?: number;
+}
+
 export interface LocalAppConfig {
   readonly schemaVersion: "1";
   readonly configPath: string;
   readonly journalPath: string;
+  readonly context?: LocalContextConfig;
   readonly principal: {
     readonly subject: string;
     readonly scopes: readonly string[];
@@ -350,6 +397,198 @@ function validatePolicyFields(
   }
 }
 
+interface ParsedContextSourceMapping {
+  readonly provider: ParsedProvider;
+  readonly canonicalType: string;
+  readonly externalType: string;
+}
+
+function resolveContextSource(
+  source: NonNullable<ParsedConfig["context"]>["sources"][number],
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): ParsedContextSourceMapping | undefined {
+  const provider = providers.get(source.provider);
+  if (provider === undefined) {
+    issues.push(`context source ${source.provider}/${source.externalType}: unknown provider`);
+    return undefined;
+  }
+  const mappings = provider.manifest.entities.filter(
+    (mapping) => mapping.externalType === source.externalType,
+  );
+  if (mappings.length !== 1) {
+    issues.push(
+      `context source ${source.provider}/${source.externalType}: externalType must match exactly one manifest entity mapping`,
+    );
+    return undefined;
+  }
+  return {
+    provider,
+    canonicalType: mappings[0]!.canonicalType,
+    externalType: source.externalType,
+  };
+}
+
+function contextSourceKey(provider: string, externalType: string): string {
+  return JSON.stringify([provider, externalType]);
+}
+
+function contextSourceMappings(
+  config: ParsedConfig,
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): Map<string, ParsedContextSourceMapping> {
+  const result = new Map<string, ParsedContextSourceMapping>();
+  for (const source of config.context?.sources ?? []) {
+    const key = contextSourceKey(source.provider, source.externalType);
+    if (result.has(key)) {
+      issues.push(`context.sources: duplicate source ${source.provider}/${source.externalType}`);
+      continue;
+    }
+    const resolved = resolveContextSource(source, providers, issues);
+    if (resolved !== undefined) result.set(key, resolved);
+  }
+  return result;
+}
+
+function registerContextBindingOwner(
+  entity: ParsedEntity,
+  binding: ParsedEntity["bindings"][number],
+  bindingOwners: Map<string, string>,
+  issues: string[],
+): void {
+  const key = JSON.stringify([binding.provider, binding.externalId]);
+  if (bindingOwners.has(key)) {
+    issues.push(`context binding ${binding.provider}/${binding.externalId} is duplicated`);
+    return;
+  }
+  bindingOwners.set(key, entity.entityId);
+}
+
+function sourceKeysForBinding(
+  binding: ParsedEntity["bindings"][number],
+  sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>,
+): string[] {
+  return [...sourceMappings.entries()]
+    .filter(([, source]) => (
+      binding.provider === source.provider.id
+      && binding.canonicalType === source.canonicalType
+    ))
+    .map(([key]) => key);
+}
+
+interface ContextEntityValidationState {
+  readonly sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>;
+  readonly bindingOwners: Map<string, string>;
+  readonly sourceBindingCounts: Map<string, number>;
+  readonly issues: string[];
+}
+
+function contextTypesForEntity(
+  entity: ParsedEntity,
+  state: ContextEntityValidationState,
+): Set<string> {
+  const types = new Set<string>();
+  for (const binding of entity.bindings) {
+    registerContextBindingOwner(entity, binding, state.bindingOwners, state.issues);
+    for (const sourceKey of sourceKeysForBinding(binding, state.sourceMappings)) {
+      types.add(binding.canonicalType);
+      state.sourceBindingCounts.set(
+        sourceKey,
+        (state.sourceBindingCounts.get(sourceKey) ?? 0) + 1,
+      );
+    }
+  }
+  return types;
+}
+
+function validateContextAliases(entity: ParsedEntity, issues: string[]): void {
+  if (entity.aliases.length === 0) {
+    issues.push(`entity ${entity.entityId}: context requires at least one explicit alias`);
+    return;
+  }
+  const normalized = entity.aliases.map(normalizeEntityAlias);
+  if (normalized.some((alias) => alias.length === 0)) {
+    issues.push(`entity ${entity.entityId}: context aliases must contain letters or numbers`);
+  }
+  if (new Set(normalized).size !== normalized.length) {
+    issues.push(`entity ${entity.entityId}: context aliases must be unique after normalization`);
+  }
+}
+
+function validateContextEntity(
+  entity: ParsedEntity,
+  state: ContextEntityValidationState,
+): void {
+  const types = contextTypesForEntity(entity, state);
+  if (types.size === 0) return;
+  if (types.size !== 1) {
+    state.issues.push(`entity ${entity.entityId}: context bindings must resolve to one canonicalType`);
+  }
+  validateContextAliases(entity, state.issues);
+}
+
+function validateContextSourceCoverage(
+  sourceMappings: ReadonlyMap<string, ParsedContextSourceMapping>,
+  sourceBindingCounts: ReadonlyMap<string, number>,
+  issues: string[],
+): void {
+  for (const [key, source] of sourceMappings) {
+    if ((sourceBindingCounts.get(key) ?? 0) > 0) continue;
+    issues.push(
+      `context source ${source.provider.id}/${source.externalType}: no configured entity bindings`,
+    );
+  }
+}
+
+function boundedBy(
+  smaller: number | undefined,
+  larger: number | undefined,
+  message: string,
+  issues: string[],
+): void {
+  if (smaller !== undefined && larger !== undefined && smaller > larger) issues.push(message);
+}
+
+function validateContextLimits(context: NonNullable<ParsedConfig["context"]>, issues: string[]): void {
+  boundedBy(
+    context.maxIdentityCandidates,
+    context.maxIdentityScans,
+    "context.maxIdentityCandidates must not exceed maxIdentityScans",
+    issues,
+  );
+  boundedBy(
+    context.maxRelationCandidates,
+    context.maxRelationScans,
+    "context.maxRelationCandidates must not exceed maxRelationScans",
+    issues,
+  );
+  boundedBy(
+    context.maxRelationEdges,
+    context.maxRelationCandidates,
+    "context.maxRelationEdges must not exceed maxRelationCandidates",
+    issues,
+  );
+}
+
+function validateContextEntities(
+  config: ParsedConfig,
+  providers: ReadonlyMap<string, ParsedProvider>,
+  issues: string[],
+): void {
+  if (config.context === undefined) return;
+  const sourceMappings = contextSourceMappings(config, providers, issues);
+  const state: ContextEntityValidationState = {
+    sourceMappings,
+    bindingOwners: new Map(),
+    sourceBindingCounts: new Map(),
+    issues,
+  };
+  for (const entity of config.entities) validateContextEntity(entity, state);
+  validateContextSourceCoverage(sourceMappings, state.sourceBindingCounts, issues);
+  validateContextLimits(config.context, issues);
+}
+
 function validatePrincipalScopes(config: ParsedConfig, issues: string[]): void {
   const scopes = new Set(config.principal.scopes);
   const needsRead = config.policy.operations.plan
@@ -363,6 +602,9 @@ function validatePrincipalScopes(config: ParsedConfig, issues: string[]): void {
   if (needsWrite && !scopes.has("state:write")) {
     issues.push("principal.scopes must include state:write when write access is enabled");
   }
+  if (config.context !== undefined && !scopes.has("context:read")) {
+    issues.push("principal.scopes must include context:read when context is configured");
+  }
 }
 
 function semanticIssues(config: ParsedConfig): string[] {
@@ -370,8 +612,121 @@ function semanticIssues(config: ParsedConfig): string[] {
   const providers = collectProviders(config, issues);
   const entityProperties = collectEntityProperties(config, providers, issues);
   validatePolicyFields(config, entityProperties, issues);
+  validateContextEntities(config, providers, issues);
   validatePrincipalScopes(config, issues);
   return issues;
+}
+
+function validateContextStoragePaths(
+  journalPath: string,
+  context: LocalContextConfig | undefined,
+): string[] {
+  if (context === undefined) return [];
+  const artifactMetadata = join(context.artifactStoreRoot, "artifacts.sqlite");
+  const paths = [
+    ["journalPath", journalPath],
+    ["context.semanticStatePath", context.semanticStatePath],
+    ["context.ingestionStatePath", context.ingestionStatePath],
+    ["context.artifactStoreRoot", context.artifactStoreRoot],
+    ["context artifact metadata", artifactMetadata],
+  ] as const;
+  const issues: string[] = [];
+  for (let left = 0; left < paths.length; left += 1) {
+    for (let right = left + 1; right < paths.length; right += 1) {
+      if (paths[left]![1] === paths[right]![1]) {
+        issues.push(`${paths[left]![0]} and ${paths[right]![0]} must use dedicated storage`);
+      }
+    }
+  }
+  return issues;
+}
+
+function parseConfigJson(raw: string): ParsedConfig {
+  let parsedJson: unknown;
+  try {
+    parsedJson = JSON.parse(raw);
+  } catch {
+    throw new InvalidLocalAppConfigError(["<root>: config file is not valid JSON"]);
+  }
+  const parsed = configSchema.safeParse(parsedJson);
+  if (!parsed.success) throw new InvalidLocalAppConfigError(formatZodIssues(parsed.error));
+  const issues = semanticIssues(parsed.data);
+  if (issues.length > 0) throw new InvalidLocalAppConfigError(issues);
+  return parsed.data;
+}
+
+function optionalNumber<T extends string>(
+  key: T,
+  value: number | undefined,
+): {} | Readonly<Record<T, number>> {
+  return value === undefined ? {} : { [key]: value } as Readonly<Record<T, number>>;
+}
+
+function localContextConfig(
+  baseDir: string,
+  parsed: NonNullable<ParsedConfig["context"]>,
+): LocalContextConfig {
+  return {
+    semanticStatePath: absoluteFrom(baseDir, parsed.semanticStatePath),
+    ingestionStatePath: absoluteFrom(baseDir, parsed.ingestionStatePath),
+    artifactStoreRoot: absoluteFrom(baseDir, parsed.artifactStoreRoot),
+    sources: parsed.sources.map((source) => ({ ...source })),
+    ...optionalNumber("maxBudgetTokens", parsed.maxBudgetTokens),
+    ...optionalNumber("maxIdentityCandidates", parsed.maxIdentityCandidates),
+    ...optionalNumber("maxIdentityScans", parsed.maxIdentityScans),
+    ...optionalNumber("maxRelationCandidates", parsed.maxRelationCandidates),
+    ...optionalNumber("maxRelationScans", parsed.maxRelationScans),
+    ...optionalNumber("maxRelationEdges", parsed.maxRelationEdges),
+    ...optionalNumber("syncPageSize", parsed.syncPageSize),
+    ...optionalNumber("syncMaxPages", parsed.syncMaxPages),
+  };
+}
+
+function runtimeConfig(
+  configPath: string,
+  parsed: ParsedConfig,
+): LocalAppConfig {
+  const baseDir = dirname(configPath);
+  const journalPath = absoluteFrom(baseDir, parsed.journalPath);
+  const context = parsed.context === undefined ? undefined : localContextConfig(baseDir, parsed.context);
+  const storageIssues = validateContextStoragePaths(journalPath, context);
+  if (storageIssues.length > 0) throw new InvalidLocalAppConfigError(storageIssues);
+  return {
+    schemaVersion: "1",
+    configPath,
+    journalPath,
+    ...(context === undefined ? {} : { context }),
+    principal: {
+      subject: parsed.principal.subject,
+      scopes: [...parsed.principal.scopes],
+    },
+    providers: parsed.providers.map((provider) => ({
+      id: provider.id,
+      root: absoluteFrom(baseDir, provider.root),
+      manifest: provider.manifest as ConnectorManifest,
+    })),
+    entities: parsed.entities.map((entity) => ({
+      entityId: entity.entityId as EntityId,
+      aliases: [...entity.aliases],
+      bindings: entity.bindings.map((binding) => ({ ...binding })),
+      authority: entity.authority.map((rule) => ({ ...rule })),
+    })),
+    policy: {
+      operations: { ...parsed.policy.operations },
+      fields: parsed.policy.fields.map((grant) => ({
+        entityId: grant.entityId as EntityId,
+        property: grant.property,
+        ...(grant.providers === undefined ? {} : { providers: [...grant.providers] }),
+        read: grant.read,
+        write: grant.write,
+      })),
+    },
+  };
+}
+
+function configWarnings(mode: number): string[] {
+  if (process.platform === "win32" || (mode & 0o022) === 0) return [];
+  return ["config file is group/world writable"];
 }
 
 export async function loadLocalAppConfig(
@@ -381,63 +736,10 @@ export async function loadLocalAppConfig(
   readonly warnings: readonly string[];
 }> {
   const configPath = resolve(configPathInput);
-  const [raw, info] = await Promise.all([
-    readFile(configPath, "utf8"),
-    stat(configPath),
-  ]);
-
-  let parsedJson: unknown;
-  try {
-    parsedJson = JSON.parse(raw);
-  } catch {
-    throw new InvalidLocalAppConfigError(["<root>: config file is not valid JSON"]);
-  }
-
-  const parsed = configSchema.safeParse(parsedJson);
-  if (!parsed.success) {
-    throw new InvalidLocalAppConfigError(formatZodIssues(parsed.error));
-  }
-
-  const issues = semanticIssues(parsed.data);
-  if (issues.length > 0) {
-    throw new InvalidLocalAppConfigError(issues);
-  }
-
-  const baseDir = dirname(configPath);
-  const config: LocalAppConfig = {
-    schemaVersion: "1",
-    configPath,
-    journalPath: absoluteFrom(baseDir, parsed.data.journalPath),
-    principal: {
-      subject: parsed.data.principal.subject,
-      scopes: [...parsed.data.principal.scopes],
-    },
-    providers: parsed.data.providers.map((provider) => ({
-      id: provider.id,
-      root: absoluteFrom(baseDir, provider.root),
-      manifest: provider.manifest as ConnectorManifest,
-    })),
-    entities: parsed.data.entities.map((entity) => ({
-      entityId: entity.entityId as EntityId,
-      bindings: entity.bindings.map((binding) => ({ ...binding })),
-      authority: entity.authority.map((rule) => ({ ...rule })),
-    })),
-    policy: {
-      operations: { ...parsed.data.policy.operations },
-      fields: parsed.data.policy.fields.map((grant) => ({
-        entityId: grant.entityId as EntityId,
-        property: grant.property,
-        ...(grant.providers === undefined ? {} : { providers: [...grant.providers] }),
-        read: grant.read,
-        write: grant.write,
-      })),
-    },
+  const [raw, info] = await Promise.all([readFile(configPath, "utf8"), stat(configPath)]);
+  const parsed = parseConfigJson(raw);
+  return {
+    config: runtimeConfig(configPath, parsed),
+    warnings: configWarnings(info.mode),
   };
-
-  const warnings: string[] = [];
-  if (process.platform !== "win32" && (info.mode & 0o022) !== 0) {
-    warnings.push("config file is group/world writable");
-  }
-
-  return { config, warnings };
 }

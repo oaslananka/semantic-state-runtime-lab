@@ -473,6 +473,8 @@ export interface MarkdownAuthoritativeIngestionOptions {
   readonly manifest: ConnectorManifest;
   readonly externalType: string;
   readonly entityIdForExternalId: (externalId: string) => EntityId;
+  readonly externalIds?: readonly string[];
+  readonly rejectUnlistedExternalIds?: boolean;
   readonly pageSize?: number;
   readonly maxFiles?: number;
   readonly maxRawBytes?: number;
@@ -509,6 +511,14 @@ export class InvalidMarkdownContinuationError extends Error {
   constructor(readonly continuation: string) {
     super(`Invalid or expired Markdown full-scan continuation: ${continuation}`);
     this.name = "InvalidMarkdownContinuationError";
+  }
+}
+
+
+export class UnconfiguredMarkdownIngestionSourceError extends Error {
+  constructor(readonly externalId: string) {
+    super(`Markdown ingestion source ${externalId} is not in the configured authoritative inventory`);
+    this.name = "UnconfiguredMarkdownIngestionSourceError";
   }
 }
 
@@ -572,28 +582,67 @@ function portableExternalId(root: string, file: string): string {
   return relative(root, file).split(sep).join("/");
 }
 
-async function authoritativeMarkdownFiles(root: string, maxFiles: number): Promise<string[]> {
-  const files: string[] = [];
-  async function walk(directory: string): Promise<void> {
-    const entries = await readdir(directory, { withFileTypes: true });
-    for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
-      if (entry.isSymbolicLink()) continue;
-      const child = resolve(directory, entry.name);
-      if (entry.isDirectory()) {
-        await walk(child);
-        continue;
-      }
-      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
-        files.push(child);
-        if (files.length > maxFiles) {
-          throw new MarkdownScanLimitError(
-            `Markdown scan found more than maxFiles ${maxFiles}`,
-          );
-        }
-      }
+interface MarkdownInventoryOptions {
+  readonly root: string;
+  readonly maxFiles: number;
+  readonly externalIds?: ReadonlySet<string>;
+  readonly rejectUnlistedExternalIds: boolean;
+}
+
+function acceptMarkdownInventoryFile(
+  externalId: string,
+  options: MarkdownInventoryOptions,
+): boolean {
+  if (options.externalIds === undefined || options.externalIds.has(externalId)) return true;
+  if (options.rejectUnlistedExternalIds) {
+    throw new UnconfiguredMarkdownIngestionSourceError(externalId);
+  }
+  return false;
+}
+
+function addMarkdownInventoryFile(
+  files: string[],
+  child: string,
+  options: MarkdownInventoryOptions,
+): void {
+  const externalId = portableExternalId(options.root, child);
+  if (!acceptMarkdownInventoryFile(externalId, options)) return;
+  files.push(child);
+  if (files.length > options.maxFiles) {
+    throw new MarkdownScanLimitError(`Markdown scan found more than maxFiles ${options.maxFiles}`);
+  }
+}
+
+async function walkMarkdownInventory(
+  directory: string,
+  files: string[],
+  options: MarkdownInventoryOptions,
+): Promise<void> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
+    if (entry.isSymbolicLink()) continue;
+    const child = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      await walkMarkdownInventory(child, files, options);
+    } else if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+      addMarkdownInventoryFile(files, child, options);
     }
   }
-  await walk(root);
+}
+
+async function authoritativeMarkdownFiles(
+  root: string,
+  maxFiles: number,
+  externalIds?: ReadonlySet<string>,
+  rejectUnlistedExternalIds = false,
+): Promise<string[]> {
+  const files: string[] = [];
+  await walkMarkdownInventory(root, files, {
+    root,
+    maxFiles,
+    ...(externalIds === undefined ? {} : { externalIds }),
+    rejectUnlistedExternalIds,
+  });
   return files;
 }
 
@@ -680,6 +729,8 @@ implements
   readonly #manifest: ConnectorManifest;
   readonly #mapping: ConnectorManifest["entities"][number];
   readonly #entityIdForExternalId: (externalId: string) => EntityId;
+  readonly #externalIds: ReadonlySet<string> | undefined;
+  readonly #rejectUnlistedExternalIds: boolean;
   readonly #pageSize: number;
   readonly #maxFiles: number;
   readonly #maxRawBytes: number;
@@ -691,6 +742,19 @@ implements
     this.#manifest = options.manifest;
     this.#mapping = matchingEntityMapping(options.manifest, options.externalType);
     this.#entityIdForExternalId = options.entityIdForExternalId;
+    if (options.externalIds === undefined) {
+      this.#externalIds = undefined;
+    } else {
+      const normalized = options.externalIds.map((externalId) => {
+        externalIdSegments(externalId);
+        return externalId;
+      });
+      if (new Set(normalized).size !== normalized.length) {
+        throw new TypeError("Markdown externalIds must be unique");
+      }
+      this.#externalIds = new Set(normalized);
+    }
+    this.#rejectUnlistedExternalIds = options.rejectUnlistedExternalIds ?? false;
     this.#pageSize = positiveSafeInteger(options.pageSize ?? 128, "Markdown pageSize");
     this.#maxFiles = positiveSafeInteger(options.maxFiles ?? 10_000, "Markdown maxFiles");
     this.#maxRawBytes = positiveSafeInteger(
@@ -701,7 +765,12 @@ implements
 
   async #scan(): Promise<MarkdownScanSession> {
     const root = await realpath(this.#root);
-    const files = await authoritativeMarkdownFiles(root, this.#maxFiles);
+    const files = await authoritativeMarkdownFiles(
+      root,
+      this.#maxFiles,
+      this.#externalIds,
+      this.#rejectUnlistedExternalIds,
+    );
 
     const entries: MarkdownScanEntry[] = [];
     let rawBytes = 0;

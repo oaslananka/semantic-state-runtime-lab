@@ -9,7 +9,7 @@ It combines:
 - principal-scoped field policy
 - the state-bound Runtime Host
 - file-backed SQLite journal evidence
-- the two-tool MCP adapter
+- the state MCP tools, plus optional `context.compile` and artifact resources
 - stdio transport
 
 It does not open a network listener.
@@ -33,9 +33,19 @@ Paths are resolved relative to the config file unless they are absolute.
 {
   "schemaVersion": "1",
   "journalPath": "./state/runtime.sqlite",
+  "context": {
+    "semanticStatePath": "./state/semantic.sqlite",
+    "ingestionStatePath": "./state/ingestion.sqlite",
+    "artifactStoreRoot": "./state/artifacts",
+    "sources": [
+      { "provider": "source", "externalType": "markdown" },
+      { "provider": "replica", "externalType": "markdown" }
+    ],
+    "maxBudgetTokens": 512
+  },
   "principal": {
     "subject": "user:local",
-    "scopes": ["state:read", "state:write"]
+    "scopes": ["state:read", "state:write", "context:read"]
   },
   "providers": [
     {
@@ -102,6 +112,7 @@ Paths are resolved relative to the config file unless they are absolute.
   "entities": [
     {
       "entityId": "entity://project/atlas",
+      "aliases": ["Project Atlas", "Atlas"],
       "bindings": [
         {
           "provider": "source",
@@ -141,6 +152,8 @@ Paths are resolved relative to the config file unless they are absolute.
 
 A binding does not repeat field capability metadata. Its readable/writable fields are derived from the referenced connector manifest and can only be narrowed by policy.
 
+The `context` block is optional. Without it, the local app remains state-only and does not expose `context.compile`. With it, `sources` is an explicit allowlist of authoritative context source mappings. A source is identified by `(provider, externalType)` and must match exactly one manifest entity mapping. Only bindings that participate in those configured sources enter the Context Plane.
+
 ## Startup validation
 
 Before the stdio protocol loop begins, the app validates:
@@ -154,6 +167,13 @@ Before the stdio protocol loop begins, the app validates:
 - principal scope consistency
 - Markdown external IDs
 - provider roots as existing directories
+- unique context sources and exact `(provider, externalType)` manifest mapping
+- at least one binding for each configured context source
+- explicit aliases for context-participating entities
+- normalized alias uniqueness
+- duplicate `(provider, externalId)` context bindings
+- dedicated journal / semantic-state / ingestion-state / artifact metadata paths
+- `context:read` when context is enabled
 
 The SQLite journal is opened only after config and provider-root validation complete.
 
@@ -164,6 +184,36 @@ On POSIX systems a group/world-writable config file emits a warning to stderr.
 Markdown `externalId` values must be relative `.md` paths using forward slashes. Absolute paths, parent traversal, dot segments, empty segments, backslashes, and NUL bytes are rejected.
 
 The Markdown connector also resolves the target through `realpath()` and rejects symbolic-link escapes outside the configured root.
+
+## Local Context Plane
+
+When `context` is configured, the local process composes one knowledge path:
+
+```text
+configured Markdown sources
+  -> authoritative ingestion
+  -> SQLite ingestion state
+  -> SQLite Semantic State Store
+  -> Local Artifact Store
+  -> semantic change feed
+  -> incremental Context Capsules
+  -> ContextAccessGateway
+  -> MCP context.compile
+```
+
+There is no direct `RuntimeHost -> context` shortcut. Semantic context and raw artifacts come from the same mapped ingestion round, so artifact projection cannot lag behind an already-persisted semantic-only mapped plan.
+
+Configured aliases are seeded as deterministic append-only semantic alias evidence. Adding an alias is supported. Removing or renaming a previously persisted config-owned alias fails closed in v1 because alias validity/retraction is not yet modeled.
+
+The in-memory capsule cache is derived and rebuildable. Restarting with the same durable stores replays the semantic change feed and reconstructs current capsules.
+
+### Freshness and authoritative inventory
+
+Before `context.compile` is delegated to the Context Access Gateway, the local runtime synchronizes every configured context source. Concurrent requests coalesce one in-flight synchronization round. Artifact list/read uses the same shared source synchronizer.
+
+For Markdown v1 this synchronization is correctness-first: the connector performs an authoritative recursive full scan. Files under a configured authoritative root that are not present in the configured external-ID inventory cause the local context synchronization to fail closed. The MCP boundary returns a sanitized internal error and does not fall back to stale cached context.
+
+This means request latency is currently O(configured Markdown inventory). Filesystem watchers may later be used as wake-up or dirty hints, but they are not a correctness source and no production latency claim is made for request-time full scans.
 
 ## Policy
 
@@ -178,7 +228,7 @@ effective read  = connector read capability  AND policy read grant
 effective write = connector write capability AND policy write grant
 ```
 
-A policy grant can optionally restrict a canonical property to named providers.
+A policy grant can optionally restrict a canonical property to named providers. Canonical context still requires `context:read`; entity/property visibility is filtered by the configured field read grants. Markdown-only local context exposes no inferred relations. Provenance IDs are hidden unless the principal also has `artifact:read`. Raw artifacts are never granted merely because `context:read` is present.
 
 The proposal digest is never an authorization credential. `state.apply` re-evaluates current policy and live provider state before any external write.
 
@@ -188,8 +238,10 @@ Reconciliation evidence is stored in the configured SQLite file.
 
 Restarting the local process with the same journal path preserves prior event history. Journal actor evidence contains only the principal subject; scopes and credentials are not persisted.
 
+When context is enabled, semantic state, ingestion receipts/projections, and raw artifact versions use separate durable stores. Reusing persistent context storage with a changed source/storage topology fails closed unless an explicit migration or fresh context store is used.
+
 ## Verification
 
 The repository test suite covers real Markdown and SQLite behavior with the MCP adapter.
 
-The separate build-after-test stdio smoke gate spawns `dist/cli.js` as a real child process through the official MCP `StdioClientTransport`. It verifies tool discovery, planning, apply, stale-digest rejection, denied-field redaction, journal creation, restart, and that invalid startup writes nothing to stdout.
+The separate build-after-test stdio smoke gate spawns `dist/cli.js` as a real child process through the official MCP `StdioClientTransport`. It verifies tool discovery, planning, apply, stale-digest rejection, denied-field redaction, real `context.compile`, semantic/artifact persistence, restart, and that invalid startup writes nothing to stdout. The in-process composition tests additionally cover edits, field/file deletion retractions, strict unknown-file failure, stale-context suppression, alias drift, artifact scope, source-sync coalescing, and same-revision semantic/artifact projection.
