@@ -1,7 +1,6 @@
 import { mkdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { MarkdownFilesystemConnector } from "@ssrl/connector-markdown-fs";
-import type { ConnectorEntityMapping } from "@ssrl/connector-sdk";
 import type {
   AuthorityRule,
   ExternalBinding,
@@ -26,28 +25,15 @@ import {
   type LocalPolicyFieldGrant,
   type LocalProviderConfig,
 } from "./config.js";
-
-function mappingFor(
-  provider: LocalProviderConfig,
-  binding: LocalEntityBindingConfig,
-): ConnectorEntityMapping {
-  const mapping = provider.manifest.entities.find(
-    (candidate) => candidate.canonicalType === binding.canonicalType,
-  );
-  if (mapping === undefined) {
-    throw new Error(
-      `Provider ${provider.id} does not declare canonical type ${binding.canonicalType}`,
-    );
-  }
-  return mapping;
-}
+import { createLocalContextRuntime } from "./local-context.js";
+import { providerEntityMapping } from "./provider-mapping.js";
 
 function externalBinding(
   entity: LocalEntityConfig,
   binding: LocalEntityBindingConfig,
   provider: LocalProviderConfig,
 ): ExternalBinding {
-  const mapping = mappingFor(provider, binding);
+  const mapping = providerEntityMapping(provider, binding.canonicalType);
   return {
     entityId: entity.entityId,
     provider: provider.id,
@@ -162,6 +148,7 @@ export interface LocalRuntimeApp {
   readonly host: RuntimeHost;
   readonly principal: RuntimePrincipal;
   readonly journal: SQLiteEventJournal;
+  readonly context?: Awaited<ReturnType<typeof createLocalContextRuntime>>;
   createMcpServer(): ReturnType<typeof createRuntimeMcpServer>;
   close(): void;
 }
@@ -198,6 +185,13 @@ export async function createLocalRuntimeApp(
 
   await mkdir(dirname(config.journalPath), { recursive: true });
   const journal = new SQLiteEventJournal({ path: config.journalPath });
+  let contextRuntime: Awaited<ReturnType<typeof createLocalContextRuntime>>;
+  try {
+    contextRuntime = await createLocalContextRuntime(config);
+  } catch (cause) {
+    journal.close();
+    throw cause;
+  }
   const principal: RuntimePrincipal = {
     subject: config.principal.subject,
     scopes: [...config.principal.scopes],
@@ -215,10 +209,17 @@ export async function createLocalRuntimeApp(
     host,
     principal,
     journal,
+    ...(contextRuntime === undefined ? {} : { context: contextRuntime }),
     createMcpServer() {
       return createRuntimeMcpServer({
         host,
         principal,
+        ...(contextRuntime === undefined
+          ? {}
+          : {
+              context: { gateway: contextRuntime.gateway },
+              artifacts: { gateway: contextRuntime.artifactGateway },
+            }),
         name: "ssrl-local",
         version: "0.1.0",
       });
@@ -226,6 +227,7 @@ export async function createLocalRuntimeApp(
     close() {
       if (closed) return;
       closed = true;
+      contextRuntime?.close();
       journal.close();
     },
   };
@@ -246,3 +248,7 @@ export async function loadAndCreateLocalRuntimeApp(
 }
 
 export * from "./config.js";
+export {
+  LocalContextAliasRemovalUnsupportedError,
+  LocalContextConfigurationDriftError,
+} from "./local-context.js";

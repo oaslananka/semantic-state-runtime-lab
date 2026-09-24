@@ -12,7 +12,13 @@
     "@ssrl/runtime-host": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
     "zod": "4.6.5",
-    "@modelcontextprotocol/server": "2.1.0"
+    "@modelcontextprotocol/server": "2.1.0",
+    "@ssrl/context-access": "workspace:*",
+    "@ssrl/ingestion": "workspace:*",
+    "@ssrl/materializer": "workspace:*",
+    "@ssrl/storage-local-artifacts": "workspace:*",
+    "@ssrl/state-store": "workspace:*",
+    "@ssrl/artifact-access": "workspace:*"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.1.0",

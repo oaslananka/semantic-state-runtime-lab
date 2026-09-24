@@ -255,6 +255,39 @@ describe("MarkdownAuthoritativeIngestionAdapter", () => {
     expect(third.changes[0]?.changeId).not.toBe(first.changes[0]?.changeId);
   });
 
+  it("scopes authoritative inventory to explicit configured external ids", async () => {
+    const root = await vault();
+    await note(root, "Projects/Atlas.md", "active");
+    await note(root, "Private/Unconfigured.md", "secret");
+    const source = adapter(root, {
+      externalIds: ["Projects/Atlas.md"],
+      maxFiles: 1,
+      entityIdForExternalId: (externalId) => {
+        if (externalId !== "Projects/Atlas.md") throw new Error("unconfigured identity reached mapper");
+        return atlas;
+      },
+    });
+
+    const page = await fullPage(source);
+    expect(page.changes.map((change) => change.externalId)).toEqual(["Projects/Atlas.md"]);
+  });
+
+  it("can fail closed when an authoritative root contains an unconfigured Markdown id", async () => {
+    const root = await vault();
+    await note(root, "Projects/Atlas.md", "active");
+    await note(root, "Private/Unconfigured.md", "secret");
+    const source = adapter(root, {
+      externalIds: ["Projects/Atlas.md"],
+      rejectUnlistedExternalIds: true,
+      entityIdForExternalId: () => atlas,
+    });
+
+    await expect(fullPage(source)).rejects.toMatchObject({
+      name: "UnconfiguredMarkdownIngestionSourceError",
+      externalId: "Private/Unconfigured.md",
+    });
+  });
+
   it("keeps raw body and unmapped frontmatter out of SourceChange payload", async () => {
     const root = await vault();
     await note(root, "Projects/Atlas.md", "active", {

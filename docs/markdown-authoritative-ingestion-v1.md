@@ -68,6 +68,8 @@ An unchanged byte-identical inventory therefore produces the same checkpoint and
 
 The adapter still performs the full scan on the next round. Stable checkpoint identity is replay/accounting information, not a promise that the filesystem was not rescanned.
 
+The adapter can optionally receive an explicit `externalIds` inventory. By default this scopes the scan to those IDs. Deployments that treat the configured root as a closed authoritative namespace can also enable `rejectUnlistedExternalIds`; then any additional Markdown file fails the scan instead of being silently ignored. The local Node Context Plane uses this strict mode.
+
 ## Full-scan pagination
 
 A multi-page full scan captures one in-memory session:
@@ -212,7 +214,7 @@ The real filesystem test covers:
 12. rename test verifies delete(old path) + upsert(new path);
 13. scan-to-artifact race aborts before artifact mutation, semantic append, projection, or checkpoint advancement.
 
-Separate adversarial tests cover symlinks, invalid UTF-8, deleted-after-scan files, expired continuations, `maxFiles`, and `maxRawBytes`.
+Separate adversarial tests cover symlinks, invalid UTF-8, deleted-after-scan files, expired continuations, explicit external-ID scoping, strict unlisted-file failure, `maxFiles`, and `maxRawBytes`.
 
 ## Performance benchmark
 
