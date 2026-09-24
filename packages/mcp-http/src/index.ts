@@ -13,6 +13,7 @@ import {
 import {
   createRuntimeMcpServer,
   type RuntimeMcpArtifactOptions,
+  type RuntimeMcpContextOptions,
   type RuntimeMcpScopeOptions,
 } from "@ssrl/mcp-server";
 import type { RuntimeHost } from "@ssrl/runtime-host";
@@ -40,6 +41,7 @@ export interface AuthenticatedRuntimeMcpHttpOptions {
   readonly verifier: OAuthTokenVerifier;
   readonly principalMapper: McpAuthPrincipalMapper;
   readonly artifacts?: RuntimeMcpArtifactOptions;
+  readonly context?: RuntimeMcpContextOptions;
   readonly endpointScopes?: readonly string[];
   readonly operationScopes?: RuntimeMcpScopeOptions;
   readonly resourceMetadataUrl?: string;
@@ -124,6 +126,7 @@ export const DEFAULT_REMOTE_MCP_OPERATION_SCOPES: RuntimeMcpScopeOptions = {
   plan: ["state:read"],
   apply: ["state:write"],
   artifacts: ["artifact:read"],
+  context: ["context:read"],
 } as const;
 
 export function createAuthenticatedRuntimeMcpHttpHandler(
@@ -150,6 +153,7 @@ export function createAuthenticatedRuntimeMcpHttpHandler(
       host: options.host,
       principal,
       ...(options.artifacts === undefined ? {} : { artifacts: options.artifacts }),
+      ...(options.context === undefined ? {} : { context: options.context }),
       scopes: options.operationScopes ?? DEFAULT_REMOTE_MCP_OPERATION_SCOPES,
       ...(options.name === undefined ? {} : { name: options.name }),
       ...(options.version === undefined ? {} : { version: options.version }),

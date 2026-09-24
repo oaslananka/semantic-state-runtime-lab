@@ -174,7 +174,8 @@ Remote v1 defaults to these coarse operation scopes:
 {
   plan: ["state:read"],
   apply: ["state:write"],
-  artifacts: ["artifact:read"]
+  artifacts: ["artifact:read"],
+  context: ["context:read"]
 }
 ```
 
@@ -189,11 +190,14 @@ These scopes are **coarse preconditions only**.
 They do not replace:
 
 - RuntimeHost operation/field/proposal policy;
-- ArtifactAccessGateway resource/version policy.
+- ArtifactAccessGateway resource/version policy;
+- ContextAccessGateway operation/entity/property/relation/provenance policy.
 
 A bearer with `artifact:read` can still receive zero resources or not-found semantics because SSRL resource policy denies that specific artifact.
 
 Likewise a bearer with `state:read` can still receive an `access_denied` tool result for an entity denied by RuntimeHost policy.
+
+A bearer with `context:read` can likewise still receive a sanitized `access_denied` result because `ContextAccessGateway` remains authoritative after the coarse MCP scope preflight. A bearer without `context:read` receives a request-time `403 insufficient_scope` before the context gateway callback runs. The bearer identity is mapped to the server-side principal; the MCP tool input has no principal field and cannot override it.
 
 ## Host and Origin validation
 
