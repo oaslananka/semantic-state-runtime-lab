@@ -1,6 +1,7 @@
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import {
   MCP_TOOL_NAMES,
@@ -214,6 +215,35 @@ async function exists(path: string): Promise<boolean> {
   }
 }
 
+function fullSyncGenerationCounts(path: string): number[] {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    const rows = db.prepare(`
+      SELECT source_key, COUNT(*) AS count
+      FROM ingestion_full_sync_generations
+      GROUP BY source_key
+      ORDER BY source_key
+    `).all() as unknown as { readonly count: number | bigint }[];
+    return rows.map((row) => Number(row.count)).toSorted((left, right) => left - right);
+  } finally {
+    db.close();
+  }
+}
+
+async function waitFor<T>(
+  operation: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 2_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await operation();
+    if (predicate(value)) return value;
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for local context refresh");
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
+
 async function connect(app: LocalRuntimeApp) {
   const server = app.createMcpServer();
   const client = new Client({
@@ -360,6 +390,38 @@ describe("local Node composition", () => {
       const sharedStorage = contextConfigObject();
       sharedStorage.context.semanticStatePath = sharedStorage.journalPath;
       await expectInvalidConfig(fx, sharedStorage, "dedicated storage");
+    } finally {
+      await rm(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  it("validates source verification age and defaults to always-verify mode", async () => {
+    const fx = await fixture();
+    try {
+      const baseline = contextConfigObject();
+      await writeConfig(fx, baseline);
+      const loaded = await loadLocalAppConfig(fx.configPath);
+      expect(loaded.config.context?.sourceVerificationMaxAgeMs).toBe(0);
+
+      const enabledBase = contextConfigObject();
+      const enabled = {
+        ...enabledBase,
+        context: { ...enabledBase.context, sourceVerificationMaxAgeMs: 60_000 },
+      };
+      await writeConfig(fx, enabled);
+      expect((await loadLocalAppConfig(fx.configPath)).config.context?.sourceVerificationMaxAgeMs)
+        .toBe(60_000);
+
+      for (const invalidAge of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+        const invalidBase = contextConfigObject();
+        const invalid = {
+          ...invalidBase,
+          context: { ...invalidBase.context, sourceVerificationMaxAgeMs: invalidAge },
+        };
+        await writeConfig(fx, invalid);
+        await expect(loadLocalAppConfig(fx.configPath))
+          .rejects.toBeInstanceOf(InvalidLocalAppConfigError);
+      }
     } finally {
       await rm(fx.root, { recursive: true, force: true });
     }
@@ -689,6 +751,135 @@ describe("local Node composition", () => {
     } finally {
       if (connection !== undefined) await connection.close();
       app?.close();
+      await rm(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  it("uses watcher dirty hints to skip clean scans and rescan only the changed root", async () => {
+    const fx = await fixture();
+    const baseConfig = contextConfigObject();
+    const config = {
+      ...baseConfig,
+      context: { ...baseConfig.context, sourceVerificationMaxAgeMs: 60_000 },
+    };
+    let app: LocalRuntimeApp | undefined;
+    let connection: Awaited<ReturnType<typeof connect>> | undefined;
+    try {
+      await writeFile(fx.configPath, JSON.stringify(config, null, 2), "utf8");
+      ({ app } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+      connection = await connect(app);
+
+      const first = mcpContextCompileOutputSchema.parse(
+        (await compileContext(connection)).structuredContent,
+      );
+      expect(first.records.some((record) => record.text.includes("2026-11-20"))).toBe(true);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 1]);
+
+      await compileContext(connection);
+      await compileContext(connection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 1]);
+
+      const current = await readFile(join(fx.primary, "project.md"), "utf8");
+      await writeFile(
+        join(fx.primary, "project.md"),
+        current.replace('deadline: "2026-11-20"', 'deadline: "2026-12-17"'),
+        "utf8",
+      );
+      const refreshed = await waitFor(
+        async () => mcpContextCompileOutputSchema.parse(
+          (await compileContext(connection!)).structuredContent,
+        ),
+        (output) => output.records.some((record) => record.text.includes("2026-12-17")),
+      );
+      expect(refreshed.records.some((record) => record.text.includes("2026-12-17"))).toBe(true);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 2]);
+
+      await compileContext(connection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 2]);
+
+      await rm(join(fx.primary, "project.md"));
+      const afterDelete = await waitFor(
+        async () => mcpContextCompileOutputSchema.parse(
+          (await compileContext(connection!)).structuredContent,
+        ),
+        (output) => output.records.every((record) => !record.text.includes("2026-12-17")),
+      );
+      expect(afterDelete.records.every((record) => !record.text.includes("2026-12-17"))).toBe(true);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 3]);
+
+      await compileContext(connection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 3]);
+    } finally {
+      if (connection !== undefined) await connection.close();
+      app?.close();
+      await rm(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  it("verifies every source again after restart even when the capsule cache is warm", async () => {
+    const fx = await fixture();
+    const base = contextConfigObject();
+    const config = {
+      ...base,
+      context: { ...base.context, sourceVerificationMaxAgeMs: 60_000 },
+    };
+    let first: LocalRuntimeApp | undefined;
+    let second: LocalRuntimeApp | undefined;
+    let firstConnection: Awaited<ReturnType<typeof connect>> | undefined;
+    let secondConnection: Awaited<ReturnType<typeof connect>> | undefined;
+    try {
+      await writeFile(fx.configPath, JSON.stringify(config, null, 2), "utf8");
+      ({ app: first } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+      firstConnection = await connect(first);
+      await compileContext(firstConnection);
+      await compileContext(firstConnection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([1, 1]);
+      await firstConnection.close();
+      firstConnection = undefined;
+      first.close();
+      first = undefined;
+
+      ({ app: second } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+      secondConnection = await connect(second);
+      await compileContext(secondConnection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([2, 2]);
+      await compileContext(secondConnection);
+      expect(fullSyncGenerationCounts(fx.ingestionStatePath)).toEqual([2, 2]);
+    } finally {
+      if (secondConnection !== undefined) await secondConnection.close();
+      if (firstConnection !== undefined) await firstConnection.close();
+      second?.close();
+      first?.close();
+      await rm(fx.root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat verification max age as persistent source-topology drift", async () => {
+    const fx = await fixture();
+    let first: LocalRuntimeApp | undefined;
+    let second: LocalRuntimeApp | undefined;
+    try {
+      const initialBase = contextConfigObject();
+      const initial = {
+        ...initialBase,
+        context: { ...initialBase.context, sourceVerificationMaxAgeMs: 5_000 },
+      };
+      await writeFile(fx.configPath, JSON.stringify(initial, null, 2), "utf8");
+      ({ app: first } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+      first.close();
+      first = undefined;
+
+      const changedBase = contextConfigObject();
+      const changed = {
+        ...changedBase,
+        context: { ...changedBase.context, sourceVerificationMaxAgeMs: 60_000 },
+      };
+      await writeFile(fx.configPath, JSON.stringify(changed, null, 2), "utf8");
+      ({ app: second } = await loadAndCreateLocalRuntimeApp(fx.configPath));
+      expect(second.context).toBeDefined();
+    } finally {
+      second?.close();
+      first?.close();
       await rm(fx.root, { recursive: true, force: true });
     }
   });

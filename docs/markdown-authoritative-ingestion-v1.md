@@ -21,9 +21,7 @@ The design is intentionally correctness-first. It does **not** claim that a port
 
 ## Why full scan is authoritative
 
-Node's `fs.watch()` documentation still warns that watcher behavior is not completely consistent across platforms, can be unreliable or impossible on NFS/SMB and virtualized host filesystems, and does not guarantee a filename on every event. Watch events may be useful later as wake-up or dirty hints, but v1 never treats them as replay truth.
-
-Every synchronization round therefore starts with:
+Node's `fs.watch()` documentation still warns that watcher behavior is not completely consistent across platforms, can be unreliable or impossible on NFS/SMB and virtualized host filesystems, and does not guarantee a filename on every event. The local Node composition can now use `fs.watch()` only as a wake-up/dirty hint with bounded age verification. The connector itself still never treats notifications as replay truth. Whenever verification is required, synchronization starts with:
 
 ```text
 incremental request
@@ -225,33 +223,27 @@ pnpm build
 pnpm benchmark:markdown:v1
 ```
 
-The deterministic workload creates 100 and 1,000 small synthetic Markdown notes and measures:
+The deterministic workload now creates 100, 1,000, and 10,000 small synthetic Markdown notes. It measures the same correctness-first full-scan path and separately measures the verification gate when the source is known clean.
 
-```text
-recursive enumeration
-+ exact byte reads
-+ SHA-256
-+ strict UTF-8 decode
-+ YAML/frontmatter parsing
-+ configured field extraction
-```
+A local 2026-09-24 run measured:
 
-A local 2026-09-24 run measured approximately:
+| Notes | Raw bytes | Authoritative scan | Dirty verify | 25 clean gate accesses |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 19,812 | 59.89 ms | 40.52 ms | 0.122 ms |
+| 1,000 | 200,112 | 255.81 ms | 224.30 ms | 0.030 ms |
+| 10,000 | 2,021,112 | 2,577.61 ms | 1,864.12 ms | 0.027 ms |
 
-| Notes | Raw bytes | Pages | Scan/parse time |
-| ---: | ---: | ---: | ---: |
-| 100 | 19,812 | 1 | 59 ms |
-| 1,000 | 200,112 | 8 | 262 ms |
+The clean burst caused zero additional Markdown scans. An explicit dirty hint then caused exactly one authoritative verification. Byte-identical authoritative checkpoints remained stable.
 
-These timings are observational, hardware/filesystem dependent, and dominated by small-file overhead. They are **not** a production latency SLO or evidence that full scans scale to very large vaults.
+These timings are observational, hardware/filesystem dependent, and not a production SLO. Clean-burst timing is verification-gate overhead only; it does not include full context compilation, retrieval, MCP transport, or model latency.
 
-The benchmark also verifies that a second byte-identical scan yields the same checkpoint.
+See `docs/source-verification-v1.md` for watcher failure, max-age, restart, and bounded-staleness semantics.
 
 ## Non-goals
 
 v1 does not add:
 
-- `fs.watch()` as a durable cursor;
+- `fs.watch()` as a durable cursor or semantic truth;
 - Obsidian UI/plugin integration;
 - arbitrary binary source files;
 - PDF/OCR/chunk extraction;

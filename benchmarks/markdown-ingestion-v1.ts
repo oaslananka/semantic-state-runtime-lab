@@ -6,13 +6,22 @@ import type { ConnectorManifest } from "../packages/connector-sdk/dist/index.js"
 import { MarkdownAuthoritativeIngestionAdapter } from "../packages/connector-markdown-fs/dist/index.js";
 import type { EntityId } from "../packages/core/dist/index.js";
 import type { SourceContinuation } from "../packages/ingestion/dist/index.js";
+import {
+  CoalescedVerifiedSourceSync,
+  SourceVerificationGate,
+} from "../packages/node-app/dist/source-verification.js";
 
 interface CaseResult {
   readonly notes: number;
   readonly bytes: number;
   readonly pages: number;
   readonly changes: number;
-  readonly elapsedMs: number;
+  readonly authoritativeScanMs: number;
+  readonly dirtyHintVerifyMs: number;
+  readonly cleanHintBurstRequests: number;
+  readonly cleanHintBurstElapsedMs: number;
+  readonly cleanHintMeanMs: number;
+  readonly verificationScans: number;
   readonly mibPerSecond: number;
   readonly checkpointStable: boolean;
 }
@@ -113,17 +122,51 @@ async function runCase(notes: number): Promise<CaseResult> {
     });
     const start = performance.now();
     const first = await fullScan(adapter);
-    const elapsedMs = performance.now() - start;
-    const second = await fullScan(adapter);
+    const authoritativeScanMs = performance.now() - start;
+
+    const gate = new SourceVerificationGate({ maxVerificationAgeMs: 60_000 });
+    let verificationScans = 0;
+    let latestCheckpoint: string | undefined;
+    const sync = new CoalescedVerifiedSourceSync([{
+      id: "markdown",
+      gate,
+      async verify() {
+        verificationScans += 1;
+        latestCheckpoint = (await fullScan(adapter)).checkpoint;
+      },
+    }]);
+    const dirtyStart = performance.now();
+    await sync.run();
+    const dirtyHintVerifyMs = performance.now() - dirtyStart;
+
+    const cleanHintBurstRequests = 25;
+    const scansBeforeCleanBurst = verificationScans;
+    const cleanStart = performance.now();
+    for (let index = 0; index < cleanHintBurstRequests; index += 1) await sync.run();
+    const cleanHintBurstElapsedMs = performance.now() - cleanStart;
+    if (verificationScans !== scansBeforeCleanBurst) {
+      throw new Error(`Clean dirty-hint burst unexpectedly scanned at ${notes} files`);
+    }
+
+    gate.markDirty();
+    await sync.run();
+    if (verificationScans !== 2) {
+      throw new Error(`Dirty hint did not trigger exactly one verification at ${notes} files`);
+    }
     const mib = bytes / (1024 * 1024);
     return {
       notes,
       bytes,
       pages: first.pages,
       changes: first.changes,
-      elapsedMs: Number(elapsedMs.toFixed(2)),
-      mibPerSecond: Number((mib / Math.max(elapsedMs / 1000, Number.EPSILON)).toFixed(2)),
-      checkpointStable: first.checkpoint === second.checkpoint,
+      authoritativeScanMs: Number(authoritativeScanMs.toFixed(2)),
+      dirtyHintVerifyMs: Number(dirtyHintVerifyMs.toFixed(2)),
+      cleanHintBurstRequests,
+      cleanHintBurstElapsedMs: Number(cleanHintBurstElapsedMs.toFixed(3)),
+      cleanHintMeanMs: Number((cleanHintBurstElapsedMs / cleanHintBurstRequests).toFixed(4)),
+      verificationScans,
+      mibPerSecond: Number((mib / Math.max(authoritativeScanMs / 1000, Number.EPSILON)).toFixed(2)),
+      checkpointStable: first.checkpoint === latestCheckpoint,
     };
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -131,10 +174,10 @@ async function runCase(notes: number): Promise<CaseResult> {
 }
 
 const results = [];
-for (const notes of [100, 1_000]) results.push(await runCase(notes));
+for (const notes of [100, 1_000, 10_000]) results.push(await runCase(notes));
 console.log(JSON.stringify({
   benchmark: "markdown-authoritative-ingestion-v1",
   scope: "recursive enumerate + exact byte read + SHA-256 + strict UTF-8 + frontmatter parse/projected-field extraction",
-  note: "Timing is observational. No pass/fail latency threshold or production-scale performance claim is implied.",
+  note: "Timing is observational. Dirty hints never replace authoritative scans; clean bursts measure only the verification gate. No production SLA is implied.",
   results,
 }, null, 2));

@@ -55,6 +55,12 @@ import type {
   LocalProviderConfig,
 } from "./config.js";
 import { providerExternalTypeMapping } from "./provider-mapping.js";
+import {
+  CoalescedVerifiedSourceSync,
+  SourceVerificationGate,
+  createRecursiveFsDirtyHint,
+  type SourceDirtyHint,
+} from "./source-verification.js";
 
 const CONFIG_ALIAS_PREFIX = "local-context-alias-v1:sha256:";
 const COMPOSITION_METADATA_SCHEMA = "ssrl-local-context-composition-v1" as const;
@@ -62,7 +68,9 @@ const COMPOSITION_METADATA_FILE = "local-context-composition-v1.json";
 
 interface LocalContextSource {
   readonly sourceKey: IngestionSourceKey;
+  readonly root: string;
   readonly adapter: MarkdownAuthoritativeIngestionAdapter;
+  readonly verification: SourceVerificationGate;
 }
 
 interface ResolvedContextSource {
@@ -319,7 +327,12 @@ function bindingsFor(
     .toSorted((left, right) => left.externalId.localeCompare(right.externalId));
 }
 
-function contextSources(config: LocalAppConfig): LocalContextSource[] {
+function contextSources(
+  config: LocalAppConfig,
+  monotonicNow?: () => number,
+): LocalContextSource[] {
+  const context = config.context;
+  if (context === undefined) return [];
   const sources: LocalContextSource[] = [];
   for (const source of resolvedContextSources(config)) {
     const mapping = providerExternalTypeMapping(source.provider, source.externalType);
@@ -327,6 +340,11 @@ function contextSources(config: LocalAppConfig): LocalContextSource[] {
     const ids = new Map(bindings.map((binding) => [binding.externalId, binding.entityId]));
     sources.push({
       sourceKey: sourceKey(source.provider.id, mapping.canonicalType, mapping.externalType),
+      root: source.provider.root,
+      verification: new SourceVerificationGate({
+        maxVerificationAgeMs: context.sourceVerificationMaxAgeMs,
+        ...(monotonicNow === undefined ? {} : { monotonicNow }),
+      }),
       adapter: new MarkdownAuthoritativeIngestionAdapter({
         root: source.provider.root,
         manifest: source.provider.manifest,
@@ -344,6 +362,19 @@ function contextSources(config: LocalAppConfig): LocalContextSource[] {
     });
   }
   return sources.toSorted((left, right) => left.sourceKey.localeCompare(right.sourceKey));
+}
+
+function contextSourceDirtyHints(sources: readonly LocalContextSource[]): SourceDirtyHint[] {
+  const gatesByRoot = new Map<string, SourceVerificationGate[]>();
+  for (const source of sources) {
+    if (!source.verification.optimizationEnabled) continue;
+    const gates = gatesByRoot.get(source.root) ?? [];
+    gates.push(source.verification);
+    gatesByRoot.set(source.root, gates);
+  }
+  return [...gatesByRoot.entries()]
+    .toSorted(([left], [right]) => left.localeCompare(right))
+    .map(([root, gates]) => createRecursiveFsDirtyHint(root, gates));
 }
 
 function entityTypes(config: LocalAppConfig): EntityTypeDescriptor[] {
@@ -609,17 +640,27 @@ async function createPersistentStores(config: LocalAppConfig) {
   }
 }
 
+function closePersistentStores(stores: Awaited<ReturnType<typeof createPersistentStores>>): void {
+  stores.artifactStore.close();
+  stores.capsuleStore.close();
+  stores.ingestionState.close();
+  stores.semanticState.close();
+}
+
 export async function createLocalContextRuntime(
   config: LocalAppConfig,
   now: () => string = () => new Date().toISOString(),
+  monotonicNow?: () => number,
 ): Promise<LocalContextRuntime | undefined> {
   const context = config.context;
   if (context === undefined) return undefined;
   await ensureCompositionMetadata(config);
   const stores = await createPersistentStores(config);
+  let sourceDirtyHints: readonly SourceDirtyHint[] = [];
   try {
     await seedContextIdentity(config, stores.semanticState, now);
-    const sources = contextSources(config);
+    const sources = contextSources(config, monotonicNow);
+    sourceDirtyHints = contextSourceDirtyHints(sources);
     const engine = new IngestionEngine({
       semanticState: stores.semanticState,
       ingestionState: stores.ingestionState,
@@ -666,17 +707,21 @@ export async function createLocalContextRuntime(
       ...(context.maxRelationEdges === undefined ? {} : { maxRelationEdges: context.maxRelationEdges }),
       now,
     });
-    const sourceSync = new CoalescedLocalSourceSync(async () => {
-      for (const source of sources) {
+    const sourceSync = new CoalescedVerifiedSourceSync(sources.map((source) => ({
+      id: source.sourceKey,
+      gate: source.verification,
+      async verify() {
         await engine.sync({
           sourceKey: source.sourceKey,
           source: source.adapter,
           mapper: source.adapter,
           artifactMapper: source.adapter,
         });
-      }
-    });
-    const synchronizeSources = () => sourceSync.run();
+      },
+    })));
+    const synchronizeSources = async () => {
+      await sourceSync.run();
+    };
     const artifactGateway = new FreshLocalArtifactGateway({
       store: stores.artifactStore,
       policy: localArtifactPolicy(config),
@@ -696,17 +741,13 @@ export async function createLocalContextRuntime(
       close() {
         if (closed) return;
         closed = true;
-        stores.artifactStore.close();
-        stores.capsuleStore.close();
-        stores.ingestionState.close();
-        stores.semanticState.close();
+        for (const hint of sourceDirtyHints) hint.close();
+        closePersistentStores(stores);
       },
     };
   } catch (error) {
-    stores.artifactStore.close();
-    stores.capsuleStore.close();
-    stores.ingestionState.close();
-    stores.semanticState.close();
+    for (const hint of sourceDirtyHints) hint.close();
+    closePersistentStores(stores);
     throw error;
   }
 }
