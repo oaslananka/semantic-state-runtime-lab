@@ -74,3 +74,11 @@ It is an observational local benchmark, not a production SLA. See `docs/durable-
 `pnpm benchmark:replication:v0` measures the correctness-baseline flat inventory on 1k / 10k / 100k canonical immutable records. It measures record hashing, deterministic inventory-root construction, equal-set comparison, a 10-record-per-side delta, one collision, descriptor JSON size, and observational heap growth.
 
 The benchmark is intentionally **not** a production sync performance claim. It verifies descriptor fingerprints and inventory roots before diffing. At 100k records the payload-free flat descriptor inventory is still roughly 34.3 MB and verified comparison is roughly 6.5 s on the recorded local run, which is evidence that a real WAN protocol needs authenticated Merkle/range set reconciliation while preserving the same record/merge semantics. See `docs/immutable-replication-v0.md`.
+
+## Bounded reconciliation session v1
+
+`pnpm benchmark:replication:sync:v1` measures transport-neutral reconciliation protocol work: equal roots, one-record delta, resumed 10+10 delta, and a deliberately brute-forced 10,000-descriptor hot leaf. Metrics cover remote message count, node hashes, leaf pages, payload-free descriptor count/bytes, and serialized resume-state size.
+
+The normal fixture is 10,000 records with a 12-bit tree because the 100,000-record parity requirement is already exercised in the test suite; keeping the routine benchmark smaller avoids duplicating a load test in every CI run. The hot-leaf fixture is a real 8-bit prefix collision set, not a fake endpoint. Pagination bounds each response but total hot-leaf work remains linear.
+
+This benchmark makes no network-latency claim. See `docs/bounded-reconciliation-session-v1.md`.

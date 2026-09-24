@@ -25,6 +25,11 @@
       "types": "./src/merkle.ts",
       "import": "./dist/merkle.js",
       "default": "./dist/merkle.js"
+    },
+    "./sync": {
+      "types": "./src/sync.ts",
+      "import": "./dist/sync.js",
+      "default": "./dist/sync.js"
     }
   }
 }
