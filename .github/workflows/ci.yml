@@ -68,3 +68,6 @@ jobs:
 
       - name: Prefix Merkle replication benchmark smoke test
         run: pnpm benchmark:replication:merkle:v1
+
+      - name: Bounded reconciliation session benchmark smoke test
+        run: pnpm benchmark:replication:sync:v1

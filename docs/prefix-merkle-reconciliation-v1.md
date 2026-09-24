@@ -261,4 +261,4 @@ Artifact blobs continue to transfer separately by content digest after artifact-
 
 The spike validates the narrow hypothesis that SSRL can keep its immutable collision semantics while making small-delta set discovery sublinear in exchanged descriptor volume.
 
-It does **not** establish a complete multi-device sync product yet. The next layer still needs an authenticated transport/session protocol, peer trust/capability model, bounded node/leaf exchange messages, resumability, and abuse limits.
+It does **not** establish a complete multi-device sync product yet. Bounded pinned-view exchange and resumable client session semantics are implemented in the follow-up documented at `docs/bounded-reconciliation-session-v1.md`. Authenticated peer/device trust, authorized transfer, and a real network transport remain separate work.

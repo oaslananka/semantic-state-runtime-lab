@@ -79,7 +79,10 @@ function descriptorOrder(left: ReplicationRecordDescriptor, right: ReplicationRe
 
 
 
-async function leafIdForKey(key: ReplicationRecordKey, bits: PrefixMerkleBits): Promise<number> {
+export async function prefixMerkleLeafIdForKey(
+  key: ReplicationRecordKey,
+  bits: PrefixMerkleBits,
+): Promise<number> {
   const digest = await sha256Bytes(utf8Bytes(key));
   const first16 = ((digest[0] ?? 0) << 8) | (digest[1] ?? 0);
   return first16 >>> (16 - bits);
@@ -174,7 +177,7 @@ export class PrefixMerkleIndex {
     const leaves = new Map<number, Map<ReplicationRecordKey, ReplicationRecordDescriptor>>();
     const leafIds = await mapInBatches(
       normalized,
-      (descriptor) => leafIdForKey(descriptor.key, bits),
+      (descriptor) => prefixMerkleLeafIdForKey(descriptor.key, bits),
     );
     normalized.forEach((descriptor, index) => {
       const leafId = leafIds[index]!;
@@ -252,7 +255,7 @@ export class PrefixMerkleIndex {
   async add(descriptor: ReplicationRecordDescriptor): Promise<PrefixMerkleAddResult> {
     const normalized = (await normalizeReplicationDescriptors([descriptor]))[0];
     if (normalized === undefined) throw new InvalidReplicationRecordError("Missing normalized descriptor");
-    const leafId = await leafIdForKey(normalized.key, this.prefixBits);
+    const leafId = await prefixMerkleLeafIdForKey(normalized.key, this.prefixBits);
     const records = this.#leaves.get(leafId) ?? new Map();
     const existing = records.get(normalized.key);
     if (existing !== undefined) {
