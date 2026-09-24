@@ -1,4 +1,18 @@
-import { McpServer } from "@modelcontextprotocol/server";
+import {
+  McpServer,
+  ProtocolError,
+  ProtocolErrorCode,
+  ResourceNotFoundError,
+  ResourceTemplate,
+} from "@modelcontextprotocol/server";
+import {
+  ArtifactAccessDeniedError,
+  ArtifactAccessNotFoundError,
+  ArtifactCatalogScanLimitError,
+  ArtifactReadTooLargeError,
+  type ArtifactAccessGateway,
+  type ArtifactResourceDescriptor,
+} from "@ssrl/artifact-access";
 import type {
   EntityId,
   StateValue,
@@ -101,9 +115,16 @@ export const mcpApplyOutputSchema = z.object({
   journalRunId: z.string().optional(),
 });
 
+export interface RuntimeMcpArtifactOptions {
+  readonly gateway: ArtifactAccessGateway;
+  readonly maxListedResources?: number;
+  readonly maxResourceBytes?: number;
+}
+
 export interface RuntimeMcpServerOptions {
   readonly host: RuntimeHost;
   readonly principal: RuntimePrincipal;
+  readonly artifacts?: RuntimeMcpArtifactOptions;
   readonly name?: string;
   readonly version?: string;
 }
@@ -162,6 +183,145 @@ function planText(
   ].join(" ");
 }
 
+const ARTIFACT_RESOURCE_TEMPLATE = "ssrl://artifact/resource/sha256/{fingerprint}";
+const ARTIFACT_VERSION_TEMPLATE = "ssrl://artifact/version/sha256/{fingerprint}";
+export const MCP_ARTIFACT_CACHE_HINT = {
+  ttlMs: 0,
+  cacheScope: "private" as const,
+} as const;
+
+function opaqueResourceName(descriptor: ArtifactResourceDescriptor): string {
+  return `artifact-${descriptor.uri.slice(-12)}`;
+}
+
+function mcpResourceDescriptor(descriptor: ArtifactResourceDescriptor) {
+  return {
+    uri: descriptor.uri,
+    name: opaqueResourceName(descriptor),
+    ...(descriptor.title === undefined ? {} : { title: descriptor.title }),
+    mimeType: descriptor.mediaType,
+    size: descriptor.size,
+  };
+}
+
+function strictUtf8(bytes: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function sanitizedArtifactReadError(uri: string, error: unknown): never {
+  if (error instanceof ArtifactAccessDeniedError || error instanceof ArtifactAccessNotFoundError) {
+    throw new ResourceNotFoundError(uri);
+  }
+  if (error instanceof ArtifactReadTooLargeError) {
+    throw new ProtocolError(
+      ProtocolErrorCode.InvalidParams,
+      "Artifact resource exceeds the MCP read limit.",
+    );
+  }
+  throw new ProtocolError(
+    ProtocolErrorCode.InternalError,
+    "Artifact resource read failed.",
+  );
+}
+
+function registerArtifactResources(
+  server: McpServer,
+  options: RuntimeMcpServerOptions,
+): void {
+  const artifactOptions = options.artifacts;
+  if (artifactOptions === undefined) return;
+  const maxListedResources = artifactOptions.maxListedResources ?? 500;
+  const maxResourceBytes = artifactOptions.maxResourceBytes ?? 256 * 1024;
+  for (const [name, value] of [
+    ["maxListedResources", maxListedResources],
+    ["maxResourceBytes", maxResourceBytes],
+  ] as const) {
+    if (!(Number.isSafeInteger(value) && value >= 1)) {
+      throw new RangeError(`MCP artifact ${name} must be a positive safe integer`);
+    }
+  }
+
+  const read = async (uri: URL) => {
+    try {
+      const result = await artifactOptions.gateway.read({
+        uri: uri.href,
+        principal: options.principal,
+        maxBytes: maxResourceBytes,
+      });
+      const text = result.resource.mediaType.startsWith("text/")
+        ? strictUtf8(result.bytes)
+        : undefined;
+      return {
+        contents: [text === undefined
+          ? {
+            uri: uri.href,
+            mimeType: result.resource.mediaType,
+            blob: Buffer.from(result.bytes).toString("base64"),
+          }
+          : {
+            uri: uri.href,
+            mimeType: result.resource.mediaType,
+            text,
+          }],
+      };
+    } catch (error) {
+      return sanitizedArtifactReadError(uri.href, error);
+    }
+  };
+
+  server.registerResource(
+    "artifact-current",
+    new ResourceTemplate(ARTIFACT_RESOURCE_TEMPLATE, {
+      list: async () => {
+        try {
+          const page = await artifactOptions.gateway.list({
+            principal: options.principal,
+            limit: Math.min(maxListedResources + 1, 1_000),
+          });
+          if (page.hasMore || page.resources.length > maxListedResources) {
+            throw new ProtocolError(
+              ProtocolErrorCode.InternalError,
+              "Artifact resource list exceeds the MCP server limit.",
+            );
+          }
+          return { resources: page.resources.map(mcpResourceDescriptor) };
+        } catch (error) {
+          if (error instanceof ProtocolError) throw error;
+          if (error instanceof ArtifactCatalogScanLimitError) {
+            throw new ProtocolError(
+              ProtocolErrorCode.InternalError,
+              "Artifact resource listing exceeded its scan limit.",
+            );
+          }
+          throw new ProtocolError(
+            ProtocolErrorCode.InternalError,
+            "Artifact resource listing failed.",
+          );
+        }
+      },
+    }),
+    {
+      description: "Policy-filtered current SSRL artifacts.",
+      cacheHint: MCP_ARTIFACT_CACHE_HINT,
+    },
+    read,
+  );
+
+  server.registerResource(
+    "artifact-version",
+    new ResourceTemplate(ARTIFACT_VERSION_TEMPLATE, { list: undefined }),
+    {
+      description: "Policy-filtered immutable SSRL artifact version.",
+      cacheHint: MCP_ARTIFACT_CACHE_HINT,
+    },
+    read,
+  );
+}
+
 export function createRuntimeMcpServer(
   options: RuntimeMcpServerOptions,
 ): McpServer {
@@ -169,6 +329,8 @@ export function createRuntimeMcpServer(
     name: options.name ?? "ssrl-runtime",
     version: options.version ?? "0.0.0",
   });
+
+  registerArtifactResources(server, options);
 
   server.registerTool(
     MCP_TOOL_NAMES.plan,

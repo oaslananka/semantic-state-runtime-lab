@@ -8,8 +8,10 @@ function source(path: string): string {
 export default defineConfig({
   resolve: {
     alias: {
+      "@ssrl/access": source("./packages/access/src/index.ts"),
       "@ssrl/core": source("./packages/core/src/index.ts"),
       "@ssrl/artifact-store": source("./packages/artifact-store/src/index.ts"),
+      "@ssrl/artifact-access": source("./packages/artifact-access/src/index.ts"),
       "@ssrl/storage-local-artifacts": source("./packages/storage-local-artifacts/src/index.ts"),
       "@ssrl/state-store": source("./packages/state-store/src/index.ts"),
       "@ssrl/materializer": source("./packages/materializer/src/index.ts"),

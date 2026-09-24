@@ -1,3 +1,4 @@
+import type { AccessDecision, AccessPrincipal } from "@ssrl/access";
 import { createHash } from "node:crypto";
 import {
   reconciliationProposalJson,
@@ -17,14 +18,8 @@ import {
 export type ProposalDigest = `sha256:${string}`;
 export type ProposalStatus = "ready" | "blocked" | "noop";
 
-export interface RuntimePrincipal {
-  readonly subject: string;
-  readonly scopes: readonly string[];
-}
-
-export type RuntimeAccessDecision =
-  | { readonly effect: "allow" }
-  | { readonly effect: "deny"; readonly code: string };
+export type RuntimePrincipal = AccessPrincipal;
+export type RuntimeAccessDecision = AccessDecision;
 
 export type RuntimeAccessRequest =
   | {

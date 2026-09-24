@@ -1,15 +1,14 @@
 {
-  "name": "@ssrl/runtime-host",
+  "name": "@ssrl/artifact-access",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ssrl/core": "workspace:*",
-    "@ssrl/journal": "workspace:*",
-    "@ssrl/runtime": "workspace:*",
-    "@ssrl/access": "workspace:*"
+    "@ssrl/access": "workspace:*",
+    "@ssrl/artifact-store": "workspace:*"
   },
   "devDependencies": {
+    "@ssrl/storage-local-artifacts": "workspace:*",
     "@types/node": "26.6.2"
   },
   "exports": {

@@ -4,7 +4,7 @@ The access-policy layer narrows the trusted Runtime Host for authenticated or de
 
 ## Trust model
 
-A transport adapter is responsible for authenticating a caller and constructing a normalized `RuntimePrincipal`:
+A transport adapter is responsible for authenticating a caller and constructing a normalized `AccessPrincipal` from `@ssrl/access`. `RuntimePrincipal` remains a compatibility alias:
 
 ```ts
 {
@@ -13,7 +13,7 @@ A transport adapter is responsible for authenticating a caller and constructing 
 }
 ```
 
-The runtime never accepts or persists raw bearer tokens, refresh tokens, JWTs, authorization headers, or arbitrary identity-provider claims.
+The runtime and artifact gateway never accept or persist raw bearer tokens, refresh tokens, JWTs, authorization headers, or arbitrary identity-provider claims. The shared principal intentionally contains only normalized subject/scopes.
 
 When an `accessPolicy` is configured, a missing principal or missing policy decision is denied.
 
@@ -64,8 +64,8 @@ When a principal is present, reconciliation events may persist only:
 
 Scopes and other caller credentials are not copied into journal evidence. SQLite journal reads reject expanded actor metadata with fields other than `subject`.
 
-## MCP mapping later
+## MCP mapping
 
-For a future MCP adapter, bearer/OAuth verification belongs at the HTTP boundary. The adapter should map verified auth context into `RuntimePrincipal`, then call this policy-enforced Runtime Host.
+Bearer/OAuth verification belongs at the HTTP boundary. An adapter maps verified auth context into `AccessPrincipal`, then calls the policy-enforced Runtime Host and Artifact Access Gateway.
 
-MCP client/server self-reported identity metadata must not be used as an authorization principal.
+The stdio/in-process MCP composition already receives its principal explicitly. MCP client/server self-reported identity metadata is not used as an authorization principal. See `docs/artifact-access-gateway-v1.md` for raw Artifact Plane access.

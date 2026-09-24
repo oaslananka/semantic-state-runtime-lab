@@ -176,6 +176,24 @@ importers:
         specifier: 5.0.1
         version: 5.0.1(@types/node@26.6.2)(vite@8.3.0(@types/node@26.6.2)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
+  packages/access: {}
+
+  packages/artifact-access:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/artifact-store':
+        specifier: workspace:*
+        version: link:../artifact-store
+    devDependencies:
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/artifact-store:
     dependencies:
       '@ssrl/core':
@@ -305,6 +323,12 @@ importers:
       '@modelcontextprotocol/server':
         specifier: 2.0.0
         version: 2.0.0
+      '@ssrl/artifact-access':
+        specifier: workspace:*
+        version: link:../artifact-access
+      '@ssrl/artifact-store':
+        specifier: workspace:*
+        version: link:../artifact-store
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
@@ -321,6 +345,9 @@ importers:
       '@modelcontextprotocol/client':
         specifier: 2.0.0
         version: 2.0.0
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
@@ -373,6 +400,9 @@ importers:
 
   packages/runtime-host:
     dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
