@@ -508,57 +508,82 @@ async function assertPayloadDigest(record: ReplicationRecord): Promise<void> {
   }
 }
 
+type MutableSemanticStateBatch = {
+  entities: NonNullable<SemanticStateBatch["entities"]>[number][];
+  aliases: NonNullable<SemanticStateBatch["aliases"]>[number][];
+  observations: NonNullable<SemanticStateBatch["observations"]>[number][];
+  relations: NonNullable<SemanticStateBatch["relations"]>[number][];
+  retractions: NonNullable<SemanticStateBatch["retractions"]>[number][];
+};
+
+function assertPayloadRecordId(
+  actual: string,
+  expected: string,
+  label: string,
+): void {
+  if (actual !== expected) {
+    throw new InvalidReplicationRecordError(`${label} recordId mismatch`);
+  }
+}
+
+function appendSemanticRecordToBatch(
+  batch: MutableSemanticStateBatch,
+  record: ReplicationRecord,
+): void {
+  switch (record.kind) {
+    case "semantic-entity": {
+      const value = parseSemanticEntityJson(record.payload);
+      assertPayloadRecordId(value.entityId, record.recordId, "Entity");
+      batch.entities.push(value);
+      return;
+    }
+    case "semantic-alias": {
+      const value = parseEntityAliasJson(record.payload);
+      assertPayloadRecordId(value.id, record.recordId, "Alias");
+      batch.aliases.push(value);
+      return;
+    }
+    case "semantic-observation": {
+      const value = parseTemporalObservationJson(record.payload);
+      assertPayloadRecordId(value.id, record.recordId, "Observation");
+      batch.observations.push(value);
+      return;
+    }
+    case "semantic-relation": {
+      const value = parseTemporalRelationJson(record.payload);
+      assertPayloadRecordId(value.id, record.recordId, "Relation");
+      batch.relations.push(value);
+      return;
+    }
+    case "semantic-retraction": {
+      const value = parseSemanticRetractionJson(record.payload);
+      assertPayloadRecordId(value.id, record.recordId, "Retraction");
+      batch.retractions.push(value);
+      return;
+    }
+    case "artifact-mutation":
+      throw new InvalidReplicationRecordError("Artifact mutation cannot be applied to SemanticStateStore");
+  }
+}
+
 export async function applySemanticReplicationRecords(
   store: SemanticStateStore,
   records: readonly ReplicationRecord[],
   options: ReplicationApplyOptions = {},
 ): Promise<void> {
   assertApplyBatchBound(records, options);
-  const batch: {
-    entities: NonNullable<SemanticStateBatch["entities"]>[number][];
-    aliases: NonNullable<SemanticStateBatch["aliases"]>[number][];
-    observations: NonNullable<SemanticStateBatch["observations"]>[number][];
-    relations: NonNullable<SemanticStateBatch["relations"]>[number][];
-    retractions: NonNullable<SemanticStateBatch["retractions"]>[number][];
-  } = { entities: [], aliases: [], observations: [], relations: [], retractions: [] };
+  const batch: MutableSemanticStateBatch = {
+    entities: [],
+    aliases: [],
+    observations: [],
+    relations: [],
+    retractions: [],
+  };
 
   for (const record of [...records].toSorted(descriptorOrder)) {
     assertRecordIdentity(record);
     await assertPayloadDigest(record);
-    switch (record.kind) {
-      case "semantic-entity": {
-        const value = parseSemanticEntityJson(record.payload);
-        if (value.entityId !== record.recordId) throw new InvalidReplicationRecordError("Entity recordId mismatch");
-        batch.entities.push(value);
-        break;
-      }
-      case "semantic-alias": {
-        const value = parseEntityAliasJson(record.payload);
-        if (value.id !== record.recordId) throw new InvalidReplicationRecordError("Alias recordId mismatch");
-        batch.aliases.push(value);
-        break;
-      }
-      case "semantic-observation": {
-        const value = parseTemporalObservationJson(record.payload);
-        if (value.id !== record.recordId) throw new InvalidReplicationRecordError("Observation recordId mismatch");
-        batch.observations.push(value);
-        break;
-      }
-      case "semantic-relation": {
-        const value = parseTemporalRelationJson(record.payload);
-        if (value.id !== record.recordId) throw new InvalidReplicationRecordError("Relation recordId mismatch");
-        batch.relations.push(value);
-        break;
-      }
-      case "semantic-retraction": {
-        const value = parseSemanticRetractionJson(record.payload);
-        if (value.id !== record.recordId) throw new InvalidReplicationRecordError("Retraction recordId mismatch");
-        batch.retractions.push(value);
-        break;
-      }
-      case "artifact-mutation":
-        throw new InvalidReplicationRecordError("Artifact mutation cannot be applied to SemanticStateStore");
-    }
+    appendSemanticRecordToBatch(batch, record);
   }
   await store.append(batch);
 }
@@ -646,6 +671,66 @@ export async function missingArtifactBlobs(
   return missing;
 }
 
+async function targetAlreadyHasBlob(
+  target: ArtifactStore,
+  blob: RequiredArtifactBlob,
+): Promise<boolean> {
+  const existing = await target.headBlob(blob.digest);
+  if (existing === undefined) return false;
+  if (existing.size !== blob.size) {
+    throw new InvalidReplicationRecordError(`Target blob ${blob.digest} has conflicting size`);
+  }
+  return true;
+}
+
+function replicationBlobReadLimit(blob: RequiredArtifactBlob, maxBlobBytes?: number): number {
+  const maxBytes = maxBlobBytes ?? blob.size;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < blob.size) {
+    throw new RangeError(
+      `Artifact blob ${blob.digest} requires ${blob.size} bytes but maxBlobBytes is ${maxBytes}`,
+    );
+  }
+  return maxBytes;
+}
+
+async function readVerifiedSourceBlob(
+  source: ArtifactStore,
+  blob: RequiredArtifactBlob,
+  maxBlobBytes?: number,
+): Promise<Uint8Array> {
+  const maxBytes = replicationBlobReadLimit(blob, maxBlobBytes);
+  const read = await source.readBlobRange(blob.digest, {
+    offset: 0,
+    length: blob.size,
+    maxBytes,
+  });
+  if (!read.complete || read.offset !== 0 || read.bytes.byteLength !== blob.size) {
+    throw new InvalidReplicationRecordError(`Source blob ${blob.digest} did not return complete content`);
+  }
+  const sourceDigest = `sha256:${await sha256(read.bytes)}`;
+  if (sourceDigest !== blob.digest) {
+    throw new InvalidReplicationRecordError(`Source blob ${blob.digest} failed content digest verification`);
+  }
+  return read.bytes;
+}
+
+async function installVerifiedTargetBlob(
+  target: ArtifactStore,
+  blob: RequiredArtifactBlob,
+  bytes: Uint8Array,
+): Promise<void> {
+  const mediaType = blob.mediaTypes[0];
+  if (mediaType === undefined) {
+    throw new InvalidReplicationRecordError(`Blob ${blob.digest} has no media type`);
+  }
+  const installed = await target.putBlob(bytes, mediaType);
+  if (installed.digest !== artifactDigest(blob.digest) || installed.size !== blob.size) {
+    throw new InvalidReplicationRecordError(
+      `Transferred blob ${blob.digest} failed target integrity verification`,
+    );
+  }
+}
+
 export async function copyMissingArtifactBlobs(input: {
   readonly source: ArtifactStore;
   readonly target: ArtifactStore;
@@ -657,36 +742,12 @@ export async function copyMissingArtifactBlobs(input: {
   const skippedDigests: ArtifactDigest[] = [];
   let transferredBytes = 0;
   for (const blob of required) {
-    const existing = await input.target.headBlob(blob.digest);
-    if (existing !== undefined) {
-      if (existing.size !== blob.size) {
-        throw new InvalidReplicationRecordError(`Target blob ${blob.digest} has conflicting size`);
-      }
+    if (await targetAlreadyHasBlob(input.target, blob)) {
       skippedDigests.push(blob.digest);
       continue;
     }
-    const maxBytes = input.maxBlobBytes ?? blob.size;
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < blob.size) {
-      throw new RangeError(`Artifact blob ${blob.digest} requires ${blob.size} bytes but maxBlobBytes is ${maxBytes}`);
-    }
-    const read = await input.source.readBlobRange(blob.digest, {
-      offset: 0,
-      length: blob.size,
-      maxBytes,
-    });
-    if (!read.complete || read.offset !== 0 || read.bytes.byteLength !== blob.size) {
-      throw new InvalidReplicationRecordError(`Source blob ${blob.digest} did not return complete content`);
-    }
-    const sourceDigest = `sha256:${await sha256(read.bytes)}`;
-    if (sourceDigest !== blob.digest) {
-      throw new InvalidReplicationRecordError(`Source blob ${blob.digest} failed content digest verification`);
-    }
-    const mediaType = blob.mediaTypes[0];
-    if (mediaType === undefined) throw new InvalidReplicationRecordError(`Blob ${blob.digest} has no media type`);
-    const installed = await input.target.putBlob(read.bytes, mediaType);
-    if (installed.digest !== artifactDigest(blob.digest) || installed.size !== blob.size) {
-      throw new InvalidReplicationRecordError(`Transferred blob ${blob.digest} failed target integrity verification`);
-    }
+    const bytes = await readVerifiedSourceBlob(input.source, blob, input.maxBlobBytes);
+    await installVerifiedTargetBlob(input.target, blob, bytes);
     transferredDigests.push(blob.digest);
     transferredBytes += blob.size;
   }
