@@ -242,10 +242,10 @@ function projectionSlotTarget(slot: ProjectedSlot): ProjectionSlotTarget {
 
 export function normalizeDesiredProjection(desired: DesiredProjection): DesiredProjection {
   const entities = (desired.additiveEntities ?? [])
-    .map(normalizeSemanticEntity)
+    .map((entity) => normalizeSemanticEntity(entity))
     .toSorted((left, right) => left.entityId.localeCompare(right.entityId));
   const aliases = (desired.additiveAliases ?? [])
-    .map(normalizeEntityAliasRecord)
+    .map((alias) => normalizeEntityAliasRecord(alias))
     .toSorted((left, right) => left.id.localeCompare(right.id));
   const seen = new Set<string>();
   const slots = desired.slots
@@ -457,8 +457,7 @@ function semanticBatchForUpsert(input: {
   for (const previous of input.previous?.slots ?? []) {
     const next = nextByKey.get(previous.key);
     if (
-      next !== undefined
-      && next.kind === previous.kind
+      next?.kind === previous.kind
       && next.semanticRecordId === previous.semanticRecordId
     ) {
       continue;
@@ -536,6 +535,15 @@ export interface IngestionSyncResult {
   readonly resetPerformed: boolean;
 }
 
+interface ProcessedSourceChanges {
+  readonly semanticAppends: SemanticAppendCounts;
+  readonly changesProcessed: number;
+}
+
+interface FullSyncSweepResult extends ProcessedSourceChanges {
+  readonly sweptResources: number;
+}
+
 export class IngestionEngine {
   readonly #semanticState: SemanticStateStore;
   readonly #ingestionState: IngestionStateStore;
@@ -583,6 +591,64 @@ export class IngestionEngine {
     return counts;
   }
 
+  async #processSourceChanges<TPayload>(input: {
+    readonly sourceKey: IngestionSourceKey;
+    readonly changes: readonly SourceChange<TPayload>[];
+    readonly mapper: ProjectionMapper<TPayload>;
+    readonly generation?: FullSyncGeneration;
+  }): Promise<ProcessedSourceChanges> {
+    let semanticAppends = zeroAppendCounts();
+    for (const rawChange of input.changes) {
+      const change = normalizeSourceChange(rawChange);
+      semanticAppends = addAppendCounts(
+        semanticAppends,
+        await this.#processChange({ sourceKey: input.sourceKey, change, mapper: input.mapper }),
+      );
+      if (input.generation !== undefined) {
+        await this.#ingestionState.markSeen(
+          input.generation.id,
+          change.externalType,
+          change.externalId,
+        );
+      }
+    }
+    return { semanticAppends, changesProcessed: input.changes.length };
+  }
+
+  async #sweepFullSync<TPayload>(input: {
+    readonly sourceKey: IngestionSourceKey;
+    readonly generation: FullSyncGeneration;
+    readonly mapper: ProjectionMapper<TPayload>;
+  }): Promise<FullSyncSweepResult> {
+    const unseen = (await this.#ingestionState.unseenProjections(input.generation.id))
+      .filter((projection) => !projection.deleted)
+      .toSorted(compareResourceIdentity);
+    let semanticAppends = zeroAppendCounts();
+    for (const projection of unseen) {
+      const deletion: SourceChange<TPayload> = {
+        changeId: deterministicTupleId("ssrl-full-sync-delete-v1", [
+          input.generation.id,
+          projection.externalType,
+          projection.externalId,
+        ]),
+        externalType: projection.externalType,
+        externalId: projection.externalId,
+        kind: "delete",
+        effectiveAt: input.generation.observedAt,
+        recordedAt: input.generation.observedAt,
+      };
+      semanticAppends = addAppendCounts(
+        semanticAppends,
+        await this.#processChange({ sourceKey: input.sourceKey, change: deletion, mapper: input.mapper }),
+      );
+    }
+    return {
+      semanticAppends,
+      changesProcessed: unseen.length,
+      sweptResources: unseen.length,
+    };
+  }
+
   async sync<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
     readonly source: IncrementalSource<TPayload>;
@@ -618,17 +684,14 @@ export class IngestionEngine {
       }
 
       pagesRead += 1;
-      for (const rawChange of result.changes) {
-        const change = normalizeSourceChange(rawChange);
-        semanticAppends = addAppendCounts(
-          semanticAppends,
-          await this.#processChange({ sourceKey: input.sourceKey, change, mapper: input.mapper }),
-        );
-        changesProcessed += 1;
-        if (generation !== undefined) {
-          await this.#ingestionState.markSeen(generation.id, change.externalType, change.externalId);
-        }
-      }
+      const processed = await this.#processSourceChanges({
+        sourceKey: input.sourceKey,
+        changes: result.changes,
+        mapper: input.mapper,
+        ...(generation === undefined ? {} : { generation }),
+      });
+      semanticAppends = addAppendCounts(semanticAppends, processed.semanticAppends);
+      changesProcessed += processed.changesProcessed;
 
       if (result.next.kind === "continue") {
         continuation = result.next.cursor;
@@ -636,29 +699,14 @@ export class IngestionEngine {
       }
 
       if (generation !== undefined) {
-        const unseen = (await this.#ingestionState.unseenProjections(generation.id))
-          .filter((projection) => !projection.deleted)
-          .toSorted(compareResourceIdentity);
-        for (const projection of unseen) {
-          const deletion: SourceChange<TPayload> = {
-            changeId: deterministicTupleId("ssrl-full-sync-delete-v1", [
-              generation.id,
-              projection.externalType,
-              projection.externalId,
-            ]),
-            externalType: projection.externalType,
-            externalId: projection.externalId,
-            kind: "delete",
-            effectiveAt: generation.observedAt,
-            recordedAt: generation.observedAt,
-          };
-          semanticAppends = addAppendCounts(
-            semanticAppends,
-            await this.#processChange({ sourceKey: input.sourceKey, change: deletion, mapper: input.mapper }),
-          );
-          changesProcessed += 1;
-          sweptResources += 1;
-        }
+        const sweep = await this.#sweepFullSync({
+          sourceKey: input.sourceKey,
+          generation,
+          mapper: input.mapper,
+        });
+        semanticAppends = addAppendCounts(semanticAppends, sweep.semanticAppends);
+        changesProcessed += sweep.changesProcessed;
+        sweptResources += sweep.sweptResources;
         await this.#ingestionState.completeFullSyncGeneration(generation.id, result.next.checkpoint);
       } else {
         await this.#ingestionState.setCheckpoint(input.sourceKey, result.next.checkpoint);
@@ -794,7 +842,7 @@ export class InMemoryIngestionStateStore implements IngestionStateStore {
     const id = this.#activeGenerationBySource.get(sourceKey);
     if (id === undefined) return undefined;
     const generation = this.#generations.get(id);
-    if (generation === undefined || generation.status !== "active") {
+    if (generation?.status !== "active") {
       throw new Error(`Missing active full sync generation ${id}`);
     }
     return { id: generation.id, sourceKey: generation.sourceKey, observedAt: generation.observedAt };
@@ -818,7 +866,7 @@ export class InMemoryIngestionStateStore implements IngestionStateStore {
 
   #activeGeneration(generationId: string): GenerationState {
     const generation = this.#generations.get(generationId);
-    if (generation === undefined || generation.status !== "active") {
+    if (generation?.status !== "active") {
       throw new Error(`Unknown or completed full sync generation ${generationId}`);
     }
     return generation;

@@ -49,6 +49,121 @@ function sortedRecords<T extends { readonly id: string }>(map: ReadonlyMap<strin
   return [...map.values()].map((item) => item.record).toSorted((a, b) => a.id.localeCompare(b.id));
 }
 
+interface MutableAppendCounts {
+  entities: number;
+  aliases: number;
+  observations: number;
+  relations: number;
+  retractions: number;
+}
+
+interface WorkingState {
+  readonly entities: Map<string, Stored<SemanticEntity>>;
+  readonly aliases: Map<string, Stored<EntityAliasRecord>>;
+  readonly observations: Map<string, Stored<TemporalObservation>>;
+  readonly relations: Map<string, Stored<TemporalRelationEdge>>;
+  readonly retractions: Map<string, Stored<SemanticRetraction>>;
+}
+
+function appendEntities(
+  batch: SemanticStateBatch,
+  state: WorkingState,
+  counts: MutableAppendCounts,
+): void {
+  const records = (batch.entities ?? [])
+    .map((entity) => normalizeSemanticEntity(entity))
+    .toSorted((a, b) => a.entityId.localeCompare(b.entityId));
+  for (const record of records) {
+    if (insertRecord(state.entities, "entity", record.entityId, record, semanticEntityJson(record))) {
+      counts.entities += 1;
+    }
+  }
+}
+
+function requireEntity(state: WorkingState, entityId: EntityId): void {
+  if (!state.entities.has(entityId)) throw new UnknownSemanticEntityError(entityId);
+}
+
+function appendAliases(
+  batch: SemanticStateBatch,
+  state: WorkingState,
+  counts: MutableAppendCounts,
+): void {
+  const records = (batch.aliases ?? [])
+    .map((alias) => normalizeEntityAliasRecord(alias))
+    .toSorted((a, b) => a.id.localeCompare(b.id));
+  for (const record of records) {
+    requireEntity(state, record.entityId);
+    if (insertRecord(state.aliases, "alias", record.id, record, entityAliasJson(record))) {
+      counts.aliases += 1;
+    }
+  }
+}
+
+function appendObservations(
+  batch: SemanticStateBatch,
+  state: WorkingState,
+  counts: MutableAppendCounts,
+): void {
+  const records = (batch.observations ?? [])
+    .map((observation) => normalizeTemporalObservation(observation))
+    .toSorted((a, b) => a.id.localeCompare(b.id));
+  for (const record of records) {
+    requireEntity(state, record.entityId);
+    if (insertRecord(
+      state.observations,
+      "observation",
+      record.id,
+      record,
+      temporalObservationJson(record),
+    )) {
+      counts.observations += 1;
+    }
+  }
+}
+
+function appendRelations(
+  batch: SemanticStateBatch,
+  state: WorkingState,
+  counts: MutableAppendCounts,
+): void {
+  const records = (batch.relations ?? [])
+    .map((relation) => normalizeTemporalRelation(relation))
+    .toSorted((a, b) => a.id.localeCompare(b.id));
+  for (const record of records) {
+    requireEntity(state, record.from);
+    requireEntity(state, record.to);
+    if (insertRecord(state.relations, "relation", record.id, record, temporalRelationJson(record))) {
+      counts.relations += 1;
+    }
+  }
+}
+
+function appendRetractions(
+  batch: SemanticStateBatch,
+  state: WorkingState,
+  counts: MutableAppendCounts,
+): void {
+  const records = (batch.retractions ?? [])
+    .map((retraction) => normalizeSemanticRetraction(retraction))
+    .toSorted((a, b) => a.id.localeCompare(b.id));
+  for (const record of records) {
+    const targetExists = record.targetKind === "observation"
+      ? state.observations.has(record.targetId)
+      : state.relations.has(record.targetId);
+    if (!targetExists) throw new UnknownSemanticTargetError(record.targetKind, record.targetId);
+    if (insertRecord(
+      state.retractions,
+      "retraction",
+      record.id,
+      record,
+      semanticRetractionJson(record),
+    )) {
+      counts.retractions += 1;
+    }
+  }
+}
+
 export class TestSemanticStateStore implements SemanticStateStore {
   #entities = new Map<string, Stored<SemanticEntity>>();
   #aliases = new Map<string, Stored<EntityAliasRecord>>();
@@ -57,18 +172,14 @@ export class TestSemanticStateStore implements SemanticStateStore {
   #retractions = new Map<string, Stored<SemanticRetraction>>();
 
   async append(batch: SemanticStateBatch): Promise<SemanticAppendCounts> {
-    const entities = new Map(this.#entities);
-    const aliases = new Map(this.#aliases);
-    const observations = new Map(this.#observations);
-    const relations = new Map(this.#relations);
-    const retractions = new Map(this.#retractions);
-    const counts: {
-      entities: number;
-      aliases: number;
-      observations: number;
-      relations: number;
-      retractions: number;
-    } = {
+    const state: WorkingState = {
+      entities: new Map(this.#entities),
+      aliases: new Map(this.#aliases),
+      observations: new Map(this.#observations),
+      relations: new Map(this.#relations),
+      retractions: new Map(this.#retractions),
+    };
+    const counts: MutableAppendCounts = {
       entities: 0,
       aliases: 0,
       observations: 0,
@@ -76,39 +187,17 @@ export class TestSemanticStateStore implements SemanticStateStore {
       retractions: 0,
     };
 
-    for (const raw of (batch.entities ?? []).map(normalizeSemanticEntity).toSorted((a, b) => a.entityId.localeCompare(b.entityId))) {
-      if (insertRecord(entities, "entity", raw.entityId, raw, semanticEntityJson(raw))) counts.entities += 1;
-    }
-    for (const raw of (batch.aliases ?? []).map(normalizeEntityAliasRecord).toSorted((a, b) => a.id.localeCompare(b.id))) {
-      if (!entities.has(raw.entityId)) throw new UnknownSemanticEntityError(raw.entityId);
-      if (insertRecord(aliases, "alias", raw.id, raw, entityAliasJson(raw))) counts.aliases += 1;
-    }
-    for (const raw of (batch.observations ?? []).map(normalizeTemporalObservation).toSorted((a, b) => a.id.localeCompare(b.id))) {
-      if (!entities.has(raw.entityId)) throw new UnknownSemanticEntityError(raw.entityId);
-      if (insertRecord(observations, "observation", raw.id, raw, temporalObservationJson(raw))) {
-        counts.observations += 1;
-      }
-    }
-    for (const raw of (batch.relations ?? []).map(normalizeTemporalRelation).toSorted((a, b) => a.id.localeCompare(b.id))) {
-      if (!entities.has(raw.from)) throw new UnknownSemanticEntityError(raw.from);
-      if (!entities.has(raw.to)) throw new UnknownSemanticEntityError(raw.to);
-      if (insertRecord(relations, "relation", raw.id, raw, temporalRelationJson(raw))) counts.relations += 1;
-    }
-    for (const raw of (batch.retractions ?? []).map(normalizeSemanticRetraction).toSorted((a, b) => a.id.localeCompare(b.id))) {
-      const targetExists = raw.targetKind === "observation"
-        ? observations.has(raw.targetId)
-        : relations.has(raw.targetId);
-      if (!targetExists) throw new UnknownSemanticTargetError(raw.targetKind, raw.targetId);
-      if (insertRecord(retractions, "retraction", raw.id, raw, semanticRetractionJson(raw))) {
-        counts.retractions += 1;
-      }
-    }
+    appendEntities(batch, state, counts);
+    appendAliases(batch, state, counts);
+    appendObservations(batch, state, counts);
+    appendRelations(batch, state, counts);
+    appendRetractions(batch, state, counts);
 
-    this.#entities = entities;
-    this.#aliases = aliases;
-    this.#observations = observations;
-    this.#relations = relations;
-    this.#retractions = retractions;
+    this.#entities = state.entities;
+    this.#aliases = state.aliases;
+    this.#observations = state.observations;
+    this.#relations = state.relations;
+    this.#retractions = state.retractions;
     return counts;
   }
 
@@ -170,5 +259,11 @@ export class TestSemanticStateStore implements SemanticStateStore {
     return { changes: [], hasMore: false };
   }
 
-  close(): void {}
+  close(): void {
+    this.#entities.clear();
+    this.#aliases.clear();
+    this.#observations.clear();
+    this.#relations.clear();
+    this.#retractions.clear();
+  }
 }

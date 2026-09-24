@@ -366,7 +366,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
-    if (row === undefined || row.projection_json === null) return undefined;
+    if (row?.projection_json == null) return undefined;
     try {
       return parseDesiredProjectionJson(row.projection_json);
     } catch (cause) {
