@@ -1,7 +1,6 @@
 import { canonicalJson } from "@ssrl/core";
 import {
   InvalidReplicationRecordError,
-  ReplicationRecordCollisionError,
   assertSameReplicationDescriptor,
   diffReplicationDescriptors,
   normalizeReplicationDescriptors,
@@ -185,7 +184,7 @@ export class PrefixMerkleIndex {
     });
 
     const emptyHash = await leafHash([]);
-    const hashes = Array<string>(2 ** bits).fill(emptyHash);
+    const hashes = new Array<string>(2 ** bits).fill(emptyHash);
     await Promise.all([...leaves.entries()].map(async ([leafId, records]) => {
       hashes[leafId] = await leafHash([...records.values()].toSorted(descriptorOrder));
     }));
