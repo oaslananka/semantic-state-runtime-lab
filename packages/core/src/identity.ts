@@ -110,7 +110,7 @@ function matchAliases(
     .map((alias) => alias.raw);
 }
 
-function aliasScore(alias: string): number {
+export function entityAliasScore(alias: string): number {
   const normalized = normalizeEntityAlias(alias);
   return tokenCount(normalized) * 100 + normalized.length;
 }
@@ -132,7 +132,7 @@ export function matchEntityAliasesForQuery(
   );
   if (matchedAliases.length === 0) return undefined;
   return {
-    score: Math.max(...matchedAliases.map(aliasScore)),
+    score: Math.max(...matchedAliases.map(entityAliasScore)),
     matchedAliases,
   };
 }
@@ -150,7 +150,7 @@ function candidateFor(
   const strongestAlias = aliasMatch.score;
   const typeCueScore = matchedTypeCues.length === 0
     ? 0
-    : 10_000 + Math.max(...matchedTypeCues.map(aliasScore));
+    : 10_000 + Math.max(...matchedTypeCues.map(entityAliasScore));
   const matchedAliasSet = new Set(matchedAliases.map(normalizeEntityAlias));
   const evidenceRefs = entity.aliases
     .filter((alias) => matchedAliasSet.has(normalizeEntityAlias(alias.value)))

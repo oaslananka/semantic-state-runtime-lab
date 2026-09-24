@@ -62,6 +62,12 @@ export interface SemanticChangePage {
   readonly hasMore: boolean;
 }
 
+
+export interface SemanticBootstrapView {
+  readonly entityIds: readonly EntityId[];
+  readonly cursor?: SemanticChangeCursor;
+}
+
 export interface SemanticStateSnapshot {
   readonly schema: typeof SEMANTIC_STATE_SNAPSHOT_SCHEMA;
   readonly entities: readonly SemanticEntity[];
@@ -90,6 +96,7 @@ export interface SemanticStateStore {
   relationsFromEntity(entityId: EntityId): Promise<readonly TemporalRelationEdge[]>;
   retractionsForEntity(entityId: EntityId): Promise<readonly SemanticRetraction[]>;
   lookupAlias(value: string): Promise<AliasLookupResult>;
+  bootstrapView(): Promise<SemanticBootstrapView>;
   changesAfter(cursor?: SemanticChangeCursor, limit?: number): Promise<SemanticChangePage>;
 }
 

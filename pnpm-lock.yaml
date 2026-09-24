@@ -464,6 +464,9 @@ importers:
       '@ssrl/storage-sqlite':
         specifier: workspace:*
         version: link:../storage-sqlite
+      '@ssrl/storage-sqlite-capsules':
+        specifier: workspace:*
+        version: link:../storage-sqlite-capsules
       zod:
         specifier: 4.6.5
         version: 4.6.5
@@ -543,6 +546,25 @@ importers:
       '@ssrl/context':
         specifier: workspace:*
         version: link:../context
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/storage-sqlite-capsules:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+    devDependencies:
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2

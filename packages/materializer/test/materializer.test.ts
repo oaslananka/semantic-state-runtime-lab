@@ -6,10 +6,12 @@ import type { EntityId } from "@ssrl/core";
 import type {
   SemanticChangeCursor,
   SemanticStateBatch,
+  SemanticStateStore,
 } from "@ssrl/state-store";
 import { SQLiteSemanticStateStore } from "@ssrl/storage-sqlite";
 import { bm25Baseline, contextCorpusFromCapsules } from "@ssrl/context";
 import {
+  ContextCapsuleBootstrapper,
   ContextCapsuleMaterializer,
   ContextCapsuleSyncLimitError,
   IncrementalContextCapsuleSynchronizer,
@@ -143,6 +145,10 @@ class FailOnceCapsuleStore implements ContextCapsuleStore {
 
   async setCheckpoint(cursor: SemanticChangeCursor): Promise<void> {
     await this.inner.setCheckpoint(cursor);
+  }
+
+  async reset(): Promise<void> {
+    await this.inner.reset();
   }
 
   async staleEntityIds(at: string, configurationVersion: string): Promise<readonly EntityId[]> {
@@ -426,6 +432,120 @@ describe("incremental context capsules", () => {
     expect((await cache.search("Alice and Project Atlas", 1)).map((item) => item.entityId))
       .toEqual([project]);
     expect(await cache.search("Unknown thing", 10)).toEqual([]);
+    state.close();
+  });
+
+  it("bootstraps a cold cache from current entity ids instead of replaying historical feed pages", async () => {
+    const { state, cache, materializer: mat, worker } = await seededRuntime();
+    const sync = new IncrementalContextCapsuleSynchronizer({
+      worker,
+      bootstrapper: new ContextCapsuleBootstrapper({
+        stateStore: state,
+        capsuleStore: cache,
+        materializer: mat,
+      }),
+      pageSize: 1,
+      maxPages: 1,
+    });
+
+    const result = await sync.synchronize("2026-03-01T00:00:00Z");
+    expect(result.bootstrapped).toBe(true);
+    expect(result.pages).toBe(1);
+    expect(result.changesRead).toBe(0);
+    expect(result.materializedEntityIds).toEqual([alice, project]);
+    expect(await cache.checkpoint()).toBeDefined();
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("REST");
+    state.close();
+  });
+
+  it("does not skip a semantic change committed after the bootstrap tail cursor", async () => {
+    const path = await databasePath();
+    const inner = new SQLiteSemanticStateStore({ path });
+    await inner.append(baseBatch());
+    let injected = false;
+    const state = new Proxy(inner, {
+      get(target, property) {
+        if (property === "bootstrapView") {
+          return async () => {
+            const view = await target.bootstrapView();
+            if (!injected) {
+              injected = true;
+              await target.append({
+                observations: [{
+                  id: "api-grpc-after-bootstrap-tail",
+                  entityId: project,
+                  property: "Project.apiStyle",
+                  value: "gRPC",
+                  source: { provider: "adr", externalId: "atlas-api", revision: "grpc" },
+                  validFrom: "2026-09-10T00:00:00Z",
+                  recordedAt: "2026-09-10T00:00:00Z",
+                }],
+              });
+            }
+            return view;
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as SemanticStateStore;
+    const cache = new InMemoryContextCapsuleStore();
+    const mat = materializer(state as SQLiteSemanticStateStore);
+    const worker = new IncrementalContextCapsuleWorker({
+      stateStore: state,
+      capsuleStore: cache,
+      materializer: mat,
+    });
+    const sync = new IncrementalContextCapsuleSynchronizer({
+      worker,
+      bootstrapper: new ContextCapsuleBootstrapper({
+        stateStore: state,
+        capsuleStore: cache,
+        materializer: mat,
+      }),
+      pageSize: 100,
+      maxPages: 2,
+    });
+
+    const result = await sync.synchronize("2026-09-24T00:00:00Z");
+    expect(result.bootstrapped).toBe(true);
+    expect(result.changesRead).toBe(1);
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("gRPC");
+    inner.close();
+  });
+
+  it("recovers a foreign persisted checkpoint by resetting and bootstrapping derived capsules", async () => {
+    const { state, cache, materializer: mat, worker } = await seededRuntime();
+    const foreignPath = await databasePath();
+    const foreign = new SQLiteSemanticStateStore({ path: foreignPath });
+    await foreign.append(baseBatch());
+    const foreignCursor = (await foreign.changesAfter()).nextCursor;
+    expect(foreignCursor).toBeDefined();
+    const stale = await mat.materializeEntity(project, "2026-03-01T00:00:00Z");
+    expect(stale).toBeDefined();
+    await cache.put(stale!);
+    await cache.setCheckpoint(foreignCursor!);
+
+    const sync = new IncrementalContextCapsuleSynchronizer({
+      worker,
+      bootstrapper: new ContextCapsuleBootstrapper({
+        stateStore: state,
+        capsuleStore: cache,
+        materializer: mat,
+      }),
+      pageSize: 100,
+      maxPages: 2,
+    });
+    const result = await sync.synchronize("2026-09-24T00:00:00Z");
+
+    expect(result.recoveredInvalidCheckpoint).toBe(true);
+    expect(result.materializedEntityIds).toEqual([alice, project]);
+    expect((await cache.get(project))?.material.state.canonical.properties["Project.apiStyle"]?.value)
+      .toBe("GraphQL");
+    expect(await cache.checkpoint()).not.toBe(foreignCursor);
+    foreign.close();
     state.close();
   });
 

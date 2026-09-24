@@ -14,6 +14,7 @@ import {
 import {
   typedEntityFromAliasRecords,
   type EntityAliasRecord,
+  InvalidSemanticChangeCursorError,
   type SemanticChangeCursor,
   type SemanticStateStore,
 } from "@ssrl/state-store";
@@ -53,6 +54,7 @@ export interface ContextCapsuleStore {
   delete(entityId: EntityId): Promise<boolean>;
   checkpoint(): Promise<SemanticChangeCursor | undefined>;
   setCheckpoint(cursor: SemanticChangeCursor): Promise<void>;
+  reset(): Promise<void>;
   staleEntityIds(at: string, configurationVersion: string): Promise<readonly EntityId[]>;
 }
 
@@ -94,10 +96,50 @@ export interface ContextCapsuleSyncResult {
   readonly changesRead: number;
   readonly materializedEntityIds: readonly EntityId[];
   readonly checkpoint?: SemanticChangeCursor;
+  readonly bootstrapped?: boolean;
+  readonly recoveredInvalidCheckpoint?: boolean;
+}
+
+export interface ContextCapsuleBootstrapResult {
+  readonly entityIds: readonly EntityId[];
+  readonly materializedEntityIds: readonly EntityId[];
+  readonly checkpoint?: SemanticChangeCursor;
+}
+
+export class ContextCapsuleBootstrapper {
+  readonly #options: IncrementalCapsuleWorkerOptions;
+
+  constructor(options: IncrementalCapsuleWorkerOptions) {
+    this.#options = options;
+  }
+
+  async rebuild(at: string): Promise<ContextCapsuleBootstrapResult> {
+    const materializedAt = isoTimestamp(at, "capsule bootstrap time");
+    const view = await this.#options.stateStore.bootstrapView();
+    await this.#options.capsuleStore.reset();
+    const materializedEntityIds: EntityId[] = [];
+    for (const entityId of view.entityIds) {
+      const capsule = await this.#options.materializer.materializeEntity(
+        entityId,
+        materializedAt,
+        view.cursor,
+      );
+      if (capsule === undefined) continue;
+      await this.#options.capsuleStore.put(capsule);
+      materializedEntityIds.push(entityId);
+    }
+    if (view.cursor !== undefined) await this.#options.capsuleStore.setCheckpoint(view.cursor);
+    return {
+      entityIds: view.entityIds,
+      materializedEntityIds,
+      ...(view.cursor === undefined ? {} : { checkpoint: view.cursor }),
+    };
+  }
 }
 
 export interface IncrementalContextCapsuleSynchronizerOptions {
   readonly worker: IncrementalContextCapsuleWorker;
+  readonly bootstrapper?: ContextCapsuleBootstrapper;
   readonly pageSize?: number;
   readonly maxPages?: number;
 }
@@ -220,6 +262,123 @@ export function relatedEntityIdsFromCapsule(capsule: ContextCapsule): EntityId[]
 
 export function contextCapsuleMaterialJson(material: ContextCapsuleMaterial): string {
   return canonicalJson(material);
+}
+
+
+export class CorruptContextCapsuleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CorruptContextCapsuleError";
+  }
+}
+
+function capsuleObject(value: unknown, label: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new CorruptContextCapsuleError(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function capsuleString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new CorruptContextCapsuleError(`${label} must be a non-empty string`);
+  }
+  return value;
+}
+
+function capsuleTimestamp(value: unknown, label: string): string {
+  const raw = capsuleString(value, label);
+  const millis = Date.parse(raw);
+  if (!Number.isFinite(millis) || new Date(millis).toISOString() !== raw) {
+    throw new CorruptContextCapsuleError(`${label} must be a canonical UTC timestamp`);
+  }
+  return raw;
+}
+
+function capsuleStringArray(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value)) throw new CorruptContextCapsuleError(`${label} must be an array`);
+  return value.map((item, index) => capsuleString(item, `${label}[${index}]`));
+}
+
+function validateCapsuleEntity(value: unknown, entityId: EntityId): TypedEntity {
+  const entity = capsuleObject(value, "capsule.material.entity");
+  if (capsuleString(entity.id, "capsule.material.entity.id") !== entityId) {
+    throw new CorruptContextCapsuleError("capsule material entity id disagrees with capsule entityId");
+  }
+  const aliases = entity.aliases;
+  if (!Array.isArray(aliases)) {
+    throw new CorruptContextCapsuleError("capsule.material.entity.aliases must be an array");
+  }
+  for (const [index, item] of aliases.entries()) {
+    const alias = capsuleObject(item, `capsule.material.entity.aliases[${index}]`);
+    capsuleString(alias.value, `capsule.material.entity.aliases[${index}].value`);
+    if (alias.evidenceRefs !== undefined) {
+      capsuleStringArray(alias.evidenceRefs, `capsule.material.entity.aliases[${index}].evidenceRefs`);
+    }
+  }
+  capsuleString(entity.type, "capsule.material.entity.type");
+  return entity as unknown as TypedEntity;
+}
+
+function validateCapsuleState(value: unknown, entityId: EntityId): ContextCapsuleState {
+  const state = capsuleObject(value, "capsule.material.state");
+  const canonical = capsuleObject(state.canonical, "capsule.material.state.canonical");
+  if (capsuleString(canonical.entityId, "capsule.material.state.canonical.entityId") !== entityId) {
+    throw new CorruptContextCapsuleError("capsule canonical entity id disagrees with capsule entityId");
+  }
+  capsuleObject(canonical.properties, "capsule.material.state.canonical.properties");
+  if (!Array.isArray(state.conflicts)) {
+    throw new CorruptContextCapsuleError("capsule.material.state.conflicts must be an array");
+  }
+  capsuleObject(state.evidence, "capsule.material.state.evidence");
+  capsuleObject(state.conflictEvidence, "capsule.material.state.conflictEvidence");
+  return state as unknown as ContextCapsuleState;
+}
+
+function validateCapsuleMaterial(value: unknown, entityId: EntityId): ContextCapsuleMaterial {
+  const material = capsuleObject(value, "capsule.material");
+  validateCapsuleEntity(material.entity, entityId);
+  validateCapsuleState(material.state, entityId);
+  if (!Array.isArray(material.activeRelations)) {
+    throw new CorruptContextCapsuleError("capsule.material.activeRelations must be an array");
+  }
+  if (!Array.isArray(material.appliedRetractions)) {
+    throw new CorruptContextCapsuleError("capsule.material.appliedRetractions must be an array");
+  }
+  if (material.nextTemporalBoundary !== undefined) {
+    capsuleTimestamp(material.nextTemporalBoundary, "capsule.material.nextTemporalBoundary");
+  }
+  return material as unknown as ContextCapsuleMaterial;
+}
+
+export function contextCapsuleJson(capsule: ContextCapsule): string {
+  return canonicalJson(capsule);
+}
+
+export function parseContextCapsuleJson(value: string): ContextCapsule {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new CorruptContextCapsuleError("Context capsule is not valid JSON");
+  }
+  if (canonicalJson(parsed) !== value) {
+    throw new CorruptContextCapsuleError("Context capsule JSON is not canonical");
+  }
+  const capsule = capsuleObject(parsed, "capsule");
+  if (capsule.schema !== CONTEXT_CAPSULE_SCHEMA) {
+    throw new CorruptContextCapsuleError("Unsupported context capsule schema");
+  }
+  const rawEntityId = capsuleString(capsule.entityId, "capsule.entityId");
+  if (!rawEntityId.startsWith("entity://")) {
+    throw new CorruptContextCapsuleError("capsule.entityId must use the entity:// scheme");
+  }
+  const entityId = rawEntityId as EntityId;
+  capsuleTimestamp(capsule.materializedAt, "capsule.materializedAt");
+  capsuleString(capsule.configurationVersion, "capsule.configurationVersion");
+  if (capsule.changeCursor !== undefined) capsuleString(capsule.changeCursor, "capsule.changeCursor");
+  validateCapsuleMaterial(capsule.material, entityId);
+  return capsule as unknown as ContextCapsule;
 }
 
 export class ContextCapsuleMaterializer {
@@ -364,6 +523,11 @@ export class InMemoryContextCapsuleStore implements ContextCapsuleStore {
     this.#checkpoint = cursor;
   }
 
+  async reset(): Promise<void> {
+    this.#capsules.clear();
+    this.#checkpoint = undefined;
+  }
+
   async staleEntityIds(
     at: string,
     configurationVersion: string,
@@ -386,25 +550,28 @@ function emptyWrites(): Record<CapsuleWriteResult, number> {
 }
 
 export class IncrementalContextCapsuleWorker {
-  readonly #stateStore: SemanticStateStore;
-  readonly #capsuleStore: ContextCapsuleStore;
-  readonly #materializer: ContextCapsuleMaterializer;
+  readonly #options: IncrementalCapsuleWorkerOptions;
 
   constructor(options: IncrementalCapsuleWorkerOptions) {
-    this.#stateStore = options.stateStore;
-    this.#capsuleStore = options.capsuleStore;
-    this.#materializer = options.materializer;
+    this.#options = options;
+  }
+
+  async checkpoint(): Promise<SemanticChangeCursor | undefined> {
+    return this.#options.capsuleStore.checkpoint();
   }
 
   async runOnce(request: CapsuleWorkerRunRequest): Promise<CapsuleWorkerRunResult> {
     const at = isoTimestamp(request.at, "worker time");
-    const checkpoint = await this.#capsuleStore.checkpoint();
-    const page = await this.#stateStore.changesAfter(checkpoint, request.limit ?? 100);
+    const checkpoint = await this.#options.capsuleStore.checkpoint();
+    const page = await this.#options.stateStore.changesAfter(checkpoint, request.limit ?? 100);
     const changedEntityIds = sortedUniqueEntityIds(
       page.changes.map((change) => change.primaryEntityId),
     );
     const staleEntityIds = sortedUniqueEntityIds(
-      await this.#capsuleStore.staleEntityIds(at, this.#materializer.configurationVersion),
+      await this.#options.capsuleStore.staleEntityIds(
+        at,
+        this.#options.materializer.configurationVersion,
+      ),
     );
     const targets = sortedUniqueEntityIds([...changedEntityIds, ...staleEntityIds]);
     const materializedEntityIds: EntityId[] = [];
@@ -412,18 +579,22 @@ export class IncrementalContextCapsuleWorker {
     const writes = emptyWrites();
 
     for (const entityId of targets) {
-      const capsule = await this.#materializer.materializeEntity(entityId, at, page.nextCursor ?? checkpoint);
+      const capsule = await this.#options.materializer.materializeEntity(
+        entityId,
+        at,
+        page.nextCursor ?? checkpoint,
+      );
       if (capsule === undefined) {
-        if (await this.#capsuleStore.delete(entityId)) deletedEntityIds.push(entityId);
+        if (await this.#options.capsuleStore.delete(entityId)) deletedEntityIds.push(entityId);
         continue;
       }
-      const result = await this.#capsuleStore.put(capsule);
+      const result = await this.#options.capsuleStore.put(capsule);
       writes[result] += 1;
       materializedEntityIds.push(entityId);
     }
 
     if (page.nextCursor !== undefined && page.nextCursor !== checkpoint) {
-      await this.#capsuleStore.setCheckpoint(page.nextCursor);
+      await this.#options.capsuleStore.setCheckpoint(page.nextCursor);
     }
     return {
       changesRead: page.changes.length,
@@ -441,11 +612,13 @@ export class IncrementalContextCapsuleWorker {
 
 export class IncrementalContextCapsuleSynchronizer implements ContextCapsuleSynchronizer {
   readonly #worker: IncrementalContextCapsuleWorker;
+  readonly #bootstrapper: ContextCapsuleBootstrapper | undefined;
   readonly #pageSize: number;
   readonly #maxPages: number;
 
   constructor(options: IncrementalContextCapsuleSynchronizerOptions) {
     this.#worker = options.worker;
+    this.#bootstrapper = options.bootstrapper;
     this.#pageSize = options.pageSize ?? 100;
     this.#maxPages = options.maxPages ?? 100;
     if (!Number.isSafeInteger(this.#pageSize) || this.#pageSize < 1 || this.#pageSize > 1_000) {
@@ -456,7 +629,7 @@ export class IncrementalContextCapsuleSynchronizer implements ContextCapsuleSync
     }
   }
 
-  async synchronize(at: string): Promise<ContextCapsuleSyncResult> {
+  async #synchronizeOnce(at: string): Promise<ContextCapsuleSyncResult> {
     const materialized = new Set<EntityId>();
     let changesRead = 0;
     let checkpoint: SemanticChangeCursor | undefined;
@@ -475,5 +648,38 @@ export class IncrementalContextCapsuleSynchronizer implements ContextCapsuleSync
       }
     }
     throw new ContextCapsuleSyncLimitError(this.#maxPages);
+  }
+
+  async synchronize(at: string): Promise<ContextCapsuleSyncResult> {
+    let bootstrap: ContextCapsuleBootstrapResult | undefined;
+    if (this.#bootstrapper !== undefined && await this.#worker.checkpoint() === undefined) {
+      bootstrap = await this.#bootstrapper.rebuild(at);
+    }
+    try {
+      const result = await this.#synchronizeOnce(at);
+      if (bootstrap === undefined) return result;
+      return {
+        ...result,
+        materializedEntityIds: sortedUniqueEntityIds([
+          ...bootstrap.materializedEntityIds,
+          ...result.materializedEntityIds,
+        ]),
+        bootstrapped: true,
+      };
+    } catch (error) {
+      if (!(error instanceof InvalidSemanticChangeCursorError) || this.#bootstrapper === undefined) {
+        throw error;
+      }
+      const recovery = await this.#bootstrapper.rebuild(at);
+      const result = await this.#synchronizeOnce(at);
+      return {
+        ...result,
+        materializedEntityIds: sortedUniqueEntityIds([
+          ...recovery.materializedEntityIds,
+          ...result.materializedEntityIds,
+        ]),
+        recoveredInvalidCheckpoint: true,
+      };
+    }
   }
 }
