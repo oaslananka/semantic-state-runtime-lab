@@ -518,6 +518,19 @@ function addAppendCounts(
   };
 }
 
+function sourceReadRequest(
+  mode: "incremental" | "full",
+  durableCheckpoint: SourceCheckpoint | undefined,
+  continuation: SourceContinuation | undefined,
+): SourceReadRequest {
+  const request: SourceReadRequest = { mode };
+  if (mode === "incremental" && durableCheckpoint !== undefined) {
+    Object.assign(request, { checkpoint: durableCheckpoint });
+  }
+  if (continuation !== undefined) Object.assign(request, { continuation });
+  return request;
+}
+
 export interface IngestionEngineOptions {
   readonly semanticState: SemanticStateStore;
   readonly ingestionState: IngestionStateStore;
@@ -595,7 +608,7 @@ export class IngestionEngine {
     readonly sourceKey: IngestionSourceKey;
     readonly changes: readonly SourceChange<TPayload>[];
     readonly mapper: ProjectionMapper<TPayload>;
-    readonly generation?: FullSyncGeneration;
+    readonly generation: FullSyncGeneration | undefined;
   }): Promise<ProcessedSourceChanges> {
     let semanticAppends = zeroAppendCounts();
     for (const rawChange of input.changes) {
@@ -649,6 +662,35 @@ export class IngestionEngine {
     };
   }
 
+  async #startFullSync(
+    sourceKey: IngestionSourceKey,
+    mode: "incremental" | "full",
+    reason: string,
+  ): Promise<FullSyncGeneration> {
+    if (mode === "full") throw new FullSyncResetLoopError(reason);
+    const observedAt = isoTimestamp(this.#now(), "full sync observedAt");
+    return this.#ingestionState.beginFullSyncGeneration(sourceKey, observedAt);
+  }
+
+  async #completeRound<TPayload>(input: {
+    readonly sourceKey: IngestionSourceKey;
+    readonly mapper: ProjectionMapper<TPayload>;
+    readonly generation: FullSyncGeneration | undefined;
+    readonly checkpoint: SourceCheckpoint;
+  }): Promise<FullSyncSweepResult> {
+    if (input.generation === undefined) {
+      await this.#ingestionState.setCheckpoint(input.sourceKey, input.checkpoint);
+      return { semanticAppends: zeroAppendCounts(), changesProcessed: 0, sweptResources: 0 };
+    }
+    const sweep = await this.#sweepFullSync({
+      sourceKey: input.sourceKey,
+      generation: input.generation,
+      mapper: input.mapper,
+    });
+    await this.#ingestionState.completeFullSyncGeneration(input.generation.id, input.checkpoint);
+    return sweep;
+  }
+
   async sync<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
     readonly source: IncrementalSource<TPayload>;
@@ -665,18 +707,12 @@ export class IngestionEngine {
     let resetPerformed = generation !== undefined;
 
     for (;;) {
-      const result = await input.source.read({
-        mode,
-        ...(mode === "incremental" && durableCheckpoint !== undefined
-          ? { checkpoint: durableCheckpoint }
-          : {}),
-        ...(continuation === undefined ? {} : { continuation }),
-      });
+      const result = await input.source.read(
+        sourceReadRequest(mode, durableCheckpoint, continuation),
+      );
 
       if (result.kind === "reset-required") {
-        if (mode === "full") throw new FullSyncResetLoopError(result.reason);
-        const observedAt = isoTimestamp(this.#now(), "full sync observedAt");
-        generation = await this.#ingestionState.beginFullSyncGeneration(input.sourceKey, observedAt);
+        generation = await this.#startFullSync(input.sourceKey, mode, result.reason);
         mode = "full";
         resetPerformed = true;
         continuation = undefined;
@@ -688,7 +724,7 @@ export class IngestionEngine {
         sourceKey: input.sourceKey,
         changes: result.changes,
         mapper: input.mapper,
-        ...(generation === undefined ? {} : { generation }),
+        generation,
       });
       semanticAppends = addAppendCounts(semanticAppends, processed.semanticAppends);
       changesProcessed += processed.changesProcessed;
@@ -698,19 +734,15 @@ export class IngestionEngine {
         continue;
       }
 
-      if (generation !== undefined) {
-        const sweep = await this.#sweepFullSync({
-          sourceKey: input.sourceKey,
-          generation,
-          mapper: input.mapper,
-        });
-        semanticAppends = addAppendCounts(semanticAppends, sweep.semanticAppends);
-        changesProcessed += sweep.changesProcessed;
-        sweptResources += sweep.sweptResources;
-        await this.#ingestionState.completeFullSyncGeneration(generation.id, result.next.checkpoint);
-      } else {
-        await this.#ingestionState.setCheckpoint(input.sourceKey, result.next.checkpoint);
-      }
+      const completion = await this.#completeRound({
+        sourceKey: input.sourceKey,
+        mapper: input.mapper,
+        generation,
+        checkpoint: result.next.checkpoint,
+      });
+      semanticAppends = addAppendCounts(semanticAppends, completion.semanticAppends);
+      changesProcessed += completion.changesProcessed;
+      sweptResources += completion.sweptResources;
 
       return {
         sourceKey: input.sourceKey,
