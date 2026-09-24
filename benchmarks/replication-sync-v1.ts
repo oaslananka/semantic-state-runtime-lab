@@ -63,9 +63,11 @@ function firstPrefixByte(recordId: string): number {
 
 async function hotLeafDescriptors(count: number): Promise<ReplicationRecordDescriptor[]> {
   const ids: string[] = [];
-  for (let ordinal = 0; ids.length < count; ordinal += 1) {
+  let ordinal = 0;
+  while (ids.length < count) {
     const id = `hot-sync-${String(ordinal).padStart(10, "0")}`;
     if (firstPrefixByte(id) === 0) ids.push(id);
+    ordinal += 1;
   }
   const result: ReplicationRecordDescriptor[] = [];
   const batchSize = 1_000;

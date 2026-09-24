@@ -222,6 +222,53 @@ async function decodeLeafCursor(
   return value as unknown as LeafCursorPayload;
 }
 
+async function leafAfterKey(
+  secret: CryptoKey,
+  info: ReconciliationViewInfo,
+  leafId: number,
+  descriptors: readonly ReplicationRecordDescriptor[],
+  cursor: ReconciliationLeafCursor | undefined,
+): Promise<ReplicationRecordKey | undefined> {
+  if (cursor === undefined) return undefined;
+  const payload = await decodeLeafCursor(secret, cursor);
+  if (
+    payload.viewId !== info.viewId
+    || payload.rootDigest !== info.rootDigest
+    || payload.leafId !== leafId
+  ) {
+    throw new InvalidReconciliationCursorError("Reconciliation cursor does not belong to this view/leaf");
+  }
+  if (!descriptors.some((descriptor) => descriptor.key === payload.afterKey)) {
+    throw new InvalidReconciliationCursorError("Reconciliation cursor points to a missing leaf key");
+  }
+  return payload.afterKey;
+}
+
+function boundedLeafDescriptors(
+  descriptors: readonly ReplicationRecordDescriptor[],
+  start: number,
+  maxDescriptors: number,
+  maxBytes: number,
+): { readonly descriptors: ReplicationRecordDescriptor[]; readonly estimatedBytes: number } {
+  const page: ReplicationRecordDescriptor[] = [];
+  let estimatedBytes = 2;
+  for (const descriptor of descriptors.slice(start)) {
+    if (page.length >= maxDescriptors) break;
+    const nextBytes = pageBytes(estimatedBytes, descriptor, page.length);
+    if (nextBytes > maxBytes) {
+      if (page.length === 0) {
+        throw new ReconciliationLimitError(
+          `Descriptor ${descriptor.key} cannot fit inside maxBytes=${maxBytes}`,
+        );
+      }
+      break;
+    }
+    page.push(replicationDescriptor(descriptor));
+    estimatedBytes = nextBytes;
+  }
+  return { descriptors: page, estimatedBytes };
+}
+
 export class FrozenPrefixMerkleView {
   readonly #index: PrefixMerkleIndex;
   readonly #secret: CryptoKey;
@@ -286,43 +333,19 @@ export class FrozenPrefixMerkleView {
       "maxBytes",
     );
     const descriptors = this.#index.leafDescriptors(options.leafId);
-    let afterKey: ReplicationRecordKey | undefined;
-    if (options.cursor !== undefined) {
-      const cursor = await decodeLeafCursor(this.#secret, options.cursor);
-      if (
-        cursor.viewId !== this.#info.viewId
-        || cursor.rootDigest !== this.#info.rootDigest
-        || cursor.leafId !== options.leafId
-      ) {
-        throw new InvalidReconciliationCursorError("Reconciliation cursor does not belong to this view/leaf");
-      }
-      if (!descriptors.some((descriptor) => descriptor.key === cursor.afterKey)) {
-        throw new InvalidReconciliationCursorError("Reconciliation cursor points to a missing leaf key");
-      }
-      afterKey = cursor.afterKey;
-    }
-
+    const afterKey = await leafAfterKey(
+      this.#secret,
+      this.#info,
+      options.leafId,
+      descriptors,
+      options.cursor,
+    );
     const start = afterKey === undefined
       ? 0
       : descriptors.findIndex((descriptor) => descriptor.key === afterKey) + 1;
-    const page: ReplicationRecordDescriptor[] = [];
-    let estimatedBytes = 2;
-    for (const descriptor of descriptors.slice(start)) {
-      if (page.length >= maxDescriptors) break;
-      const nextBytes = pageBytes(estimatedBytes, descriptor, page.length);
-      if (nextBytes > maxBytes) {
-        if (page.length === 0) {
-          throw new ReconciliationLimitError(
-            `Descriptor ${descriptor.key} cannot fit inside maxBytes=${maxBytes}`,
-          );
-        }
-        break;
-      }
-      page.push(replicationDescriptor(descriptor));
-      estimatedBytes = nextBytes;
-    }
-    const completed = start + page.length >= descriptors.length;
-    const last = page.at(-1);
+    const page = boundedLeafDescriptors(descriptors, start, maxDescriptors, maxBytes);
+    const completed = start + page.descriptors.length >= descriptors.length;
+    const last = page.descriptors.at(-1);
     const nextCursor = completed || last === undefined
       ? undefined
       : await encodeLeafCursor(this.#secret, {
@@ -336,8 +359,8 @@ export class FrozenPrefixMerkleView {
       viewId: this.#info.viewId,
       rootDigest: this.#info.rootDigest,
       leafId: options.leafId,
-      descriptors: page,
-      estimatedBytes,
+      descriptors: page.descriptors,
+      estimatedBytes: page.estimatedBytes,
       ...(nextCursor === undefined ? {} : { nextCursor }),
       completed,
     };
