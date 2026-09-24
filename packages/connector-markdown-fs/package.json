@@ -6,11 +6,15 @@
   "dependencies": {
     "@ssrl/connector-sdk": "workspace:*",
     "@ssrl/core": "workspace:*",
-    "yaml": "2.9.1"
+    "yaml": "2.9.1",
+    "@ssrl/ingestion": "workspace:*"
   },
   "devDependencies": {
     "@ssrl/runtime": "workspace:*",
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.2",
+    "@ssrl/storage-sqlite": "workspace:*",
+    "@ssrl/storage-local-artifacts": "workspace:*",
+    "@ssrl/materializer": "workspace:*"
   },
   "exports": {
     ".": {

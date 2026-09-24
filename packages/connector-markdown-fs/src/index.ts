@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  lstat,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -18,7 +20,9 @@ import {
   win32,
 } from "node:path";
 import {
+  canonicalJson,
   valuesEqual,
+  type EntityId,
   type ExternalBinding,
   type ExternalSnapshot,
   type Mutation,
@@ -30,6 +34,20 @@ import {
   type ConnectorManifest,
   type ManifestedStateProvider,
 } from "@ssrl/connector-sdk";
+import {
+  sourceCheckpoint,
+  sourceContinuation,
+  type ArtifactProjectionDraft,
+  type ArtifactProjectionMapper,
+  type DesiredProjection,
+  type IncrementalSource,
+  type ProjectionMapper,
+  type SourceChange,
+  type SourceChangeDraft,
+  type SourceContinuation,
+  type SourceReadRequest,
+  type SourceReadResult,
+} from "@ssrl/ingestion";
 import { isMap, parseDocument } from "yaml";
 
 type ParsedDocument = ReturnType<typeof parseDocument>;
@@ -442,5 +460,401 @@ export class MarkdownFilesystemConnector implements ManifestedStateProvider {
     } finally {
       await rm(temp, { force: true });
     }
+  }
+}
+
+
+export interface MarkdownIngestionPayload {
+  readonly values: Readonly<Record<string, StateValue>>;
+}
+
+export interface MarkdownAuthoritativeIngestionOptions {
+  readonly root: string;
+  readonly manifest: ConnectorManifest;
+  readonly externalType: string;
+  readonly entityIdForExternalId: (externalId: string) => EntityId;
+  readonly pageSize?: number;
+  readonly maxFiles?: number;
+  readonly maxRawBytes?: number;
+}
+
+export class StaleMarkdownIngestionSourceError extends Error {
+  constructor(
+    readonly externalId: string,
+    readonly expectedRevision: string,
+    readonly actualRevision?: string,
+  ) {
+    super(
+      `Markdown ingestion source ${externalId} changed after scan: expected ${expectedRevision}, actual ${actualRevision ?? "missing"}`,
+    );
+    this.name = "StaleMarkdownIngestionSourceError";
+  }
+}
+
+export class InvalidMarkdownEncodingError extends Error {
+  constructor(readonly externalId: string) {
+    super(`Markdown ingestion source ${externalId} is not valid UTF-8`);
+    this.name = "InvalidMarkdownEncodingError";
+  }
+}
+
+export class MarkdownScanLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MarkdownScanLimitError";
+  }
+}
+
+export class InvalidMarkdownContinuationError extends Error {
+  constructor(readonly continuation: string) {
+    super(`Invalid or expired Markdown full-scan continuation: ${continuation}`);
+    this.name = "InvalidMarkdownContinuationError";
+  }
+}
+
+interface MarkdownScanEntry {
+  readonly externalId: string;
+  readonly revision: string;
+  readonly payload: MarkdownIngestionPayload;
+}
+
+interface MarkdownScanSession {
+  readonly id: string;
+  readonly entries: readonly MarkdownScanEntry[];
+  readonly checkpoint: ReturnType<typeof sourceCheckpoint>;
+}
+
+function positiveSafeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function sha256Bytes(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function rawRevision(bytes: Uint8Array): string {
+  return `sha256:${sha256Bytes(bytes)}`;
+}
+
+function deterministicHashId(prefix: string, values: readonly unknown[]): string {
+  const digest = createHash("sha256").update(canonicalJson(values), "utf8").digest("hex");
+  return `${prefix}:${digest}`;
+}
+
+function decodeMarkdown(externalId: string, bytes: Uint8Array): string {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new InvalidMarkdownEncodingError(externalId);
+  }
+}
+
+function readableValues(
+  externalId: string,
+  content: string,
+  fields: readonly ConnectorFieldMapping[],
+): Readonly<Record<string, StateValue>> {
+  const parts = splitMarkdown(externalId, content);
+  const frontmatter = parts.document.toJSON() as unknown;
+  const values: Record<string, StateValue> = {};
+  for (const field of fields) {
+    if (!field.access.includes("read")) continue;
+    const value = toStateValue(valueAtPath(frontmatter, externalPathSegments(field.external)));
+    if (value !== undefined) values[field.external] = value;
+  }
+  return values;
+}
+
+function portableExternalId(root: string, file: string): string {
+  return relative(root, file).split(sep).join("/");
+}
+
+async function authoritativeMarkdownFiles(root: string, maxFiles: number): Promise<string[]> {
+  const files: string[] = [];
+  async function walk(directory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
+      if (entry.isSymbolicLink()) continue;
+      const child = resolve(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(child);
+        continue;
+      }
+      if (entry.isFile() && entry.name.toLowerCase().endsWith(".md")) {
+        files.push(child);
+        if (files.length > maxFiles) {
+          throw new MarkdownScanLimitError(
+            `Markdown scan found more than maxFiles ${maxFiles}`,
+          );
+        }
+      }
+    }
+  }
+  await walk(root);
+  return files;
+}
+
+async function secureMarkdownBytes(
+  root: string,
+  externalId: string,
+  maxBytes?: number,
+): Promise<Uint8Array> {
+  const segments = externalIdSegments(externalId);
+  const realRoot = await realpath(root);
+  const requested = resolve(realRoot, ...segments);
+  if (!isWithinRoot(realRoot, requested)) {
+    throw new UnsafeMarkdownPathError(externalId, "resolved path escapes connector root");
+  }
+  let info;
+  try {
+    info = await lstat(requested);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new StaleMarkdownIngestionSourceError(externalId, "present-at-scan");
+    }
+    throw cause;
+  }
+  if (info.isSymbolicLink()) {
+    throw new UnsafeMarkdownPathError(externalId, "symbolic links are not authoritative ingestion files");
+  }
+  if (!info.isFile()) {
+    throw new UnsafeMarkdownPathError(externalId, "resolved path is not a regular file");
+  }
+  if (maxBytes !== undefined && info.size > maxBytes) {
+    throw new MarkdownScanLimitError(
+      `Markdown scan would exceed maxRawBytes while reading ${externalId}`,
+    );
+  }
+  const file = await realpath(requested);
+  if (!isWithinRoot(realRoot, file)) {
+    throw new UnsafeMarkdownPathError(externalId, "resolved file escapes connector root");
+  }
+  const bytes = new Uint8Array(await readFile(file));
+  if (maxBytes !== undefined && bytes.byteLength > maxBytes) {
+    throw new MarkdownScanLimitError(
+      `Markdown scan exceeded maxRawBytes while reading ${externalId}`,
+    );
+  }
+  return bytes;
+}
+
+function matchingEntityMapping(
+  manifest: ConnectorManifest,
+  externalType: string,
+): ConnectorManifest["entities"][number] {
+  const matches = manifest.entities.filter((entity) => entity.externalType === externalType);
+  if (matches.length !== 1) {
+    throw new Error(
+      `Markdown ingestion externalType ${externalType} must match exactly one manifest entity mapping`,
+    );
+  }
+  return matches[0]!;
+}
+
+function continuationValue(sessionId: string, offset: number): SourceContinuation {
+  return sourceContinuation(`markdown-full-v1:${sessionId}:${offset}`);
+}
+
+function parseContinuation(value: SourceContinuation): { readonly sessionId: string; readonly offset: number } {
+  const match = /^markdown-full-v1:([0-9a-f-]+):(\d+)$/i.exec(value);
+  if (match === null) throw new InvalidMarkdownContinuationError(value);
+  const offset = Number(match[2]);
+  if (!Number.isSafeInteger(offset) || offset < 1) throw new InvalidMarkdownContinuationError(value);
+  return { sessionId: match[1]!, offset };
+}
+
+/**
+ * Correctness-first Markdown ingestion adapter.
+ * It intentionally performs an authoritative full scan on every sync round;
+ * filesystem watch APIs may be added later only as wake-up/dirty hints.
+ */
+export class MarkdownAuthoritativeIngestionAdapter
+implements
+  IncrementalSource<MarkdownIngestionPayload>,
+  ProjectionMapper<MarkdownIngestionPayload>,
+  ArtifactProjectionMapper<MarkdownIngestionPayload> {
+  readonly #root: string;
+  readonly #manifest: ConnectorManifest;
+  readonly #mapping: ConnectorManifest["entities"][number];
+  readonly #entityIdForExternalId: (externalId: string) => EntityId;
+  readonly #pageSize: number;
+  readonly #maxFiles: number;
+  readonly #maxRawBytes: number;
+  readonly #sessions = new Map<string, MarkdownScanSession>();
+
+  constructor(options: MarkdownAuthoritativeIngestionOptions) {
+    validateConnectorManifest(options.manifest);
+    this.#root = resolve(options.root);
+    this.#manifest = options.manifest;
+    this.#mapping = matchingEntityMapping(options.manifest, options.externalType);
+    this.#entityIdForExternalId = options.entityIdForExternalId;
+    this.#pageSize = positiveSafeInteger(options.pageSize ?? 128, "Markdown pageSize");
+    this.#maxFiles = positiveSafeInteger(options.maxFiles ?? 10_000, "Markdown maxFiles");
+    this.#maxRawBytes = positiveSafeInteger(
+      options.maxRawBytes ?? 256 * 1024 * 1024,
+      "Markdown maxRawBytes",
+    );
+  }
+
+  async #scan(): Promise<MarkdownScanSession> {
+    const root = await realpath(this.#root);
+    const files = await authoritativeMarkdownFiles(root, this.#maxFiles);
+
+    const entries: MarkdownScanEntry[] = [];
+    let rawBytes = 0;
+    for (const file of files) {
+      const externalId = portableExternalId(root, file);
+      const bytes = await secureMarkdownBytes(
+        root,
+        externalId,
+        this.#maxRawBytes - rawBytes,
+      );
+      rawBytes += bytes.byteLength;
+      const revision = rawRevision(bytes);
+      entries.push({
+        externalId,
+        revision,
+        payload: {
+          values: readableValues(
+            externalId,
+            decodeMarkdown(externalId, bytes),
+            this.#mapping.fields,
+          ),
+        },
+      });
+    }
+    const checkpoint = sourceCheckpoint(deterministicHashId(
+      "markdown-inventory-v1",
+      entries.map((entry) => [entry.externalId, entry.revision]),
+    ));
+    return { id: randomUUID(), entries, checkpoint };
+  }
+
+  #change(entry: MarkdownScanEntry): SourceChangeDraft<MarkdownIngestionPayload> {
+    return {
+      changeId: deterministicHashId(
+        "markdown-change-v1",
+        [this.#mapping.externalType, entry.externalId, entry.revision],
+      ),
+      externalType: this.#mapping.externalType,
+      externalId: entry.externalId,
+      kind: "upsert",
+      revision: entry.revision,
+      payload: entry.payload,
+    };
+  }
+
+  #page(session: MarkdownScanSession, offset: number): SourceReadResult<MarkdownIngestionPayload> {
+    if (offset < 0 || offset > session.entries.length) {
+      throw new InvalidMarkdownContinuationError(continuationValue(session.id, offset));
+    }
+    const end = Math.min(offset + this.#pageSize, session.entries.length);
+    const changes = session.entries.slice(offset, end).map((entry) => this.#change(entry));
+    if (end < session.entries.length) {
+      return {
+        kind: "page",
+        changes,
+        next: { kind: "continue", cursor: continuationValue(session.id, end) },
+      };
+    }
+    this.#sessions.delete(session.id);
+    return { kind: "page", changes, next: { kind: "complete", checkpoint: session.checkpoint } };
+  }
+
+  async read(request: SourceReadRequest): Promise<SourceReadResult<MarkdownIngestionPayload>> {
+    if (request.mode === "incremental") {
+      return {
+        kind: "reset-required",
+        reason: "portable-markdown-filesystem-requires-authoritative-full-scan",
+      };
+    }
+    if (request.continuation !== undefined) {
+      const parsed = parseContinuation(request.continuation);
+      const session = this.#sessions.get(parsed.sessionId);
+      if (session === undefined) throw new InvalidMarkdownContinuationError(request.continuation);
+      return this.#page(session, parsed.offset);
+    }
+
+    // A continuation belongs only to the immediately active full scan. Starting a
+    // fresh authoritative scan expires abandoned sessions instead of retaining
+    // unbounded directory snapshots in memory.
+    this.#sessions.clear();
+    const session = await this.#scan();
+    if (session.entries.length > this.#pageSize) this.#sessions.set(session.id, session);
+    return this.#page(session, 0);
+  }
+
+  project(change: SourceChange<MarkdownIngestionPayload>): DesiredProjection {
+    if (change.kind !== "upsert" || change.payload === undefined || change.revision === undefined) {
+      throw new Error("Markdown semantic projection requires an upsert payload and revision");
+    }
+    if (change.externalType !== this.#mapping.externalType) {
+      throw new Error(`Unexpected Markdown external type ${change.externalType}`);
+    }
+    const entityId = this.#entityIdForExternalId(change.externalId);
+    const slots: DesiredProjection["slots"][number][] = [];
+    for (const field of this.#mapping.fields) {
+      if (!field.access.includes("read")) continue;
+      const value = change.payload.values[field.external];
+      if (value === undefined) continue;
+      slots.push({
+        key: field.canonical,
+        kind: "observation",
+        record: {
+          id: deterministicHashId(
+            "markdown-observation-v1",
+            [change.externalId, change.revision, field.canonical, field.external],
+          ),
+          entityId,
+          property: field.canonical,
+          value,
+          source: {
+            provider: this.#manifest.id,
+            externalId: change.externalId,
+            revision: change.revision,
+          },
+          validFrom: change.effectiveAt,
+          recordedAt: change.recordedAt,
+        },
+      });
+    }
+    return {
+      additiveEntities: [{ entityId, entityType: this.#mapping.canonicalType }],
+      slots,
+    };
+  }
+
+  async projectArtifact(
+    change: SourceChange<MarkdownIngestionPayload>,
+  ): Promise<ArtifactProjectionDraft | undefined> {
+    if (change.kind !== "upsert") return undefined;
+    if (change.revision === undefined) {
+      throw new Error("Markdown artifact projection requires a content revision");
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = await secureMarkdownBytes(this.#root, change.externalId);
+    } catch (cause) {
+      if (cause instanceof StaleMarkdownIngestionSourceError) {
+        throw new StaleMarkdownIngestionSourceError(change.externalId, change.revision);
+      }
+      throw cause;
+    }
+    const actualRevision = rawRevision(bytes);
+    if (actualRevision !== change.revision) {
+      throw new StaleMarkdownIngestionSourceError(
+        change.externalId,
+        change.revision,
+        actualRevision,
+      );
+    }
+    return {
+      bytes,
+      mediaType: "text/markdown",
+      title: basename(change.externalId),
+    };
   }
 }
