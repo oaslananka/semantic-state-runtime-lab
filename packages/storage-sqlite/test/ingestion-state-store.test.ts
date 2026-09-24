@@ -1,16 +1,21 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { artifactDigest } from "@ssrl/artifact-store";
 import {
   FullSyncCompletionCollisionError,
   MappedProjectionCollisionError,
   SourceChangeCollisionError,
+  desiredProjectionJson,
   ingestionSourceKey,
+  mappedIngestionPlanJson,
   resolveSourceChange,
   resourceProjectionJson,
   sourceCheckpoint,
+  type DesiredProjection,
+  type MappedIngestionPlan,
   type ResourceProjection,
   type SourceChangeDraft,
 } from "@ssrl/ingestion";
@@ -21,18 +26,21 @@ import {
   SQLiteSemanticStateStore,
 } from "../src/index.js";
 
-const roots: string[] = [];
+const roots = new Set<string>();
 const source = ingestionSourceKey("synthetic/account-1/projects:all");
 const otherSource = ingestionSourceKey("synthetic/account-1/projects:favorites");
 
 async function databasePath(name = "ingestion.sqlite"): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "ssrl-ingestion-state-"));
-  roots.push(root);
+  const root = await fsPromises.mkdtemp(join(tmpdir(), "ssrl-ingestion-state-"));
+  roots.add(root);
   return join(root, name);
 }
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  for (const root of roots) {
+    await fsPromises.rm(root, { recursive: true, force: true });
+  }
+  roots.clear();
 });
 
 function projection(
@@ -61,6 +69,33 @@ function draft(
     payload: { value: "active" },
     ...overrides,
   };
+}
+
+function desiredProjection(status: string = "active"): DesiredProjection {
+  return {
+    additiveEntities: [{ entityId: "entity://project/atlas" as const, entityType: "Project" }],
+    slots: [{
+      key: "status",
+      kind: "observation",
+      record: {
+        id: "obs:atlas:r1:status",
+        entityId: "entity://project/atlas" as const,
+        property: "Project.status",
+        value: status,
+        source: { provider: "synthetic", externalId: "atlas", revision: "r1" },
+        validFrom: "2026-09-24T00:00:00Z",
+        recordedAt: "2026-09-24T00:01:00Z",
+      },
+    }],
+  };
+}
+
+function expectSchemaVersion3(path: string): void {
+  const inspect = new DatabaseSync(path);
+  expect(inspect.prepare(`
+    SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
+  `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
+  inspect.close();
 }
 
 async function persistReceipt(
@@ -133,54 +168,102 @@ describe("SQLiteIngestionStateStore", () => {
       effectiveAt: "2026-09-24T00:00:00Z",
       recordedAt: "2026-09-24T00:01:00Z",
     }));
-    const desired = {
-      additiveEntities: [{ entityId: "entity://project/atlas" as const, entityType: "Project" }],
-      slots: [{
-        key: "status",
-        kind: "observation" as const,
-        record: {
-          id: "obs:atlas:r1:status",
-          entityId: "entity://project/atlas" as const,
-          property: "Project.status",
-          value: "active",
-          source: { provider: "synthetic", externalId: "atlas", revision: "r1" },
-          validFrom: "2026-09-24T00:00:00Z",
-          recordedAt: "2026-09-24T00:01:00Z",
-        },
-      }],
-    };
-    expect(await first.putMappedProjection(source, "change-plan", desired)).toBe("inserted");
+    const desired = desiredProjection();
+    expect(await first.putMappedPlan(source, "change-plan", { semantic: desired, artifactAction: { kind: "preserve" } })).toBe("inserted");
     first.close();
 
     const reopened = new SQLiteIngestionStateStore({ path });
-    expect(await reopened.mappedProjection(source, "change-plan")).toEqual({
-      additiveEntities: [{ entityId: "entity://project/atlas", entityType: "Project" }],
-      slots: [{
-        key: "status",
-        kind: "observation",
-        record: expect.objectContaining({
-          id: "obs:atlas:r1:status",
-          validFrom: "2026-09-24T00:00:00.000Z",
-          recordedAt: "2026-09-24T00:01:00.000Z",
-        }),
-      }],
+    expect(await reopened.mappedPlan(source, "change-plan")).toEqual({
+      semantic: {
+        additiveEntities: [{ entityId: "entity://project/atlas", entityType: "Project" }],
+        slots: [{
+          key: "status",
+          kind: "observation",
+          record: expect.objectContaining({
+            id: "obs:atlas:r1:status",
+            validFrom: "2026-09-24T00:00:00.000Z",
+            recordedAt: "2026-09-24T00:01:00.000Z",
+          }),
+        }],
+      },
+      artifactAction: { kind: "preserve" },
     });
-    expect(await reopened.putMappedProjection(source, "change-plan", desired)).toBe("existing");
-    await expect(reopened.putMappedProjection(source, "change-plan", {
-      additiveEntities: desired.additiveEntities,
-      slots: [{
-        key: "status",
-        kind: "observation",
-        record: {
-          id: "obs:atlas:r1:status",
-          entityId: "entity://project/atlas" as const,
-          property: "Project.status",
-          value: "paused",
-          source: { provider: "synthetic", externalId: "atlas", revision: "r1" },
-          validFrom: "2026-09-24T00:00:00Z",
+    expect(await reopened.putMappedPlan(source, "change-plan", { semantic: desired, artifactAction: { kind: "preserve" } })).toBe("existing");
+    await expect(reopened.putMappedPlan(source, "change-plan", {
+      semantic: desiredProjection("paused"),
+      artifactAction: { kind: "preserve" },
+    })).rejects.toBeInstanceOf(MappedProjectionCollisionError);
+    reopened.close();
+  });
+
+  it("persists an artifact-bearing mapped plan across reopen and protects it from collision", async () => {
+    const path = await databasePath();
+    const first = new SQLiteIngestionStateStore({ path });
+    const item = draft("artifact-plan", {
+      effectiveAt: "2026-09-24T00:00:00Z",
+      recordedAt: "2026-09-24T00:01:00Z",
+    });
+    await persistReceipt(first, item);
+    const digest = artifactDigest(`sha256:${"a".repeat(64)}`);
+    const plan: MappedIngestionPlan = {
+      semantic: desiredProjection(),
+      artifactAction: {
+        kind: "apply",
+        mutation: {
+          id: "artifact-mutation:atlas:r1",
+          resource: {
+            sourceKey: source,
+            externalType: "project",
+            externalId: "atlas",
+          },
+          kind: "upsert",
+          effectiveAt: "2026-09-24T00:00:00Z",
           recordedAt: "2026-09-24T00:01:00Z",
+          revision: "r1",
+          title: "Atlas binary",
+          sourceUri: "source://synthetic/atlas",
+          blob: {
+            digest,
+            size: 4,
+            mediaType: "application/octet-stream",
+          },
         },
-      }],
+      },
+    };
+
+    expect(await first.putMappedPlan(source, item.changeId, plan)).toBe("inserted");
+    first.close();
+
+    const reopened = new SQLiteIngestionStateStore({ path });
+    expect(await reopened.mappedPlan(source, item.changeId)).toEqual({
+      semantic: expect.any(Object),
+      artifactAction: {
+        kind: "apply",
+        mutation: expect.objectContaining({
+          id: "artifact-mutation:atlas:r1",
+          effectiveAt: "2026-09-24T00:00:00.000Z",
+          recordedAt: "2026-09-24T00:01:00.000Z",
+          revision: "r1",
+          blob: {
+            digest,
+            size: 4,
+            mediaType: "application/octet-stream",
+          },
+        }),
+      },
+    });
+    expect(await reopened.putMappedPlan(source, item.changeId, plan)).toBe("existing");
+    await expect(reopened.putMappedPlan(source, item.changeId, {
+      ...plan,
+      artifactAction: {
+        kind: "apply",
+        mutation: {
+          ...(plan.artifactAction.kind === "apply"
+            ? plan.artifactAction.mutation
+            : (() => { throw new Error("expected apply plan"); })()),
+          title: "different title",
+        },
+      },
     })).rejects.toBeInstanceOf(MappedProjectionCollisionError);
     reopened.close();
   });
@@ -206,7 +289,7 @@ describe("SQLiteIngestionStateStore", () => {
         PRIMARY KEY(source_key, change_id)
       ) STRICT;
       INSERT INTO ingestion_change_receipts(source_key, change_id, change_json, projection_json)
-      SELECT source_key, change_id, resolved_change_json, projection_json
+      SELECT source_key, change_id, resolved_change_json, NULL
       FROM ingestion_change_receipts_v2;
       DROP TABLE ingestion_change_receipts_v2;
       UPDATE ingestion_state_meta
@@ -219,11 +302,96 @@ describe("SQLiteIngestionStateStore", () => {
     expect(await migrated.changeReceipt(source, item)).toEqual(expected);
     migrated.close();
 
-    const inspect = new DatabaseSync(path);
-    expect(inspect.prepare(`
-      SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
-    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
-    inspect.close();
+    expectSchemaVersion3(path);
+  });
+
+  it("migrates v2 semantic mapped projections to preserve-artifact plans without losing restart state", async () => {
+    const path = await databasePath();
+    const first = new SQLiteIngestionStateStore({ path });
+    const item = draft("legacy-v2-plan", {
+      effectiveAt: "2026-09-24T00:00:00Z",
+      recordedAt: "2026-09-24T00:01:00Z",
+    });
+    const resolved = await persistReceipt(first, item);
+    const desired = desiredProjection();
+    await first.putMappedPlan(source, item.changeId, {
+      semantic: desired,
+      artifactAction: { kind: "preserve" },
+    });
+    await first.setCheckpoint(source, sourceCheckpoint("cp-v2"));
+    await first.putProjection(projection());
+    const generation = await first.beginFullSyncGeneration(source, "2026-10-01T00:00:00Z");
+    await first.markSeen(generation.id, "project", "atlas");
+    first.close();
+
+    const raw = new DatabaseSync(path);
+    raw.exec("BEGIN IMMEDIATE");
+    try {
+      raw.exec(`
+        ALTER TABLE ingestion_change_receipts RENAME TO ingestion_change_receipts_v3;
+        CREATE TABLE ingestion_change_receipts (
+          source_key TEXT NOT NULL,
+          change_id TEXT NOT NULL,
+          provider_change_json TEXT NOT NULL CHECK(json_valid(provider_change_json)),
+          resolved_change_json TEXT NOT NULL CHECK(json_valid(resolved_change_json)),
+          projection_json TEXT CHECK(projection_json IS NULL OR json_valid(projection_json)),
+          PRIMARY KEY(source_key, change_id)
+        ) STRICT;
+      `);
+      const receipt = raw.prepare(`
+        SELECT source_key, change_id, provider_change_json, resolved_change_json
+        FROM ingestion_change_receipts_v3
+        WHERE source_key = ? AND change_id = ?
+      `).get(source, item.changeId) as {
+        source_key: string;
+        change_id: string;
+        provider_change_json: string;
+        resolved_change_json: string;
+      };
+      raw.prepare(`
+        INSERT INTO ingestion_change_receipts(
+          source_key, change_id, provider_change_json, resolved_change_json, projection_json
+        ) VALUES (?, ?, ?, ?, ?)
+      `).run(
+        receipt.source_key,
+        receipt.change_id,
+        receipt.provider_change_json,
+        receipt.resolved_change_json,
+        desiredProjectionJson(desired),
+      );
+      raw.exec(`
+        DROP TABLE ingestion_change_receipts_v3;
+        UPDATE ingestion_state_meta
+        SET schema_version = 2
+        WHERE component = 'ingestion-state-store';
+      `);
+      raw.exec("COMMIT");
+    } catch (cause) {
+      raw.exec("ROLLBACK");
+      raw.close();
+      throw cause;
+    }
+    raw.close();
+
+    const migrated = new SQLiteIngestionStateStore({ path });
+    expect(await migrated.checkpoint(source)).toBe(sourceCheckpoint("cp-v2"));
+    expect(await migrated.changeReceipt(source, item)).toEqual(resolved);
+    expect(await migrated.mappedPlan(source, item.changeId)).toEqual({
+      semantic: expect.objectContaining({
+        additiveEntities: [{ entityId: "entity://project/atlas", entityType: "Project" }],
+      }),
+      artifactAction: { kind: "preserve" },
+    });
+    expect(await migrated.putMappedPlan(source, item.changeId, {
+      semantic: desired,
+      artifactAction: { kind: "preserve" },
+    })).toBe("existing");
+    expect(await migrated.projection(source, "project", "atlas")).toEqual(projection());
+    expect(await migrated.activeFullSyncGeneration(source)).toEqual(generation);
+    expect(await migrated.unseenProjections(generation.id)).toEqual([]);
+    migrated.close();
+
+    expectSchemaVersion3(path);
   });
 
   it("persists an active full-sync generation and seen set across close/reopen", async () => {
@@ -240,8 +408,9 @@ describe("SQLiteIngestionStateStore", () => {
       ...generation,
       observedAt: "2026-10-01T00:00:00.000Z",
     });
-    expect((await reopened.unseenProjections(generation.id)).map((item) => item.externalId))
-      .toEqual(["zeus"]);
+    const unseenAfterReopen = await reopened.unseenProjections(generation.id);
+    expect(unseenAfterReopen).toHaveLength(1);
+    expect(unseenAfterReopen[0]?.externalId).toBe("zeus");
     reopened.close();
   });
 

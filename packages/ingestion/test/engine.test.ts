@@ -1,21 +1,31 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EntityId, StateValue } from "@ssrl/core";
+import {
+  ArtifactBlobCorruptError,
+  type ArtifactMutation,
+  type ArtifactStore,
+} from "@ssrl/artifact-store";
+import { LocalArtifactStore } from "@ssrl/storage-local-artifacts";
 import { TestSemanticStateStore } from "./test-semantic-store.js";
 import {
   InMemoryIngestionStateStore,
   IngestionEngine,
+  InvalidSourceChangeError,
+  mappedIngestionPlanJson,
   SourceChangeCollisionError,
   ingestionSourceKey,
   resolveSourceChange,
   sourceCheckpoint,
   sourceContinuation,
+  type ArtifactProjectionMapper,
   type DesiredProjection,
   type IncrementalSource,
   type IngestionStateStore,
   type IngestionSourceKey,
+  type MappedIngestionPlan,
   type ProjectionMapper,
   type ResourceProjection,
   type SourceChange,
@@ -35,6 +45,12 @@ async function databasePath(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ssrl-ingestion-"));
   roots.push(root);
   return join(root, "semantic.sqlite");
+}
+
+async function artifactRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "ssrl-ingestion-artifact-"));
+  roots.push(root);
+  return root;
 }
 
 afterEach(async () => {
@@ -169,15 +185,15 @@ class DelegatingIngestionState implements IngestionStateStore {
   ) {
     return this.inner.putChangeReceipt(source, change, resolved);
   }
-  mappedProjection(source: IngestionSourceKey, changeId: string) {
-    return this.inner.mappedProjection(source, changeId);
+  mappedPlan(source: IngestionSourceKey, changeId: string) {
+    return this.inner.mappedPlan(source, changeId);
   }
-  putMappedProjection(
+  putMappedPlan(
     source: IngestionSourceKey,
     changeId: string,
-    projection: DesiredProjection,
+    plan: MappedIngestionPlan,
   ) {
-    return this.inner.putMappedProjection(source, changeId, projection);
+    return this.inner.putMappedPlan(source, changeId, plan);
   }
   activeFullSyncGeneration(source: IngestionSourceKey) {
     return this.inner.activeFullSyncGeneration(source);
@@ -216,15 +232,134 @@ class FailCheckpointOnceState extends DelegatingIngestionState {
   }
 }
 
-async function runtime(ingestionState: IngestionStateStore = new InMemoryIngestionStateStore()) {
+class FailMappedPlanOnceState extends DelegatingIngestionState {
+  #failed = false;
+  override async putMappedPlan(
+    source: IngestionSourceKey,
+    changeId: string,
+    plan: MappedIngestionPlan,
+  ): Promise<"inserted" | "existing"> {
+    if (!this.#failed) {
+      this.#failed = true;
+      throw new Error("simulated mapped-plan persistence crash");
+    }
+    return super.putMappedPlan(source, changeId, plan);
+  }
+}
+
+class RecordingIngestionState extends DelegatingIngestionState {
+  constructor(inner: IngestionStateStore, readonly events: string[]) { super(inner); }
+  override async putMappedPlan(source: IngestionSourceKey, changeId: string, plan: MappedIngestionPlan) {
+    const result = await super.putMappedPlan(source, changeId, plan);
+    this.events.push("plan");
+    return result;
+  }
+  override async putProjection(projection: ResourceProjection): Promise<void> {
+    await super.putProjection(projection);
+    this.events.push("projection");
+  }
+  override async setCheckpoint(source: IngestionSourceKey, checkpoint: SourceCheckpoint): Promise<void> {
+    await super.setCheckpoint(source, checkpoint);
+    this.events.push("checkpoint");
+  }
+}
+
+class RecordingArtifactStore implements ArtifactStore {
+  #failAppendOnce = false;
+  constructor(
+    readonly inner: ArtifactStore,
+    readonly events: string[],
+  ) {}
+  failNextAppend() { this.#failAppendOnce = true; }
+  async putBlob(bytes: Uint8Array, mediaType: string) {
+    const blob = await this.inner.putBlob(bytes, mediaType);
+    this.events.push("blob");
+    return blob;
+  }
+  headBlob(...args: Parameters<ArtifactStore["headBlob"]>) { return this.inner.headBlob(...args); }
+  readBlobRange(...args: Parameters<ArtifactStore["readBlobRange"]>) {
+    return this.inner.readBlobRange(...args);
+  }
+  async append(mutations: readonly ArtifactMutation[]) {
+    this.events.push("artifact");
+    if (this.#failAppendOnce) {
+      this.#failAppendOnce = false;
+      throw new Error("simulated artifact append failure");
+    }
+    return this.inner.append(mutations);
+  }
+  mutation(...args: Parameters<ArtifactStore["mutation"]>) { return this.inner.mutation(...args); }
+  mutationsForResource(...args: Parameters<ArtifactStore["mutationsForResource"]>) {
+    return this.inner.mutationsForResource(...args);
+  }
+  snapshot() { return this.inner.snapshot(); }
+}
+
+class RecordingSemanticStore extends TestSemanticStateStore {
+  #failAppendOnce = false;
+  constructor(readonly events: string[]) { super(); }
+  failNextAppend() { this.#failAppendOnce = true; }
+  override async append(batch: Parameters<TestSemanticStateStore["append"]>[0]) {
+    this.events.push("semantic");
+    if (this.#failAppendOnce) {
+      this.#failAppendOnce = false;
+      throw new Error("simulated semantic append failure");
+    }
+    return super.append(batch);
+  }
+}
+
+function rawArtifactMapper(
+  bytes: Uint8Array,
+  calls?: { count: number },
+): ArtifactProjectionMapper<ProjectPayload> {
+  return {
+    projectArtifact() {
+      if (calls !== undefined) calls.count += 1;
+      return {
+        bytes,
+        mediaType: "application/octet-stream",
+        title: "Atlas raw payload",
+        sourceUri: "source://synthetic/atlas",
+      };
+    },
+  };
+}
+
+const semanticMapperMustNotRun: ProjectionMapper<ProjectPayload> = {
+  project() { throw new Error("semantic mapper must not rerun"); },
+};
+
+const artifactMapperMustNotRun: ArtifactProjectionMapper<ProjectPayload> = {
+  projectArtifact() { throw new Error("artifact mapper must not rerun"); },
+};
+
+async function runtime(
+  ingestionState: IngestionStateStore = new InMemoryIngestionStateStore(),
+  options: { readonly artifactStore?: ArtifactStore; readonly semantic?: TestSemanticStateStore } = {},
+) {
   await databasePath();
-  const semantic = new TestSemanticStateStore();
+  const semantic = options.semantic ?? new TestSemanticStateStore();
   const engine = new IngestionEngine({
     semanticState: semantic,
     ingestionState,
+    ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
     now: () => "2026-09-24T12:00:00Z",
   });
   return { semantic, ingestionState, engine };
+}
+
+async function localArtifactRuntime(
+  ingestionState: IngestionStateStore = new InMemoryIngestionStateStore(),
+  semantic?: TestSemanticStateStore,
+) {
+  const root = await artifactRoot();
+  const artifacts = new LocalArtifactStore({ root });
+  const configured = await runtime(ingestionState, {
+    artifactStore: artifacts,
+    ...(semantic === undefined ? {} : { semantic }),
+  });
+  return { ...configured, artifacts, root };
 }
 
 function singlePageSource(
@@ -627,6 +762,364 @@ describe("IngestionEngine", () => {
       effectiveFrom: "2026-10-01T00:00:00.000Z",
       recordedAt: "2026-10-01T00:00:00.000Z",
     }));
+    semantic.close();
+  });
+
+  it("rejects binary provider payloads so raw bytes cannot enter durable change receipts", () => {
+    expect(() => resolveSourceChange({
+      changeId: "binary-payload",
+      externalType: "project",
+      externalId: "atlas",
+      kind: "upsert",
+      payload: { raw: new Uint8Array([0, 255, 1]) },
+    }, "2026-09-24T00:00:00Z")).toThrow(InvalidSourceChangeError);
+  });
+
+  it("orders artifact ingestion as blob -> durable plan -> artifact -> semantic -> projection -> checkpoint", async () => {
+    const events: string[] = [];
+    const innerState = new InMemoryIngestionStateStore();
+    const ingestionState = new RecordingIngestionState(innerState, events);
+    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
+    const artifacts = new RecordingArtifactStore(localArtifacts, events);
+    const semantic = new RecordingSemanticStore(events);
+    const { engine } = await runtime(ingestionState, { artifactStore: artifacts, semantic });
+    const bytes = new Uint8Array([0, 1, 2, 255, 4]);
+
+    const result = await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("artifact-order", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+      ], sourceCheckpoint("cp-artifact-order")),
+      mapper,
+      artifactMapper: rawArtifactMapper(bytes),
+    });
+
+    expect(events).toEqual(["blob", "plan", "artifact", "semantic", "projection", "checkpoint"]);
+    expect(result.artifactMutationsAppended).toBe(1);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
+    const plan = await innerState.mappedPlan(sourceKey, "artifact-order");
+    expect(plan).toBeDefined();
+    const planJson = mappedIngestionPlanJson(plan!);
+    expect(planJson).not.toContain("\"bytes\"");
+    expect(planJson).not.toContain("255");
+    expect(planJson).not.toContain("RAW-PAYLOAD");
+    expect(plan?.artifactAction.kind).toBe("apply");
+    if (plan?.artifactAction.kind !== "apply" || plan.artifactAction.mutation.kind !== "upsert") {
+      throw new Error("expected artifact upsert plan");
+    }
+    expect(plan.artifactAction.mutation).toEqual(expect.objectContaining({
+      resource: { sourceKey, externalType: "project", externalId: "atlas" },
+      effectiveAt: "2026-09-24T00:00:00.000Z",
+      recordedAt: "2026-09-24T00:00:01.000Z",
+      revision: "r1",
+    }));
+    const read = await localArtifacts.readBlobRange(plan.artifactAction.mutation.blob.digest, {
+      maxBytes: bytes.byteLength,
+    });
+    expect([...read.bytes]).toEqual([...bytes]);
+    expect((await innerState.projection(sourceKey, "project", "atlas"))?.artifact)
+      .toEqual(expect.objectContaining({ latestMutationId: expect.any(String) }));
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("safely retries when the process crashes after blob installation but before plan persistence", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const failingPlan = new FailMappedPlanOnceState(innerState);
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(failingPlan);
+    const source = singlePageSource([
+      change("blob-before-plan", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+    ]);
+    const artifactCalls = { count: 0 };
+    let semanticMapperCalls = 0;
+    const countingMapper: ProjectionMapper<ProjectPayload> = {
+      project(item) {
+        semanticMapperCalls += 1;
+        return mapper.project(item);
+      },
+    };
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper: countingMapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([31, 0, 255, 32]), artifactCalls),
+    })).rejects.toThrow(/mapped-plan persistence crash/);
+    expect(artifactCalls.count).toBe(1);
+    expect(semanticMapperCalls).toBe(1);
+    expect((await localArtifacts.snapshot()).blobs).toHaveLength(1);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(0);
+    expect(await innerState.mappedPlan(sourceKey, "blob-before-plan")).toBeUndefined();
+    expect(await innerState.checkpoint(sourceKey)).toBeUndefined();
+
+    const replay = await engine.sync({
+      sourceKey,
+      source,
+      mapper: countingMapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([31, 0, 255, 32]), artifactCalls),
+    });
+    expect(artifactCalls.count).toBe(2);
+    expect(semanticMapperCalls).toBe(2);
+    expect(replay.artifactMutationsAppended).toBe(1);
+    expect((await localArtifacts.snapshot()).blobs).toHaveLength(1);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("replays a persisted artifact plan without rerunning semantic or artifact mappers", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const failingProjection = new FailProjectionOnceState(innerState);
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(failingProjection);
+    const source = singlePageSource([
+      change("artifact-plan-replay", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+    ]);
+    const artifactCalls = { count: 0 };
+    let semanticMapperCalls = 0;
+    const countingMapper: ProjectionMapper<ProjectPayload> = {
+      project(item) {
+        semanticMapperCalls += 1;
+        return mapper.project(item);
+      },
+    };
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper: countingMapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([9, 8, 7]), artifactCalls),
+    })).rejects.toThrow(/projection persistence crash/);
+    expect(semanticMapperCalls).toBe(1);
+    expect(artifactCalls.count).toBe(1);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
+
+    const replay = await engine.sync({
+      sourceKey,
+      source,
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
+    });
+    expect(replay.artifactMutationsAppended).toBe(0);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
+    expect(await innerState.checkpoint(sourceKey)).toBe(sourceCheckpoint("cp-1"));
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("stops before semantic/projection/checkpoint when artifact append fails and safely replays", async () => {
+    const events: string[] = [];
+    const innerState = new InMemoryIngestionStateStore();
+    const ingestionState = new RecordingIngestionState(innerState, events);
+    const localArtifacts = new LocalArtifactStore({ root: await artifactRoot() });
+    const artifacts = new RecordingArtifactStore(localArtifacts, events);
+    artifacts.failNextAppend();
+    const semantic = new RecordingSemanticStore(events);
+    const { engine } = await runtime(ingestionState, { artifactStore: artifacts, semantic });
+    const source = singlePageSource([
+      change("artifact-fail", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+    ]);
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([4, 5, 6])),
+    })).rejects.toThrow(/artifact append failure/);
+    expect(events).toEqual(["blob", "plan", "artifact"]);
+    expect((await semantic.snapshot()).observations).toEqual([]);
+    expect(await innerState.projection(sourceKey, "project", "atlas")).toBeUndefined();
+    expect(await innerState.checkpoint(sourceKey)).toBeUndefined();
+
+    events.length = 0;
+    const result = await engine.sync({
+      sourceKey,
+      source,
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
+    });
+    expect(events).toEqual(["artifact", "semantic", "projection", "checkpoint"]);
+    expect(result.artifactMutationsAppended).toBe(1);
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("fails closed when a persisted artifact plan references a missing blob and never reruns mappers", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const localRoot = await artifactRoot();
+    const localArtifacts = new LocalArtifactStore({ root: localRoot });
+    const artifacts = new RecordingArtifactStore(localArtifacts, []);
+    artifacts.failNextAppend();
+    const semantic = new TestSemanticStateStore();
+    const engine = new IngestionEngine({
+      semanticState: semantic,
+      ingestionState: innerState,
+      artifactStore: artifacts,
+      now: () => "2026-09-24T12:00:00Z",
+    });
+    const source = singlePageSource([
+      change("missing-planned-blob", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+    ]);
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([51, 52, 53])),
+    })).rejects.toThrow(/artifact append failure/);
+    const plan = await innerState.mappedPlan(sourceKey, "missing-planned-blob");
+    if (plan?.artifactAction.kind !== "apply" || plan.artifactAction.mutation.kind !== "upsert") {
+      throw new Error("expected persisted artifact upsert plan");
+    }
+    const digest = plan.artifactAction.mutation.blob.digest;
+    await unlink(join(localRoot, "blobs", "sha256", digest.slice("sha256:".length)));
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
+    })).rejects.toBeInstanceOf(ArtifactBlobCorruptError);
+    expect((await semantic.snapshot()).observations).toEqual([]);
+    expect(await innerState.projection(sourceKey, "project", "atlas")).toBeUndefined();
+    expect(await innerState.checkpoint(sourceKey)).toBeUndefined();
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("leaves durable artifact evidence but no projection/checkpoint when semantic append fails", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const semantic = new RecordingSemanticStore([]);
+    semantic.failNextAppend();
+    const { artifacts: localArtifacts, engine } = await localArtifactRuntime(innerState, semantic);
+    const source = singlePageSource([
+      change("semantic-fail-after-artifact", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+    ]);
+
+    await expect(engine.sync({
+      sourceKey,
+      source,
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([1, 3, 3, 7])),
+    })).rejects.toThrow(/semantic append failure/);
+    expect((await localArtifacts.snapshot()).mutations).toHaveLength(1);
+    expect(await innerState.projection(sourceKey, "project", "atlas")).toBeUndefined();
+    expect(await innerState.checkpoint(sourceKey)).toBeUndefined();
+
+    const replay = await engine.sync({
+      sourceKey,
+      source,
+      mapper: semanticMapperMustNotRun,
+      artifactMapper: artifactMapperMustNotRun,
+    });
+    expect(replay.artifactMutationsAppended).toBe(0);
+    expect((await semantic.snapshot()).observations).toHaveLength(1);
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("deletes a live artifact when configured mapper later returns no raw content", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(innerState);
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("artifact-v1", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+      ]),
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([10, 11])),
+    });
+    const previous = await innerState.projection(sourceKey, "project", "atlas");
+    expect(previous?.artifact).toBeDefined();
+
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("artifact-none", "atlas", { name: "Atlas", status: "paused" }, {
+          revision: "r2",
+          effectiveAt: "2026-09-25T00:00:00Z",
+          recordedAt: "2026-09-25T00:01:00Z",
+        }),
+      ], sourceCheckpoint("cp-artifact-none")),
+      mapper,
+      artifactMapper: { projectArtifact: () => undefined },
+    });
+    const history = await localArtifacts.mutationsForResource({
+      sourceKey,
+      externalType: "project",
+      externalId: "atlas",
+    });
+    expect(history.map((item) => item.kind)).toEqual(["upsert", "delete"]);
+    expect((await innerState.projection(sourceKey, "project", "atlas"))?.artifact).toBeUndefined();
+    semantic.close();
+    localArtifacts.close();
+  });
+
+  it("preserves a live artifact on structured-only upsert and deletes it on provider delete", async () => {
+    const innerState = new InMemoryIngestionStateStore();
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(innerState);
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("artifact-start", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+      ]),
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([21, 22])),
+    });
+    const live = (await innerState.projection(sourceKey, "project", "atlas"))?.artifact;
+
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("structured-only", "atlas", { name: "Atlas", status: "paused" }, { revision: "r2" }),
+      ], sourceCheckpoint("cp-structured")),
+      mapper,
+    });
+    expect((await innerState.projection(sourceKey, "project", "atlas"))?.artifact).toEqual(live);
+
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("provider-delete", "atlas", undefined, { kind: "delete", revision: "r3" }),
+      ], sourceCheckpoint("cp-delete")),
+      mapper,
+    });
+    expect((await innerState.projection(sourceKey, "project", "atlas"))?.artifact).toBeUndefined();
+    const history = await localArtifacts.mutationsForResource({ sourceKey, externalType: "project", externalId: "atlas" });
+    expect(history.map((item) => item.kind)).toEqual(["upsert", "delete"]);
+    localArtifacts.close();
+    semantic.close();
+  });
+
+  it("full-sync sweep deletes an unseen live artifact without requiring the artifact mapper", async () => {
+    const state = new InMemoryIngestionStateStore();
+    const { artifacts: localArtifacts, semantic, engine } = await localArtifactRuntime(state);
+    await engine.sync({
+      sourceKey,
+      source: singlePageSource([
+        change("full-artifact-start", "atlas", { name: "Atlas", status: "active" }, { revision: "r1" }),
+      ]),
+      mapper,
+      artifactMapper: rawArtifactMapper(new Uint8Array([71, 72, 73])),
+    });
+    await state.beginFullSyncGeneration(sourceKey, "2026-10-01T00:00:00Z");
+
+    const result = await engine.sync({
+      sourceKey,
+      source: singlePageSource([], sourceCheckpoint("cp-full-artifact-delete")),
+      mapper,
+    });
+
+    expect(result.sweptResources).toBe(1);
+    expect(result.artifactMutationsAppended).toBe(1);
+    const history = await localArtifacts.mutationsForResource({
+      sourceKey,
+      externalType: "project",
+      externalId: "atlas",
+    });
+    expect(history.map((item) => item.kind)).toEqual(["upsert", "delete"]);
+    expect((await state.projection(sourceKey, "project", "atlas"))?.deleted).toBe(true);
+    expect((await state.projection(sourceKey, "project", "atlas"))?.artifact).toBeUndefined();
+    localArtifacts.close();
     semantic.close();
   });
 
