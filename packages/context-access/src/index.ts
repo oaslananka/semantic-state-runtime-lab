@@ -180,7 +180,8 @@ export class HistoricalContextAccessUnsupportedError extends Error {
 
 function safeInteger(value: number, label: string, max?: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || (max !== undefined && value > max)) {
-    throw new RangeError(`${label} must be a positive safe integer${max === undefined ? "" : ` <= ${max}`}`);
+    const upperBound = max === undefined ? "" : ` <= ${max}`;
+    throw new RangeError(`${label} must be a positive safe integer${upperBound}`);
   }
   return value;
 }
@@ -398,45 +399,68 @@ export class ContextAccessGateway {
     return true;
   }
 
+  async #visibleCanonicalState(
+    capsule: ContextCapsule,
+    principal: AccessPrincipal | undefined,
+  ): Promise<{
+    readonly properties: Record<string, (typeof capsule.material.state.canonical.properties)[string]>;
+    readonly evidence: Record<string, (typeof capsule.material.state.evidence)[string]>;
+  }> {
+    const properties: Record<string, (typeof capsule.material.state.canonical.properties)[string]> = {};
+    const evidence: Record<string, (typeof capsule.material.state.evidence)[string]> = {};
+    for (const [property, state] of Object.entries(capsule.material.state.canonical.properties)) {
+      const propertyAllowed = await this.#allows(principal, {
+        kind: "property",
+        entityId: capsule.entityId,
+        property,
+      });
+      if (!propertyAllowed || !(await this.#stateValueAllowed(principal, state.value))) continue;
+      properties[property] = state;
+      const propertyEvidence = capsule.material.state.evidence[property];
+      if (propertyEvidence !== undefined) evidence[property] = propertyEvidence;
+    }
+    return { properties, evidence };
+  }
+
+  async #visibleConflicts(
+    capsule: ContextCapsule,
+    principal: AccessPrincipal | undefined,
+  ): Promise<{
+    readonly conflicts: typeof capsule.material.state.conflicts[number][];
+    readonly conflictEvidence: Record<string, (typeof capsule.material.state.conflictEvidence)[string]>;
+  }> {
+    const conflicts = [] as typeof capsule.material.state.conflicts[number][];
+    const conflictEvidence: Record<string, (typeof capsule.material.state.conflictEvidence)[string]> = {};
+    for (const conflict of capsule.material.state.conflicts) {
+      const propertyAllowed = await this.#allows(principal, {
+        kind: "property",
+        entityId: capsule.entityId,
+        property: conflict.property,
+      });
+      if (!propertyAllowed) continue;
+
+      let candidatesAllowed = true;
+      for (const candidate of conflict.candidates) {
+        if (!(await this.#stateValueAllowed(principal, candidate.value))) {
+          candidatesAllowed = false;
+          break;
+        }
+      }
+      if (!candidatesAllowed) continue;
+      conflicts.push(conflict);
+      const propertyEvidence = capsule.material.state.conflictEvidence[conflict.property];
+      if (propertyEvidence !== undefined) conflictEvidence[conflict.property] = propertyEvidence;
+    }
+    return { conflicts, conflictEvidence };
+  }
+
   async #visibleCapsule(
     capsule: ContextCapsule,
     principal: AccessPrincipal | undefined,
     activeRelations: readonly TemporalRelationEdge[],
   ): Promise<ContextCapsule> {
-    const properties: Record<string, (typeof capsule.material.state.canonical.properties)[string]> = {};
-    const evidence: Record<string, (typeof capsule.material.state.evidence)[string]> = {};
-    for (const [property, state] of Object.entries(capsule.material.state.canonical.properties)) {
-      if (!(await this.#allows(principal, { kind: "property", entityId: capsule.entityId, property }))) {
-        continue;
-      }
-      if (!(await this.#stateValueAllowed(principal, state.value))) continue;
-      properties[property] = state;
-      const propertyEvidence = capsule.material.state.evidence[property];
-      if (propertyEvidence !== undefined) evidence[property] = propertyEvidence;
-    }
-
-    const conflicts = [] as typeof capsule.material.state.conflicts[number][];
-    const conflictEvidence: Record<string, (typeof capsule.material.state.conflictEvidence)[string]> = {};
-    for (const conflict of capsule.material.state.conflicts) {
-      if (!(await this.#allows(principal, {
-        kind: "property",
-        entityId: capsule.entityId,
-        property: conflict.property,
-      }))) continue;
-      let visible = true;
-      for (const candidate of conflict.candidates) {
-        if (!(await this.#stateValueAllowed(principal, candidate.value))) {
-          visible = false;
-          break;
-        }
-      }
-      if (!visible) continue;
-      conflicts.push(conflict);
-      const propertyConflictEvidence = capsule.material.state.conflictEvidence[conflict.property];
-      if (propertyConflictEvidence !== undefined) {
-        conflictEvidence[conflict.property] = propertyConflictEvidence;
-      }
-    }
+    const { properties, evidence } = await this.#visibleCanonicalState(capsule, principal);
+    const { conflicts, conflictEvidence } = await this.#visibleConflicts(capsule, principal);
 
     return {
       ...capsule,

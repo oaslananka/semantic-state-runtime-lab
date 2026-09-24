@@ -36,6 +36,7 @@ import {
   ContextRelationCandidateLimitError,
   HistoricalContextAccessUnsupportedError,
   type ContextAccessEvent,
+  type ContextAccessGatewayOptions,
   type ContextAccessPolicy,
   type ContextAccessRequest,
 } from "../src/index.js";
@@ -314,19 +315,21 @@ const properties = [
   { property: "Person.timezone", aliases: ["timezone", "saat dilimi"] },
 ] as const;
 
-interface GatewayFixtureOptions {
-  readonly policy?: ContextAccessPolicy;
-  readonly maxBudgetTokens?: number;
-  readonly maxIdentityCandidates?: number;
-  readonly maxIdentityScans?: number;
-  readonly maxRelationCandidates?: number;
-  readonly maxRelationScans?: number;
-  readonly maxRelationEdges?: number;
+type GatewayFixtureOptions = Pick<
+  ContextAccessGatewayOptions,
+  | "policy"
+  | "maxBudgetTokens"
+  | "maxIdentityCandidates"
+  | "maxIdentityScans"
+  | "maxRelationCandidates"
+  | "maxRelationScans"
+  | "maxRelationEdges"
+  | "now"
+> & {
   readonly syncPageSize?: number;
   readonly syncMaxPages?: number;
-  readonly now?: () => string;
   readonly events?: ContextAccessEvent[];
-}
+};
 
 async function gatewayFixture(options: GatewayFixtureOptions = {}) {
   const path = await databasePath();
@@ -373,6 +376,27 @@ async function gatewayFixture(options: GatewayFixtureOptions = {}) {
 
 function contextText(result: Awaited<ReturnType<ContextAccessGateway["compile"]>>): string {
   return result.context.records.map((record) => record.text).join("\n");
+}
+
+
+async function compileOwnerScenario(policy: ContextAccessPolicy) {
+  const { sqlite, cache, gateway } = await gatewayFixture({ policy });
+  const result = await gateway.compile({
+    principal,
+    task: "Project Atlas owner timezone",
+    budgetTokens: 180,
+  });
+  return { sqlite, cache, result };
+}
+
+
+function expectOwnerNotExpanded(
+  cache: CountingCapsuleStore,
+  result: Awaited<ReturnType<ContextAccessGateway["compile"]>>,
+): void {
+  expect(result.relatedEntityIds).toEqual([]);
+  expect(cache.getCalls).not.toContain(alice);
+  expect(contextText(result)).not.toContain("Alice");
 }
 
 describe("ContextAccessGateway", () => {
@@ -429,19 +453,12 @@ describe("ContextAccessGateway", () => {
   });
 
   it("denies a related entity before fetching or traversing its capsule", async () => {
-    const { sqlite, cache, gateway } = await gatewayFixture({
-      policy: allowPolicy({ denyEntities: [alice] }),
-    });
-    const result = await gateway.compile({
-      principal,
-      task: "Project Atlas owner timezone",
-      budgetTokens: 180,
-    });
+    const { sqlite, cache, result } = await compileOwnerScenario(
+      allowPolicy({ denyEntities: [alice] }),
+    );
 
-    expect(result.relatedEntityIds).toEqual([]);
-    expect(cache.getCalls).not.toContain(alice);
+    expectOwnerNotExpanded(cache, result);
     expect(contextText(result)).not.toContain("Europe/Istanbul");
-    expect(contextText(result)).not.toContain("Alice");
     sqlite.close();
   });
 
@@ -477,18 +494,11 @@ describe("ContextAccessGateway", () => {
   });
 
   it("filters denied relations before related capsule fetch and context projection", async () => {
-    const { sqlite, cache, gateway } = await gatewayFixture({
-      policy: allowPolicy({ denyRelations: ["owner-alice"] }),
-    });
-    const result = await gateway.compile({
-      principal,
-      task: "Project Atlas owner timezone",
-      budgetTokens: 180,
-    });
+    const { sqlite, cache, result } = await compileOwnerScenario(
+      allowPolicy({ denyRelations: ["owner-alice"] }),
+    );
 
-    expect(result.relatedEntityIds).toEqual([]);
-    expect(cache.getCalls).not.toContain(alice);
-    expect(contextText(result)).not.toContain("Alice");
+    expectOwnerNotExpanded(cache, result);
     sqlite.close();
   });
 
