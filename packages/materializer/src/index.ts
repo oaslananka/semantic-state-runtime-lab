@@ -1,0 +1,334 @@
+import {
+  activeRelationEdges,
+  canonicalJson,
+  resolveTemporalState,
+  type AuthorityRule,
+  type EntityId,
+  type TemporalObservation,
+  type TemporalRelationEdge,
+  type TemporalStateResolution,
+  type TypedEntity,
+} from "@ssrl/core";
+import {
+  typedEntityFromAliasRecords,
+  type EntityAliasRecord,
+  type SemanticChangeCursor,
+  type SemanticStateStore,
+} from "@ssrl/state-store";
+
+export const CONTEXT_CAPSULE_SCHEMA = "ssrl-context-capsule-v1" as const;
+
+export interface ContextCapsuleState {
+  readonly canonical: TemporalStateResolution["canonical"];
+  readonly conflicts: TemporalStateResolution["conflicts"];
+  readonly evidence: TemporalStateResolution["evidence"];
+  readonly conflictEvidence: TemporalStateResolution["conflictEvidence"];
+}
+
+export interface ContextCapsuleMaterial {
+  readonly entity: TypedEntity;
+  readonly state: ContextCapsuleState;
+  readonly activeRelations: readonly TemporalRelationEdge[];
+  readonly nextTemporalBoundary?: string;
+}
+
+export interface ContextCapsule {
+  readonly schema: typeof CONTEXT_CAPSULE_SCHEMA;
+  readonly entityId: EntityId;
+  readonly materializedAt: string;
+  readonly configurationVersion: string;
+  readonly changeCursor?: SemanticChangeCursor;
+  readonly material: ContextCapsuleMaterial;
+}
+
+export type CapsuleWriteResult = "inserted" | "updated" | "unchanged";
+
+export interface ContextCapsuleStore {
+  get(entityId: EntityId): Promise<ContextCapsule | undefined>;
+  put(capsule: ContextCapsule): Promise<CapsuleWriteResult>;
+  delete(entityId: EntityId): Promise<boolean>;
+  checkpoint(): Promise<SemanticChangeCursor | undefined>;
+  setCheckpoint(cursor: SemanticChangeCursor): Promise<void>;
+  staleEntityIds(at: string, configurationVersion: string): Promise<readonly EntityId[]>;
+}
+
+export interface ContextCapsuleMaterializerOptions {
+  readonly stateStore: SemanticStateStore;
+  readonly authorityByEntity?: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly configurationVersion?: string;
+}
+
+export interface IncrementalCapsuleWorkerOptions {
+  readonly stateStore: SemanticStateStore;
+  readonly capsuleStore: ContextCapsuleStore;
+  readonly materializer: ContextCapsuleMaterializer;
+}
+
+export interface CapsuleWorkerRunRequest {
+  readonly at: string;
+  readonly limit?: number;
+}
+
+export interface CapsuleWorkerRunResult {
+  readonly changesRead: number;
+  readonly changedEntityIds: readonly EntityId[];
+  readonly staleEntityIds: readonly EntityId[];
+  readonly materializedEntityIds: readonly EntityId[];
+  readonly deletedEntityIds: readonly EntityId[];
+  readonly writes: Readonly<Record<CapsuleWriteResult, number>>;
+  readonly checkpoint?: SemanticChangeCursor;
+  readonly hasMoreChanges: boolean;
+}
+
+function timestamp(value: string, label: string): number {
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis)) throw new TypeError(`${label} must be a valid timestamp`);
+  return millis;
+}
+
+function isoTimestamp(value: string, label: string): string {
+  return new Date(timestamp(value, label)).toISOString();
+}
+
+function sortedUniqueEntityIds(values: readonly EntityId[]): EntityId[] {
+  return [...new Set(values)].sort((left, right) => left.localeCompare(right));
+}
+
+function aliasKnownAt(alias: EntityAliasRecord, atMillis: number): boolean {
+  return timestamp(alias.recordedAt, `alias ${alias.id} recordedAt`) <= atMillis;
+}
+
+function typedEntity(
+  entityId: EntityId,
+  entityType: string,
+  aliases: readonly EntityAliasRecord[],
+  atMillis: number,
+): TypedEntity {
+  return typedEntityFromAliasRecords(
+    { entityId, entityType },
+    aliases.filter((alias) => aliasKnownAt(alias, atMillis)),
+  );
+}
+
+interface TemporalWindow {
+  readonly validFrom: string;
+  readonly validTo?: string;
+  readonly recordedAt: string;
+}
+
+function temporalBoundaries(window: TemporalWindow, atMillis: number): number[] {
+  const validFrom = timestamp(window.validFrom, "validFrom");
+  const recordedAt = timestamp(window.recordedAt, "recordedAt");
+  const validTo = window.validTo === undefined
+    ? Number.POSITIVE_INFINITY
+    : timestamp(window.validTo, "validTo");
+  const activation = Math.max(validFrom, recordedAt);
+  if (activation >= validTo) return [];
+
+  const candidates: number[] = [];
+  if (activation > atMillis) candidates.push(activation);
+  if (validTo > atMillis && Number.isFinite(validTo)) candidates.push(validTo);
+  return candidates;
+}
+
+function nextTemporalBoundary(
+  aliases: readonly EntityAliasRecord[],
+  observations: readonly TemporalObservation[],
+  relations: readonly TemporalRelationEdge[],
+  atMillis: number,
+): string | undefined {
+  const candidates: number[] = [];
+  for (const alias of aliases) {
+    const recordedAt = timestamp(alias.recordedAt, `alias ${alias.id} recordedAt`);
+    if (recordedAt > atMillis) candidates.push(recordedAt);
+  }
+  for (const observation of observations) {
+    candidates.push(...temporalBoundaries(observation, atMillis));
+  }
+  for (const relation of relations) {
+    candidates.push(...temporalBoundaries(relation, atMillis));
+  }
+  if (candidates.length === 0) return undefined;
+  return new Date(Math.min(...candidates)).toISOString();
+}
+
+export function relatedEntityIdsFromCapsule(capsule: ContextCapsule): EntityId[] {
+  return sortedUniqueEntityIds(capsule.material.activeRelations.map((relation) => relation.to));
+}
+
+export function contextCapsuleMaterialJson(material: ContextCapsuleMaterial): string {
+  return canonicalJson(material);
+}
+
+export class ContextCapsuleMaterializer {
+  readonly #stateStore: SemanticStateStore;
+  readonly #authorityByEntity: ReadonlyMap<EntityId, readonly AuthorityRule[]>;
+  readonly configurationVersion: string;
+
+  constructor(options: ContextCapsuleMaterializerOptions) {
+    this.#stateStore = options.stateStore;
+    this.#authorityByEntity = options.authorityByEntity ?? new Map();
+    this.configurationVersion = options.configurationVersion ?? "default";
+    if (this.configurationVersion.length === 0) {
+      throw new TypeError("configurationVersion must not be empty");
+    }
+  }
+
+  async materializeEntity(
+    entityId: EntityId,
+    at: string,
+    changeCursor?: SemanticChangeCursor,
+  ): Promise<ContextCapsule | undefined> {
+    const materializedAt = isoTimestamp(at, "materialization time");
+    const atMillis = Date.parse(materializedAt);
+    const entity = await this.#stateStore.entity(entityId);
+    if (entity === undefined) return undefined;
+
+    const [aliases, observations, relations] = await Promise.all([
+      this.#stateStore.aliasesForEntity(entityId),
+      this.#stateStore.observationsForEntity(entityId),
+      this.#stateStore.relationsFromEntity(entityId),
+    ]);
+    const resolution = resolveTemporalState({
+      entityId,
+      observations,
+      validAt: materializedAt,
+      knownAt: materializedAt,
+      authority: this.#authorityByEntity.get(entityId) ?? [],
+    });
+    const activeRelations = activeRelationEdges({
+      edges: relations,
+      fromEntityIds: [entityId],
+      validAt: materializedAt,
+      knownAt: materializedAt,
+    });
+    const boundary = nextTemporalBoundary(aliases, observations, relations, atMillis);
+
+    return {
+      schema: CONTEXT_CAPSULE_SCHEMA,
+      entityId,
+      materializedAt,
+      configurationVersion: this.configurationVersion,
+      ...(changeCursor === undefined ? {} : { changeCursor }),
+      material: {
+        entity: typedEntity(entityId, entity.entityType, aliases, atMillis),
+        state: {
+          canonical: resolution.canonical,
+          conflicts: resolution.conflicts,
+          evidence: resolution.evidence,
+          conflictEvidence: resolution.conflictEvidence,
+        },
+        activeRelations,
+        ...(boundary === undefined ? {} : { nextTemporalBoundary: boundary }),
+      },
+    };
+  }
+}
+
+export class InMemoryContextCapsuleStore implements ContextCapsuleStore {
+  readonly #capsules = new Map<EntityId, ContextCapsule>();
+  #checkpoint: SemanticChangeCursor | undefined;
+
+  async get(entityId: EntityId): Promise<ContextCapsule | undefined> {
+    return this.#capsules.get(entityId);
+  }
+
+  async put(capsule: ContextCapsule): Promise<CapsuleWriteResult> {
+    const previous = this.#capsules.get(capsule.entityId);
+    let result: CapsuleWriteResult = "inserted";
+    if (previous !== undefined) {
+      const sameMaterial = contextCapsuleMaterialJson(previous.material)
+        === contextCapsuleMaterialJson(capsule.material);
+      result = sameMaterial && previous.configurationVersion === capsule.configurationVersion
+        ? "unchanged"
+        : "updated";
+    }
+    this.#capsules.set(capsule.entityId, capsule);
+    return result;
+  }
+
+  async delete(entityId: EntityId): Promise<boolean> {
+    return this.#capsules.delete(entityId);
+  }
+
+  async checkpoint(): Promise<SemanticChangeCursor | undefined> {
+    return this.#checkpoint;
+  }
+
+  async setCheckpoint(cursor: SemanticChangeCursor): Promise<void> {
+    this.#checkpoint = cursor;
+  }
+
+  async staleEntityIds(
+    at: string,
+    configurationVersion: string,
+  ): Promise<readonly EntityId[]> {
+    const atMillis = timestamp(at, "stale check time");
+    const stale: EntityId[] = [];
+    for (const capsule of this.#capsules.values()) {
+      const boundary = capsule.material.nextTemporalBoundary;
+      const boundaryExpired = boundary !== undefined && Date.parse(boundary) <= atMillis;
+      if (boundaryExpired || capsule.configurationVersion !== configurationVersion) {
+        stale.push(capsule.entityId);
+      }
+    }
+    return stale.sort((left, right) => left.localeCompare(right));
+  }
+}
+
+function emptyWrites(): Record<CapsuleWriteResult, number> {
+  return { inserted: 0, updated: 0, unchanged: 0 };
+}
+
+export class IncrementalContextCapsuleWorker {
+  readonly #stateStore: SemanticStateStore;
+  readonly #capsuleStore: ContextCapsuleStore;
+  readonly #materializer: ContextCapsuleMaterializer;
+
+  constructor(options: IncrementalCapsuleWorkerOptions) {
+    this.#stateStore = options.stateStore;
+    this.#capsuleStore = options.capsuleStore;
+    this.#materializer = options.materializer;
+  }
+
+  async runOnce(request: CapsuleWorkerRunRequest): Promise<CapsuleWorkerRunResult> {
+    const at = isoTimestamp(request.at, "worker time");
+    const checkpoint = await this.#capsuleStore.checkpoint();
+    const page = await this.#stateStore.changesAfter(checkpoint, request.limit ?? 100);
+    const changedEntityIds = sortedUniqueEntityIds(
+      page.changes.map((change) => change.primaryEntityId),
+    );
+    const staleEntityIds = sortedUniqueEntityIds(
+      await this.#capsuleStore.staleEntityIds(at, this.#materializer.configurationVersion),
+    );
+    const targets = sortedUniqueEntityIds([...changedEntityIds, ...staleEntityIds]);
+    const materializedEntityIds: EntityId[] = [];
+    const deletedEntityIds: EntityId[] = [];
+    const writes = emptyWrites();
+
+    for (const entityId of targets) {
+      const capsule = await this.#materializer.materializeEntity(entityId, at, page.nextCursor ?? checkpoint);
+      if (capsule === undefined) {
+        if (await this.#capsuleStore.delete(entityId)) deletedEntityIds.push(entityId);
+        continue;
+      }
+      const result = await this.#capsuleStore.put(capsule);
+      writes[result] += 1;
+      materializedEntityIds.push(entityId);
+    }
+
+    if (page.nextCursor !== undefined && page.nextCursor !== checkpoint) {
+      await this.#capsuleStore.setCheckpoint(page.nextCursor);
+    }
+    return {
+      changesRead: page.changes.length,
+      changedEntityIds,
+      staleEntityIds,
+      materializedEntityIds,
+      deletedEntityIds,
+      writes,
+      ...(page.nextCursor === undefined ? {} : { checkpoint: page.nextCursor }),
+      hasMoreChanges: page.hasMore,
+    };
+  }
+}

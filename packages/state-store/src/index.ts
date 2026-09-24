@@ -37,6 +37,27 @@ export interface SemanticAppendCounts {
   readonly relations: number;
 }
 
+
+/** Backend-defined opaque cursor. Consumers must not parse or increment it. */
+declare const semanticChangeCursorBrand: unique symbol;
+export type SemanticChangeCursor = string & {
+  readonly [semanticChangeCursorBrand]: true;
+};
+
+export interface SemanticChange {
+  readonly cursor: SemanticChangeCursor;
+  readonly kind: SemanticRecordKind;
+  readonly recordId: string;
+  readonly primaryEntityId: EntityId;
+  readonly affectedEntityIds: readonly EntityId[];
+}
+
+export interface SemanticChangePage {
+  readonly changes: readonly SemanticChange[];
+  readonly nextCursor?: SemanticChangeCursor;
+  readonly hasMore: boolean;
+}
+
 export interface SemanticStateSnapshot {
   readonly schema: typeof SEMANTIC_STATE_SNAPSHOT_SCHEMA;
   readonly entities: readonly SemanticEntity[];
@@ -58,9 +79,12 @@ export interface AliasLookupResult {
 export interface SemanticStateStore {
   append(batch: SemanticStateBatch): Promise<SemanticAppendCounts>;
   snapshot(): Promise<SemanticStateSnapshot>;
+  entity(entityId: EntityId): Promise<SemanticEntity | undefined>;
+  aliasesForEntity(entityId: EntityId): Promise<readonly EntityAliasRecord[]>;
   observationsForEntity(entityId: EntityId): Promise<readonly TemporalObservation[]>;
   relationsFromEntity(entityId: EntityId): Promise<readonly TemporalRelationEdge[]>;
   lookupAlias(value: string): Promise<AliasLookupResult>;
+  changesAfter(cursor?: SemanticChangeCursor, limit?: number): Promise<SemanticChangePage>;
 }
 
 export type SemanticRecordKind = "entity" | "alias" | "observation" | "relation";
@@ -79,6 +103,14 @@ export class UnknownSemanticEntityError extends Error {
   constructor(readonly entityId: EntityId) {
     super(`Semantic record references unknown entity ${entityId}`);
     this.name = "UnknownSemanticEntityError";
+  }
+}
+
+
+export class InvalidSemanticChangeCursorError extends Error {
+  constructor(readonly cursor: string) {
+    super(`Invalid semantic change cursor: ${cursor}`);
+    this.name = "InvalidSemanticChangeCursorError";
   }
 }
 
@@ -286,6 +318,22 @@ export function emptySemanticStateSnapshot(): SemanticStateSnapshot {
   };
 }
 
+export function typedEntityFromAliasRecords(
+  entity: SemanticEntity,
+  aliases: readonly EntityAliasRecord[],
+): TypedEntity {
+  return {
+    id: entity.entityId,
+    type: entity.entityType,
+    aliases: [...aliases]
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .map((alias) => ({
+        value: alias.value,
+        ...(alias.evidenceRefs === undefined ? {} : { evidenceRefs: alias.evidenceRefs }),
+      })),
+  };
+}
+
 export function typedEntitiesFromStateSnapshot(
   snapshot: SemanticStateSnapshot,
 ): TypedEntity[] {
@@ -301,16 +349,6 @@ export function typedEntitiesFromStateSnapshot(
     if (aliases.length === 0) {
       throw new Error(`Entity ${entity.entityId} cannot hydrate TypedEntity without an alias`);
     }
-    return {
-      id: entity.entityId,
-      type: entity.entityType,
-      aliases: aliases
-        .slice()
-        .sort((left, right) => left.id.localeCompare(right.id))
-        .map((alias) => ({
-          value: alias.value,
-          ...(alias.evidenceRefs === undefined ? {} : { evidenceRefs: alias.evidenceRefs }),
-        })),
-    };
+    return typedEntityFromAliasRecords(entity, aliases);
   });
 }

@@ -219,6 +219,25 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  packages/materializer:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+    devDependencies:
+      '@ssrl/context':
+        specifier: workspace:*
+        version: link:../context
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/mcp-server:
     dependencies:
       '@modelcontextprotocol/server':

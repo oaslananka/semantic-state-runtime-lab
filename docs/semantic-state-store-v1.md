@@ -181,8 +181,10 @@ It uses a component-scoped row:
 ```text
 semantic_state_meta
   component = semantic-state-store
-  schema_version = 1
+  schema_version = 2
 ```
+
+Schema v2 adds a durable store-bound semantic change feed. A v1 database migrates atomically and bootstraps changes for all existing semantic records so incremental consumers can catch up from an empty cursor.
 
 A database with a newer state-store schema fails closed with `UnsupportedSemanticStateSchemaError`.
 
@@ -213,6 +215,12 @@ Examples of detected corruption:
 - relation endpoints disagreeing with JSON
 
 Corrupted records fail closed with `CorruptSemanticStateError`.
+
+## Incremental change feed
+
+Schema v2 writes `semantic_changes` in the same transaction as newly inserted semantic records and persists a database-specific feed identity. `changesAfter()` exposes an opaque cursor for restart-safe incremental materialization. Exact retries produce no duplicate change; failed transactions produce no orphan change.
+
+See `docs/incremental-context-capsules-v1.md` for cursor, migration, temporal cache-boundary, and materializer semantics.
 
 ## Context hydration
 

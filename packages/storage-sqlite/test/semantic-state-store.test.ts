@@ -12,9 +12,15 @@ import {
 import { GraphContextCompiler } from "@ssrl/context";
 import {
   CorruptSemanticStateError,
+  InvalidSemanticChangeCursorError,
   SemanticRecordCollisionError,
   UnknownSemanticEntityError,
+  entityAliasJson,
+  semanticEntityJson,
+  temporalObservationJson,
+  temporalRelationJson,
   typedEntitiesFromStateSnapshot,
+  type SemanticChangeCursor,
   type SemanticStateBatch,
 } from "@ssrl/state-store";
 import {
@@ -130,6 +136,109 @@ function baseBatch(): SemanticStateBatch {
       ownerRelation("owner-alice", alice, "2026-08-01T00:00:00Z"),
     ],
   };
+}
+
+function createV1Database(path: string): void {
+  const raw = new DatabaseSync(path);
+  raw.exec(`
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE semantic_state_meta (
+      component TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL
+    ) STRICT;
+    INSERT INTO semantic_state_meta(component, schema_version)
+    VALUES ('semantic-state-store', 1);
+
+    CREATE TABLE semantic_entities (
+      entity_id TEXT PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      record_json TEXT NOT NULL CHECK(json_valid(record_json))
+    ) STRICT;
+    CREATE TABLE semantic_aliases (
+      alias_id TEXT PRIMARY KEY,
+      entity_id TEXT NOT NULL REFERENCES semantic_entities(entity_id),
+      alias_value TEXT NOT NULL,
+      normalized_value TEXT NOT NULL,
+      recorded_at TEXT NOT NULL,
+      record_json TEXT NOT NULL CHECK(json_valid(record_json))
+    ) STRICT;
+    CREATE TABLE semantic_observations (
+      observation_id TEXT PRIMARY KEY,
+      entity_id TEXT NOT NULL REFERENCES semantic_entities(entity_id),
+      property TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      external_id TEXT NOT NULL,
+      valid_from TEXT NOT NULL,
+      valid_to TEXT,
+      recorded_at TEXT NOT NULL,
+      record_json TEXT NOT NULL CHECK(json_valid(record_json))
+    ) STRICT;
+    CREATE TABLE semantic_relations (
+      relation_id TEXT PRIMARY KEY,
+      from_entity_id TEXT NOT NULL REFERENCES semantic_entities(entity_id),
+      to_entity_id TEXT NOT NULL REFERENCES semantic_entities(entity_id),
+      relation_type TEXT NOT NULL,
+      valid_from TEXT NOT NULL,
+      valid_to TEXT,
+      recorded_at TEXT NOT NULL,
+      record_json TEXT NOT NULL CHECK(json_valid(record_json))
+    ) STRICT;
+  `);
+
+  const projectEntity = { entityId: project, entityType: "Project" } as const;
+  const aliceEntity = { entityId: alice, entityType: "Person" } as const;
+  raw.prepare("INSERT INTO semantic_entities(entity_id, entity_type, record_json) VALUES (?, ?, ?)")
+    .run(project, "Project", semanticEntityJson(projectEntity));
+  raw.prepare("INSERT INTO semantic_entities(entity_id, entity_type, record_json) VALUES (?, ?, ?)")
+    .run(alice, "Person", semanticEntityJson(aliceEntity));
+
+  const alias = {
+    id: "alias-project-atlas",
+    entityId: project,
+    value: "Project Atlas",
+    recordedAt: "2026-01-01T00:00:00.000Z",
+  } as const;
+  raw.prepare(`
+    INSERT INTO semantic_aliases(
+      alias_id, entity_id, alias_value, normalized_value, recorded_at, record_json
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(alias.id, project, alias.value, "project atlas", alias.recordedAt, entityAliasJson(alias));
+
+  const observation = apiObservation("api-rest", "REST", "2026-02-01T00:00:00Z");
+  raw.prepare(`
+    INSERT INTO semantic_observations(
+      observation_id, entity_id, property, provider, external_id,
+      valid_from, valid_to, recorded_at, record_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    observation.id,
+    observation.entityId,
+    observation.property,
+    observation.source.provider,
+    observation.source.externalId,
+    "2026-02-01T00:00:00.000Z",
+    null,
+    "2026-02-01T00:00:00.000Z",
+    temporalObservationJson(observation),
+  );
+
+  const relation = ownerRelation("owner-alice", alice, "2026-08-01T00:00:00Z");
+  raw.prepare(`
+    INSERT INTO semantic_relations(
+      relation_id, from_entity_id, to_entity_id, relation_type,
+      valid_from, valid_to, recorded_at, record_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    relation.id,
+    relation.from,
+    relation.to,
+    relation.relationType,
+    "2026-08-01T00:00:00.000Z",
+    null,
+    "2026-08-01T00:00:00.000Z",
+    temporalRelationJson(relation),
+  );
+  raw.close();
 }
 
 describe("SQLiteSemanticStateStore", () => {
@@ -378,6 +487,157 @@ describe("SQLiteSemanticStateStore", () => {
       expect.objectContaining({ user_version: 0 }),
     );
     inspect.close();
+  });
+
+  it("exposes entity-scoped entity and alias reads without a full snapshot", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+
+    expect(await store.entity(project)).toEqual({ entityId: project, entityType: "Project" });
+    expect(await store.entity("entity://project/missing" as const)).toBeUndefined();
+    expect((await store.aliasesForEntity(project)).map((item) => item.id))
+      .toEqual(["alias-project-atlas"]);
+    store.close();
+  });
+
+  it("emits deterministic durable changes only for actual inserts", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append(baseBatch());
+
+    const page = await store.changesAfter(undefined, 100);
+    expect(page.hasMore).toBe(false);
+    expect(page.changes).toHaveLength(12);
+    expect(page.changes.map((change) => `${change.kind}:${change.recordId}`)).toEqual([
+      `entity:${alice}`,
+      `entity:${oldOwner}`,
+      `entity:${project}`,
+      "alias:alias-alice",
+      "alias:alias-old-owner",
+      "alias:alias-project-atlas",
+      "observation:alice-timezone",
+      "observation:api-graphql",
+      "observation:api-rest",
+      "observation:deniz-timezone",
+      "relation:owner-alice",
+      "relation:owner-deniz",
+    ]);
+    const relationChange = page.changes.find((change) => change.recordId === "owner-alice");
+    expect(relationChange?.primaryEntityId).toBe(project);
+    expect(relationChange?.affectedEntityIds).toEqual([alice, project]);
+
+    const cursor = page.nextCursor;
+    expect(cursor).toBeDefined();
+    await store.append(baseBatch());
+    expect(await store.changesAfter(cursor)).toEqual({
+      changes: [],
+      nextCursor: cursor,
+      hasMore: false,
+    });
+    store.close();
+  });
+
+  it("paginates and resumes a change cursor across close/reopen without duplicates", async () => {
+    const path = await databasePath();
+    const first = new SQLiteSemanticStateStore({ path });
+    await first.append(baseBatch());
+    const pageOne = await first.changesAfter(undefined, 5);
+    expect(pageOne.changes).toHaveLength(5);
+    expect(pageOne.hasMore).toBe(true);
+    expect(pageOne.nextCursor).toBeDefined();
+    first.close();
+
+    const reopened = new SQLiteSemanticStateStore({ path });
+    const pageTwo = await reopened.changesAfter(pageOne.nextCursor, 100);
+    expect(pageTwo.changes).toHaveLength(7);
+    expect(pageTwo.changes[0]?.recordId).toBe("alias-project-atlas");
+    expect(new Set([
+      ...pageOne.changes.map((change) => change.cursor),
+      ...pageTwo.changes.map((change) => change.cursor),
+    ]).size).toBe(12);
+    reopened.close();
+  });
+
+  it("rolls back change rows together with a failed semantic transaction", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append({ entities: [{ entityId: project, entityType: "Project" }] });
+    const before = await store.changesAfter();
+
+    await expect(store.append({
+      entities: [{ entityId: alice, entityType: "Person" }],
+      aliases: [{
+        id: "bad",
+        entityId: "entity://person/missing" as const,
+        value: "Missing",
+        recordedAt: "2026-01-01T00:00:00Z",
+      }],
+    })).rejects.toBeInstanceOf(UnknownSemanticEntityError);
+
+    expect(await store.changesAfter()).toEqual(before);
+    store.close();
+  });
+
+  it("rejects malformed or foreign semantic change cursors", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await expect(store.changesAfter("not-a-cursor" as SemanticChangeCursor)).rejects
+      .toBeInstanceOf(InvalidSemanticChangeCursorError);
+    store.close();
+  });
+
+  it("rejects a cursor from another semantic-state database", async () => {
+    const firstPath = await databasePath();
+    const secondPath = await databasePath();
+    const first = new SQLiteSemanticStateStore({ path: firstPath });
+    const second = new SQLiteSemanticStateStore({ path: secondPath });
+    await first.append({ entities: [{ entityId: project, entityType: "Project" }] });
+    await second.append({ entities: [{ entityId: project, entityType: "Project" }] });
+    const foreignCursor = (await first.changesAfter()).nextCursor;
+    expect(foreignCursor).toBeDefined();
+
+    await expect(second.changesAfter(foreignCursor)).rejects
+      .toBeInstanceOf(InvalidSemanticChangeCursorError);
+    first.close();
+    second.close();
+  });
+
+  it("rejects a syntactically valid cursor sequence that was never emitted", async () => {
+    const path = await databasePath();
+    const store = new SQLiteSemanticStateStore({ path });
+    await store.append({ entities: [{ entityId: project, entityType: "Project" }] });
+    const cursor = (await store.changesAfter()).nextCursor;
+    expect(cursor).toBeDefined();
+    const unknown = cursor!.replace(/:\d+$/, ":999999") as SemanticChangeCursor;
+
+    await expect(store.changesAfter(unknown)).rejects
+      .toBeInstanceOf(InvalidSemanticChangeCursorError);
+    store.close();
+  });
+
+  it("migrates a v1 state database and bootstraps a deterministic change feed", async () => {
+    const path = await databasePath();
+    createV1Database(path);
+
+    const store = new SQLiteSemanticStateStore({ path });
+    const page = await store.changesAfter(undefined, 100);
+    expect(page.changes.map((change) => `${change.kind}:${change.recordId}`)).toEqual([
+      `entity:${alice}`,
+      `entity:${project}`,
+      "alias:alias-project-atlas",
+      "observation:api-rest",
+      "relation:owner-alice",
+    ]);
+    expect(page.changes.at(-1)?.affectedEntityIds).toEqual([alice, project]);
+    expect((await store.snapshot()).entities).toHaveLength(2);
+    store.close();
+
+    const raw = new DatabaseSync(path);
+    expect(raw.prepare(`
+      SELECT schema_version FROM semantic_state_meta WHERE component = 'semantic-state-store'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    raw.close();
   });
 
   it("hydrates bitemporal resolution and graph context from a reopened store", async () => {

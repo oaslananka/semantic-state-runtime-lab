@@ -10,6 +10,7 @@ export default defineConfig({
     alias: {
       "@ssrl/core": source("./packages/core/src/index.ts"),
       "@ssrl/state-store": source("./packages/state-store/src/index.ts"),
+      "@ssrl/materializer": source("./packages/materializer/src/index.ts"),
       "@ssrl/journal": source("./packages/journal/src/index.ts"),
       "@ssrl/runtime": source("./packages/runtime/src/index.ts"),
       "@ssrl/runtime-host": source("./packages/runtime-host/src/index.ts"),

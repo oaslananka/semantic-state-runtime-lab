@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
+  canonicalJson,
   normalizeEntityAlias,
   type EntityId,
   type TemporalObservation,
@@ -7,6 +9,7 @@ import {
 } from "@ssrl/core";
 import {
   CorruptSemanticStateError,
+  InvalidSemanticChangeCursorError,
   SEMANTIC_STATE_SNAPSHOT_SCHEMA,
   SemanticRecordCollisionError,
   UnknownSemanticEntityError,
@@ -25,14 +28,19 @@ import {
   type AliasLookupResult,
   type EntityAliasRecord,
   type SemanticAppendCounts,
+  type SemanticChange,
+  type SemanticChangeCursor,
+  type SemanticChangePage,
   type SemanticEntity,
   type SemanticStateBatch,
+  type SemanticRecordKind,
   type SemanticStateSnapshot,
   type SemanticStateStore,
 } from "@ssrl/state-store";
 
 const STATE_STORE_COMPONENT = "semantic-state-store";
-const STATE_STORE_SCHEMA_VERSION = 1;
+const STATE_STORE_SCHEMA_VERSION = 2;
+const CHANGE_CURSOR_PREFIX = "sqlite-semantic-v1:";
 
 export interface SQLiteSemanticStateStoreOptions {
   readonly path: string;
@@ -87,6 +95,15 @@ interface AliasLookupRow {
   readonly alias_json: string;
   readonly entity_json: string;
   readonly normalized_value: string;
+}
+
+
+interface ChangeRow {
+  readonly sequence_text: string;
+  readonly record_kind: string;
+  readonly record_id: string;
+  readonly primary_entity_id: string;
+  readonly affected_entity_ids_json: string;
 }
 
 export class UnsupportedSemanticStateSchemaError extends Error {
@@ -178,17 +195,81 @@ function relationRow(row: RelationRow): TemporalRelationEdge {
   return parsed;
 }
 
+function semanticRecordKind(value: string): SemanticRecordKind {
+  if (value === "entity" || value === "alias" || value === "observation" || value === "relation") {
+    return value;
+  }
+  throw new CorruptSemanticStateError(`Unknown semantic change record kind ${value}`);
+}
+
+function affectedEntityIdsJson(entityIds: readonly EntityId[]): string {
+  return canonicalJson([...new Set(entityIds)].sort((left, right) => left.localeCompare(right)));
+}
+
+function parseAffectedEntityIds(value: string): EntityId[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new CorruptSemanticStateError("Semantic change affected entities are not valid JSON");
+  }
+  if (!Array.isArray(parsed)) {
+    throw new CorruptSemanticStateError("Semantic change affected entities must be an array");
+  }
+  const ids = parsed.map((item) => {
+    if (typeof item !== "string" || !item.startsWith("entity://") || item.length <= "entity://".length) {
+      throw new CorruptSemanticStateError("Semantic change contains an invalid entity id");
+    }
+    return item as EntityId;
+  });
+  const canonical = [...new Set(ids)].sort((left, right) => left.localeCompare(right));
+  if (canonicalJson(canonical) !== value) {
+    throw new CorruptSemanticStateError("Semantic change affected entities are not canonical");
+  }
+  return canonical;
+}
+
+function cursorForSequence(feedId: string, sequenceText: string): SemanticChangeCursor {
+  return `${CHANGE_CURSOR_PREFIX}${feedId}:${sequenceText}` as SemanticChangeCursor;
+}
+
+function sequenceAfter(cursor: SemanticChangeCursor | undefined, feedId: string): bigint {
+  if (cursor === undefined) return 0n;
+  const prefix = `${CHANGE_CURSOR_PREFIX}${feedId}:`;
+  if (!cursor.startsWith(prefix)) throw new InvalidSemanticChangeCursorError(cursor);
+  const raw = cursor.slice(prefix.length);
+  if (!/^(?:0|[1-9]\d*)$/.test(raw)) throw new InvalidSemanticChangeCursorError(cursor);
+  try {
+    return BigInt(raw);
+  } catch {
+    throw new InvalidSemanticChangeCursorError(cursor);
+  }
+}
+
+function semanticChange(row: ChangeRow, feedId: string): SemanticChange {
+  return {
+    cursor: cursorForSequence(feedId, row.sequence_text),
+    kind: semanticRecordKind(row.record_kind),
+    recordId: row.record_id,
+    primaryEntityId: asEntityId(row.primary_entity_id),
+    affectedEntityIds: parseAffectedEntityIds(row.affected_entity_ids_json),
+  };
+}
+
 function semanticTableNames(): readonly string[] {
   return [
     "semantic_entities",
     "semantic_aliases",
     "semantic_observations",
     "semantic_relations",
+    "semantic_change_feed_meta",
+    "semantic_changes",
   ];
 }
 
 export class SQLiteSemanticStateStore implements SemanticStateStore {
   readonly #db: DatabaseSync;
+  readonly #feedId: string;
 
   constructor(options: SQLiteSemanticStateStoreOptions) {
     this.#db = new DatabaseSync(options.path, {
@@ -199,8 +280,21 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       this.#db.exec("PRAGMA foreign_keys = ON");
       if (options.wal === true) this.#db.exec("PRAGMA journal_mode = WAL");
       this.#initialize();
+      this.#feedId = this.#readFeedId();
     } catch (cause) {
       this.#db.close();
+      throw cause;
+    }
+  }
+
+  #transaction<T>(operation: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.#db.exec("COMMIT");
+      return result;
+    } catch (cause) {
+      this.#db.exec("ROLLBACK");
       throw cause;
     }
   }
@@ -227,31 +321,82 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       WHERE component = ?
     `).get(STATE_STORE_COMPONENT) as VersionRow | undefined;
 
-    if (versionRow !== undefined) {
-      const version = Number(versionRow.schema_version);
-      if (!Number.isSafeInteger(version) || version < 1) {
-        throw new CorruptSemanticStateDatabaseError(`Invalid semantic state schema version ${String(versionRow.schema_version)}`);
-      }
-      if (version > STATE_STORE_SCHEMA_VERSION) {
-        throw new UnsupportedSemanticStateSchemaError(version, STATE_STORE_SCHEMA_VERSION);
-      }
-      if (version === STATE_STORE_SCHEMA_VERSION) return;
+    if (versionRow === undefined) {
+      this.#createFreshSchema();
+      return;
     }
 
+    const version = Number(versionRow.schema_version);
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw new CorruptSemanticStateDatabaseError(
+        `Invalid semantic state schema version ${String(versionRow.schema_version)}`,
+      );
+    }
+    if (version > STATE_STORE_SCHEMA_VERSION) {
+      throw new UnsupportedSemanticStateSchemaError(version, STATE_STORE_SCHEMA_VERSION);
+    }
+    if (version === STATE_STORE_SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.#migrateV1ToV2();
+      return;
+    }
+    throw new CorruptSemanticStateDatabaseError(`Unsupported semantic state schema version ${version}`);
+  }
+
+  #assertFreshSemanticTables(): void {
+    const names = semanticTableNames();
     const existing = this.#db.prepare(`
       SELECT name
       FROM sqlite_master
-      WHERE type = 'table' AND name IN (?, ?, ?, ?)
+      WHERE type = 'table' AND name IN (?, ?, ?, ?, ?, ?)
       ORDER BY name
-    `).all(...semanticTableNames()) as unknown as { readonly name: string }[];
+    `).all(...names) as unknown as { readonly name: string }[];
     if (existing.length > 0) {
       throw new CorruptSemanticStateDatabaseError(
         `Semantic state tables exist without a schema marker: ${existing.map((row) => row.name).join(", ")}`,
       );
     }
+  }
 
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+  #createChangeFeedMeta(): void {
+    this.#db.exec(`
+      CREATE TABLE semantic_change_feed_meta (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        feed_id TEXT NOT NULL UNIQUE
+      ) STRICT;
+    `);
+    this.#db.prepare(`
+      INSERT INTO semantic_change_feed_meta(singleton, feed_id)
+      VALUES (1, ?)
+    `).run(randomUUID());
+  }
+
+  #readFeedId(): string {
+    const row = this.#db.prepare(`
+      SELECT feed_id FROM semantic_change_feed_meta WHERE singleton = 1
+    `).get() as { readonly feed_id: string } | undefined;
+    if (row === undefined || row.feed_id.length === 0) {
+      throw new CorruptSemanticStateDatabaseError("Semantic change feed id is missing");
+    }
+    return row.feed_id;
+  }
+
+  #createChangeTable(): void {
+    this.#db.exec(`
+      CREATE TABLE semantic_changes (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_kind TEXT NOT NULL CHECK(record_kind IN ('entity', 'alias', 'observation', 'relation')),
+        record_id TEXT NOT NULL,
+        primary_entity_id TEXT NOT NULL,
+        affected_entity_ids_json TEXT NOT NULL CHECK(json_valid(affected_entity_ids_json)),
+        UNIQUE(record_kind, record_id)
+      ) STRICT;
+    `);
+  }
+
+  #createFreshSchema(): void {
+    this.#assertFreshSemanticTables();
+    this.#transaction(() => {
       this.#db.exec(`
         CREATE TABLE semantic_entities (
           entity_id TEXT PRIMARY KEY,
@@ -306,15 +451,90 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         CREATE INDEX semantic_relations_from_type_time
           ON semantic_relations(from_entity_id, relation_type, valid_from, recorded_at, relation_id);
       `);
+      this.#createChangeFeedMeta();
+      this.#createChangeTable();
       this.#db.prepare(`
         INSERT INTO semantic_state_meta(component, schema_version)
         VALUES (?, ?)
       `).run(STATE_STORE_COMPONENT, STATE_STORE_SCHEMA_VERSION);
-      this.#db.exec("COMMIT");
-    } catch (cause) {
-      this.#db.exec("ROLLBACK");
-      throw cause;
+    });
+  }
+
+  #recordChange(
+    kind: SemanticRecordKind,
+    recordId: string,
+    primaryEntityId: EntityId,
+    affectedEntityIds: readonly EntityId[],
+  ): void {
+    this.#db.prepare(`
+      INSERT INTO semantic_changes(
+        record_kind, record_id, primary_entity_id, affected_entity_ids_json
+      ) VALUES (?, ?, ?, ?)
+    `).run(kind, recordId, primaryEntityId, affectedEntityIdsJson(affectedEntityIds));
+  }
+
+  #bootstrapV1Changes(): void {
+    const entities = this.#db.prepare(`
+      SELECT entity_id FROM semantic_entities ORDER BY entity_id
+    `).all() as unknown as { readonly entity_id: string }[];
+    for (const row of entities) {
+      const entityId = asEntityId(row.entity_id);
+      this.#recordChange("entity", row.entity_id, entityId, [entityId]);
     }
+
+    const aliases = this.#db.prepare(`
+      SELECT alias_id, entity_id FROM semantic_aliases ORDER BY alias_id
+    `).all() as unknown as { readonly alias_id: string; readonly entity_id: string }[];
+    for (const row of aliases) {
+      const entityId = asEntityId(row.entity_id);
+      this.#recordChange("alias", row.alias_id, entityId, [entityId]);
+    }
+
+    const observations = this.#db.prepare(`
+      SELECT observation_id, entity_id FROM semantic_observations ORDER BY observation_id
+    `).all() as unknown as { readonly observation_id: string; readonly entity_id: string }[];
+    for (const row of observations) {
+      const entityId = asEntityId(row.entity_id);
+      this.#recordChange("observation", row.observation_id, entityId, [entityId]);
+    }
+
+    const relations = this.#db.prepare(`
+      SELECT relation_id, from_entity_id, to_entity_id
+      FROM semantic_relations
+      ORDER BY relation_id
+    `).all() as unknown as {
+      readonly relation_id: string;
+      readonly from_entity_id: string;
+      readonly to_entity_id: string;
+    }[];
+    for (const row of relations) {
+      this.#recordChange("relation", row.relation_id, asEntityId(row.from_entity_id), [
+        asEntityId(row.from_entity_id),
+        asEntityId(row.to_entity_id),
+      ]);
+    }
+  }
+
+  #migrateV1ToV2(): void {
+    const existing = this.#db.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_changes'
+    `).get() as { readonly name: string } | undefined;
+    if (existing !== undefined) {
+      throw new CorruptSemanticStateDatabaseError(
+        "semantic_changes exists while schema marker is still v1",
+      );
+    }
+
+    this.#transaction(() => {
+      this.#createChangeFeedMeta();
+      this.#createChangeTable();
+      this.#bootstrapV1Changes();
+      this.#db.prepare(`
+        UPDATE semantic_state_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(STATE_STORE_SCHEMA_VERSION, STATE_STORE_COMPONENT);
+    });
   }
 
   #entityExists(entityId: EntityId): boolean {
@@ -352,6 +572,7 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       const existing = find.get(entity.entityId) as JsonRow | undefined;
       if (this.#isReplay(existing, "entity", entity.entityId, json)) continue;
       insert.run(entity.entityId, entity.entityType, json);
+      this.#recordChange("entity", entity.entityId, entity.entityId, [entity.entityId]);
       inserted += 1;
     }
     return inserted;
@@ -378,6 +599,7 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         alias.recordedAt,
         json,
       );
+      this.#recordChange("alias", alias.id, alias.entityId, [alias.entityId]);
       inserted += 1;
     }
     return inserted;
@@ -410,6 +632,7 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         observation.recordedAt,
         json,
       );
+      this.#recordChange("observation", observation.id, observation.entityId, [observation.entityId]);
       inserted += 1;
     }
     return inserted;
@@ -440,31 +663,32 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         relation.recordedAt,
         json,
       );
+      this.#recordChange("relation", relation.id, relation.from, [relation.from, relation.to]);
       inserted += 1;
     }
     return inserted;
   }
 
   async append(batch: SemanticStateBatch): Promise<SemanticAppendCounts> {
-    const entities = (batch.entities ?? []).map(normalizeSemanticEntity);
-    const aliases = (batch.aliases ?? []).map(normalizeEntityAliasRecord);
-    const observations = (batch.observations ?? []).map(normalizeTemporalObservation);
-    const relations = (batch.relations ?? []).map(normalizeTemporalRelation);
+    const entities = (batch.entities ?? [])
+      .map(normalizeSemanticEntity)
+      .sort((left, right) => left.entityId.localeCompare(right.entityId));
+    const aliases = (batch.aliases ?? [])
+      .map(normalizeEntityAliasRecord)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const observations = (batch.observations ?? [])
+      .map(normalizeTemporalObservation)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const relations = (batch.relations ?? [])
+      .map(normalizeTemporalRelation)
+      .sort((left, right) => left.id.localeCompare(right.id));
 
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
-      const counts: SemanticAppendCounts = {
-        entities: this.#appendEntities(entities),
-        aliases: this.#appendAliases(aliases),
-        observations: this.#appendObservations(observations),
-        relations: this.#appendRelations(relations),
-      };
-      this.#db.exec("COMMIT");
-      return counts;
-    } catch (cause) {
-      this.#db.exec("ROLLBACK");
-      throw cause;
-    }
+    return this.#transaction((): SemanticAppendCounts => ({
+      entities: this.#appendEntities(entities),
+      aliases: this.#appendAliases(aliases),
+      observations: this.#appendObservations(observations),
+      relations: this.#appendRelations(relations),
+    }));
   }
 
   async snapshot(): Promise<SemanticStateSnapshot> {
@@ -498,6 +722,25 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
       observations: observations.map(observationRow),
       relations: relations.map(relationRow),
     };
+  }
+
+  async entity(entityId: EntityId): Promise<SemanticEntity | undefined> {
+    const row = this.#db.prepare(`
+      SELECT entity_id, entity_type, record_json
+      FROM semantic_entities
+      WHERE entity_id = ?
+    `).get(entityId) as EntityRow | undefined;
+    return row === undefined ? undefined : entityRow(row);
+  }
+
+  async aliasesForEntity(entityId: EntityId): Promise<readonly EntityAliasRecord[]> {
+    const rows = this.#db.prepare(`
+      SELECT alias_id, entity_id, alias_value, normalized_value, recorded_at, record_json
+      FROM semantic_aliases
+      WHERE entity_id = ?
+      ORDER BY recorded_at, alias_id
+    `).all(entityId) as unknown as AliasRow[];
+    return rows.map(aliasRow);
   }
 
   async observationsForEntity(entityId: EntityId): Promise<readonly TemporalObservation[]> {
@@ -548,6 +791,42 @@ export class SQLiteSemanticStateStore implements SemanticStateStore {
         }
         return { entity, alias };
       }),
+    };
+  }
+
+  async changesAfter(
+    cursor?: SemanticChangeCursor,
+    limit = 100,
+  ): Promise<SemanticChangePage> {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new RangeError("Semantic change page limit must be an integer between 1 and 1000");
+    }
+    const after = sequenceAfter(cursor, this.#feedId);
+    if (cursor !== undefined) {
+      const known = this.#db.prepare(
+        "SELECT 1 AS present FROM semantic_changes WHERE sequence = ?",
+      ).get(after) as { readonly present: number } | undefined;
+      if (known === undefined) throw new InvalidSemanticChangeCursorError(cursor);
+    }
+    const rows = this.#db.prepare(`
+      SELECT CAST(sequence AS TEXT) AS sequence_text,
+             record_kind,
+             record_id,
+             primary_entity_id,
+             affected_entity_ids_json
+      FROM semantic_changes
+      WHERE sequence > ?
+      ORDER BY sequence
+      LIMIT ?
+    `).all(after, limit + 1) as unknown as ChangeRow[];
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const changes = pageRows.map((row) => semanticChange(row, this.#feedId));
+    const nextCursor = changes.at(-1)?.cursor ?? cursor;
+    return {
+      changes,
+      ...(nextCursor === undefined ? {} : { nextCursor }),
+      hasMore,
     };
   }
 
