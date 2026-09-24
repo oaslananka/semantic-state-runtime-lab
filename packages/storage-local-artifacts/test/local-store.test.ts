@@ -11,13 +11,18 @@ import {
   ArtifactMutationCollisionError,
   ArtifactMutationMissingBlobError,
   artifactDigest,
+  artifactResourceUri,
+  artifactVersionUri,
+  normalizeArtifactMutation,
   resolveArtifact,
   type ArtifactBlobDescriptor,
+  type ArtifactCatalogCursor,
   type ArtifactMutation,
   type ArtifactResourceIdentity,
 } from "@ssrl/artifact-store";
 import {
   CorruptLocalArtifactStoreError,
+  InvalidArtifactCatalogCursorError,
   LocalArtifactStore,
   UnsupportedArtifactStoreSchemaError,
 } from "../src/index.js";
@@ -68,6 +73,20 @@ function casPath(storeRoot: string, digest: string): string {
 
 function digestOf(bytes: Uint8Array): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+
+async function downgradeToV1(storeRoot: string): Promise<void> {
+  const raw = new DatabaseSync(join(storeRoot, "artifacts.sqlite"));
+  raw.exec(`
+    DROP TABLE artifact_version_index;
+    DROP TABLE artifact_resource_index;
+    DROP TABLE artifact_catalog_meta;
+    UPDATE artifact_store_meta
+    SET schema_version = 1
+    WHERE component = 'local-artifact-store';
+  `);
+  raw.close();
 }
 
 describe("LocalArtifactStore", () => {
@@ -232,6 +251,138 @@ describe("LocalArtifactStore", () => {
     expect(await store.mutation("a-orphan-reference")).toBeUndefined();
     expect((await store.unreferencedBlobs()).map((item) => item.digest)).toEqual([orphan.digest]);
     store.close();
+  });
+
+  it("indexes resource and immutable version URIs without snapshot scanning", async () => {
+    const store = new LocalArtifactStore({ root: await root() });
+    const shared = await store.putBlob(new TextEncoder().encode("shared"), "text/plain");
+    const mutationA = upsert("a-v1", resourceA, shared);
+    const mutationB = upsert("b-v1", resourceB, shared);
+    await store.append([mutationB, mutationA]);
+
+    const resourceUriA = await artifactResourceUri(resourceA);
+    const resourceUriB = await artifactResourceUri(resourceB);
+    const versionUriA = await artifactVersionUri(mutationA);
+    const page = await store.listArtifactResources({ limit: 10 });
+
+    expect(page.resources.map((item) => item.uri)).toEqual(
+      [resourceUriA, resourceUriB].toSorted((left, right) => left.localeCompare(right)),
+    );
+    expect(await store.artifactResourceByUri(resourceUriA)).toEqual(resourceA);
+    expect(await store.artifactVersionByUri(versionUriA)).toEqual(normalizeArtifactMutation(mutationA));
+    expect(await store.artifactResourceByUri("ssrl://artifact/resource/sha256/missing"))
+      .toBeUndefined();
+    expect(await store.artifactVersionByUri("ssrl://artifact/version/sha256/missing"))
+      .toBeUndefined();
+    store.close();
+  });
+
+  it("paginates the resource catalog across reopen and rejects foreign or unknown cursors", async () => {
+    const firstRoot = await root();
+    const secondRoot = await root();
+    const first = new LocalArtifactStore({ root: firstRoot });
+    const blob = await first.putBlob(new TextEncoder().encode("catalog"), "text/plain");
+    await first.append([
+      upsert("a-v1", resourceA, blob),
+      upsert("b-v1", resourceB, blob),
+    ]);
+    const firstPage = await first.listArtifactResources({ limit: 1 });
+    expect(firstPage.resources).toHaveLength(1);
+    expect(firstPage.hasMore).toBe(true);
+    expect(firstPage.nextCursor).toBeDefined();
+    const firstCursor = firstPage.nextCursor;
+    if (firstCursor === undefined) throw new Error("expected artifact catalog cursor");
+    first.close();
+
+    const reopened = new LocalArtifactStore({ root: firstRoot });
+    const secondPage = await reopened.listArtifactResources({
+      cursor: firstCursor,
+      limit: 10,
+    });
+    expect(secondPage.resources).toHaveLength(1);
+    expect(secondPage.hasMore).toBe(false);
+
+    const other = new LocalArtifactStore({ root: secondRoot });
+    const otherBlob = await other.putBlob(new TextEncoder().encode("other"), "text/plain");
+    await other.append([upsert("other-v1", resourceA, otherBlob)]);
+    await expect(other.listArtifactResources({ cursor: firstCursor }))
+      .rejects.toBeInstanceOf(InvalidArtifactCatalogCursorError);
+    const unknownCursor = firstCursor.replace(
+      /:[A-Za-z0-9_-]+$/,
+      `:${Buffer.from("ssrl://artifact/resource/sha256/" + "f".repeat(64)).toString("base64url")}`,
+    ) as ArtifactCatalogCursor;
+    await expect(reopened.listArtifactResources({ cursor: unknownCursor }))
+      .rejects.toBeInstanceOf(InvalidArtifactCatalogCursorError);
+    await expect(reopened.listArtifactResources({
+      cursor: "sqlite-artifact-catalog-v1:fake:YWJj" as ArtifactCatalogCursor,
+    })).rejects.toBeInstanceOf(InvalidArtifactCatalogCursorError);
+    reopened.close();
+    other.close();
+  });
+
+  it("migrates v1 metadata by backfilling stable resource and version URI indexes", async () => {
+    const storeRoot = await root();
+    const first = new LocalArtifactStore({ root: storeRoot });
+    const blob = await first.putBlob(new TextEncoder().encode("legacy"), "text/plain");
+    const mutation = upsert("legacy-v1", resourceA, blob);
+    await first.append([mutation]);
+    first.close();
+    await downgradeToV1(storeRoot);
+
+    const migrated = new LocalArtifactStore({ root: storeRoot });
+    const resourceUri = await artifactResourceUri(resourceA);
+    const versionUri = await artifactVersionUri(mutation);
+    expect(await migrated.artifactResourceByUri(resourceUri)).toEqual(resourceA);
+    expect(await migrated.artifactVersionByUri(versionUri)).toEqual(normalizeArtifactMutation(mutation));
+    migrated.close();
+
+    const raw = new DatabaseSync(join(storeRoot, "artifacts.sqlite"));
+    expect(raw.prepare(`
+      SELECT schema_version FROM artifact_store_meta WHERE component = 'local-artifact-store'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    raw.close();
+  });
+
+  it("repairs a missing derived URI index on exact mutation replay", async () => {
+    const storeRoot = await root();
+    const store = new LocalArtifactStore({ root: storeRoot });
+    const blob = await store.putBlob(new TextEncoder().encode("repair"), "text/plain");
+    const mutation = upsert("repair-v1", resourceA, blob);
+    await store.append([mutation]);
+    const resourceUri = await artifactResourceUri(resourceA);
+    const versionUri = await artifactVersionUri(mutation);
+
+    const raw = new DatabaseSync(join(storeRoot, "artifacts.sqlite"));
+    raw.prepare("DELETE FROM artifact_version_index WHERE version_uri = ?").run(versionUri);
+    raw.prepare("DELETE FROM artifact_resource_index WHERE resource_uri = ?").run(resourceUri);
+    raw.close();
+
+    expect(await store.append([mutation])).toBe(0);
+    expect(await store.artifactResourceByUri(resourceUri)).toEqual(resourceA);
+    expect(await store.artifactVersionByUri(versionUri)).toEqual(normalizeArtifactMutation(mutation));
+    store.close();
+  });
+
+  it("fails closed when an indexed resource URI disagrees with its internal identity", async () => {
+    const storeRoot = await root();
+    const store = new LocalArtifactStore({ root: storeRoot });
+    const blob = await store.putBlob(new TextEncoder().encode("indexed"), "text/plain");
+    await store.append([upsert("indexed-v1", resourceA, blob)]);
+    const uri = await artifactResourceUri(resourceA);
+    store.close();
+
+    const raw = new DatabaseSync(join(storeRoot, "artifacts.sqlite"));
+    raw.prepare(`
+      UPDATE artifact_resource_index
+      SET external_id = 'corrupt-id'
+      WHERE resource_uri = ?
+    `).run(uri);
+    raw.close();
+
+    const reopened = new LocalArtifactStore({ root: storeRoot });
+    await expect(reopened.artifactResourceByUri(uri))
+      .rejects.toBeInstanceOf(CorruptLocalArtifactStoreError);
+    reopened.close();
   });
 
   it("exports portable snapshot metadata without embedding raw blob bytes", async () => {

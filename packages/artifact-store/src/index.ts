@@ -69,6 +69,29 @@ export interface ArtifactBlobReadResult extends StoredArtifactBlob {
   readonly complete: boolean;
 }
 
+declare const artifactCatalogCursorBrand: unique symbol;
+export type ArtifactCatalogCursor = string & { readonly [artifactCatalogCursorBrand]: true };
+
+export interface ArtifactCatalogResource {
+  readonly uri: string;
+  readonly resource: ArtifactResourceIdentity;
+}
+
+export interface ArtifactCatalogPage {
+  readonly resources: readonly ArtifactCatalogResource[];
+  readonly nextCursor?: ArtifactCatalogCursor;
+  readonly hasMore: boolean;
+}
+
+export interface ArtifactCatalog {
+  listArtifactResources(input?: {
+    readonly cursor?: ArtifactCatalogCursor;
+    readonly limit?: number;
+  }): Promise<ArtifactCatalogPage>;
+  artifactResourceByUri(uri: string): Promise<ArtifactResourceIdentity | undefined>;
+  artifactVersionByUri(uri: string): Promise<ArtifactMutation | undefined>;
+}
+
 export interface ArtifactStore {
   putBlob(bytes: Uint8Array, mediaType: string): Promise<ArtifactBlobDescriptor>;
   headBlob(digest: ArtifactDigest): Promise<StoredArtifactBlob | undefined>;

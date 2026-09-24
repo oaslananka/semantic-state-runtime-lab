@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { canonicalJson } from "@ssrl/core";
 import { createReadStream, mkdirSync } from "node:fs";
 import {
   link,
@@ -26,6 +27,9 @@ import {
   storedArtifactBlobJson,
   type ArtifactBlobDescriptor,
   type ArtifactBlobReadRequest,
+  type ArtifactCatalog,
+  type ArtifactCatalogCursor,
+  type ArtifactCatalogPage,
   type ArtifactBlobReadResult,
   type ArtifactDigest,
   type ArtifactMutation,
@@ -36,7 +40,8 @@ import {
 } from "@ssrl/artifact-store";
 
 const STORE_COMPONENT = "local-artifact-store";
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 2;
+const CATALOG_CURSOR_PREFIX = "sqlite-artifact-catalog-v1:";
 
 export interface LocalArtifactStoreOptions {
   readonly root: string;
@@ -68,6 +73,19 @@ interface MutationRow {
 
 interface JsonRow {
   readonly record_json: string;
+}
+
+
+interface ResourceIndexRow {
+  readonly resource_uri: string;
+  readonly source_key: string;
+  readonly external_type: string;
+  readonly external_id: string;
+}
+
+interface VersionIndexRow {
+  readonly version_uri: string;
+  readonly mutation_id: string;
 }
 
 export class UnsupportedArtifactStoreSchemaError extends Error {
@@ -110,11 +128,57 @@ function resourceMatchesRow(resource: ArtifactResourceIdentity, row: MutationRow
     && resource.externalId === row.external_id;
 }
 
-export class LocalArtifactStore implements ArtifactStore {
+function localSha256Fingerprint(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function localArtifactResourceUri(resource: ArtifactResourceIdentity): string {
+  return `ssrl://artifact/resource/sha256/${localSha256Fingerprint(
+    canonicalJson(normalizeArtifactResourceIdentity(resource)),
+  )}`;
+}
+
+function localArtifactVersionUri(mutation: ArtifactMutation): string {
+  return `ssrl://artifact/version/sha256/${localSha256Fingerprint(artifactMutationJson(mutation))}`;
+}
+
+function catalogCursor(catalogId: string, resourceUri: string): ArtifactCatalogCursor {
+  const encoded = Buffer.from(resourceUri, "utf8").toString("base64url");
+  return `${CATALOG_CURSOR_PREFIX}${catalogId}:${encoded}` as ArtifactCatalogCursor;
+}
+
+function cursorResourceUri(cursor: ArtifactCatalogCursor, catalogId: string): string {
+  const prefix = `${CATALOG_CURSOR_PREFIX}${catalogId}:`;
+  if (!cursor.startsWith(prefix)) throw new InvalidArtifactCatalogCursorError(cursor);
+  const encoded = cursor.slice(prefix.length);
+  if (encoded.length === 0 || !/^[A-Za-z0-9_-]+$/.test(encoded)) {
+    throw new InvalidArtifactCatalogCursorError(cursor);
+  }
+  let decoded: string;
+  try {
+    decoded = Buffer.from(encoded, "base64url").toString("utf8");
+  } catch {
+    throw new InvalidArtifactCatalogCursorError(cursor);
+  }
+  if (!decoded.startsWith("ssrl://artifact/resource/sha256/")) {
+    throw new InvalidArtifactCatalogCursorError(cursor);
+  }
+  return decoded;
+}
+
+export class InvalidArtifactCatalogCursorError extends Error {
+  constructor(readonly cursor: string) {
+    super("Invalid artifact catalog cursor");
+    this.name = "InvalidArtifactCatalogCursorError";
+  }
+}
+
+export class LocalArtifactStore implements ArtifactStore, ArtifactCatalog {
   readonly #blobRoot: string;
   readonly #tempRoot: string;
   readonly #db: DatabaseSync;
   readonly #maxReadBytes: number;
+  readonly #catalogId: string;
 
   constructor(options: LocalArtifactStoreOptions) {
     if (options.root.trim().length === 0) throw new TypeError("Artifact store root must not be empty");
@@ -131,8 +195,21 @@ export class LocalArtifactStore implements ArtifactStore {
     try {
       this.#db.exec("PRAGMA foreign_keys = ON");
       this.#initialize();
+      this.#catalogId = this.#readCatalogId();
     } catch (cause) {
       this.#db.close();
+      throw cause;
+    }
+  }
+
+  #transaction<T>(operation: () => T): T {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.#db.exec("COMMIT");
+      return result;
+    } catch (cause) {
+      this.#db.exec("ROLLBACK");
       throw cause;
     }
   }
@@ -149,21 +226,62 @@ export class LocalArtifactStore implements ArtifactStore {
       FROM artifact_store_meta
       WHERE component = ?
     `).get(STORE_COMPONENT) as VersionRow | undefined;
-    if (versionRow !== undefined) {
-      const version = Number(versionRow.schema_version);
-      if (!Number.isSafeInteger(version) || version < 1) {
-        throw new CorruptLocalArtifactStoreError(`Invalid artifact schema version ${String(versionRow.schema_version)}`);
-      }
-      if (version > STORE_SCHEMA_VERSION) {
-        throw new UnsupportedArtifactStoreSchemaError(version, STORE_SCHEMA_VERSION);
-      }
-      if (version === STORE_SCHEMA_VERSION) return;
-    }
 
+    if (versionRow === undefined) {
+      this.#createFreshSchema();
+      return;
+    }
+    const version = Number(versionRow.schema_version);
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw new CorruptLocalArtifactStoreError(
+        `Invalid artifact schema version ${String(versionRow.schema_version)}`,
+      );
+    }
+    if (version > STORE_SCHEMA_VERSION) {
+      throw new UnsupportedArtifactStoreSchemaError(version, STORE_SCHEMA_VERSION);
+    }
+    if (version === STORE_SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.#migrateV1ToV2();
+      return;
+    }
+    throw new CorruptLocalArtifactStoreError(`Unsupported artifact schema version ${version}`);
+  }
+
+  #createCatalogTables(): void {
+    this.#db.exec(`
+      CREATE TABLE artifact_catalog_meta (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        catalog_id TEXT NOT NULL UNIQUE
+      ) STRICT;
+
+      CREATE TABLE artifact_resource_index (
+        resource_uri TEXT PRIMARY KEY,
+        source_key TEXT NOT NULL,
+        external_type TEXT NOT NULL,
+        external_id TEXT NOT NULL,
+        UNIQUE(source_key, external_type, external_id)
+      ) STRICT;
+
+      CREATE TABLE artifact_version_index (
+        version_uri TEXT PRIMARY KEY,
+        mutation_id TEXT NOT NULL UNIQUE REFERENCES artifact_mutations(mutation_id)
+      ) STRICT;
+    `);
+    this.#db.prepare(`
+      INSERT INTO artifact_catalog_meta(singleton, catalog_id)
+      VALUES (1, ?)
+    `).run(randomUUID());
+  }
+
+  #createFreshSchema(): void {
     const existing = this.#db.prepare(`
       SELECT name
       FROM sqlite_master
-      WHERE type = 'table' AND name IN ('artifact_blobs', 'artifact_mutations')
+      WHERE type = 'table' AND name IN (
+        'artifact_blobs', 'artifact_mutations',
+        'artifact_catalog_meta', 'artifact_resource_index', 'artifact_version_index'
+      )
       ORDER BY name
     `).all() as unknown as { readonly name: string }[];
     if (existing.length > 0) {
@@ -172,8 +290,7 @@ export class LocalArtifactStore implements ArtifactStore {
       );
     }
 
-    this.#db.exec("BEGIN IMMEDIATE");
-    try {
+    this.#transaction(() => {
       this.#db.exec(`
         CREATE TABLE artifact_blobs (
           digest TEXT PRIMARY KEY,
@@ -203,15 +320,108 @@ export class LocalArtifactStore implements ArtifactStore {
             effective_at, recorded_at, mutation_id
           );
       `);
+      this.#createCatalogTables();
       this.#db.prepare(`
         INSERT INTO artifact_store_meta(component, schema_version)
         VALUES (?, ?)
       `).run(STORE_COMPONENT, STORE_SCHEMA_VERSION);
-      this.#db.exec("COMMIT");
-    } catch (cause) {
-      this.#db.exec("ROLLBACK");
-      throw cause;
+    });
+  }
+
+  #readCatalogId(): string {
+    const row = this.#db.prepare(`
+      SELECT catalog_id FROM artifact_catalog_meta WHERE singleton = 1
+    `).get() as { readonly catalog_id: string } | undefined;
+    if (row === undefined || row.catalog_id.length === 0) {
+      throw new CorruptLocalArtifactStoreError("Artifact catalog id is missing");
     }
+    return row.catalog_id;
+  }
+
+  #indexMutation(mutation: ArtifactMutation): void {
+    const resourceUri = localArtifactResourceUri(mutation.resource);
+    const existingResource = this.#db.prepare(`
+      SELECT resource_uri, source_key, external_type, external_id
+      FROM artifact_resource_index
+      WHERE resource_uri = ? OR (
+        source_key = ? AND external_type = ? AND external_id = ?
+      )
+    `).all(
+      resourceUri,
+      mutation.resource.sourceKey,
+      mutation.resource.externalType,
+      mutation.resource.externalId,
+    ) as unknown as ResourceIndexRow[];
+    for (const row of existingResource) {
+      if (
+        row.resource_uri !== resourceUri
+        || row.source_key !== mutation.resource.sourceKey
+        || row.external_type !== mutation.resource.externalType
+        || row.external_id !== mutation.resource.externalId
+      ) {
+        throw new CorruptLocalArtifactStoreError("Artifact resource URI index collision");
+      }
+    }
+    if (existingResource.length === 0) {
+      this.#db.prepare(`
+        INSERT INTO artifact_resource_index(resource_uri, source_key, external_type, external_id)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        resourceUri,
+        mutation.resource.sourceKey,
+        mutation.resource.externalType,
+        mutation.resource.externalId,
+      );
+    }
+
+    const versionUri = localArtifactVersionUri(mutation);
+    const existingVersion = this.#db.prepare(`
+      SELECT version_uri, mutation_id
+      FROM artifact_version_index
+      WHERE version_uri = ? OR mutation_id = ?
+    `).all(versionUri, mutation.id) as unknown as VersionIndexRow[];
+    for (const row of existingVersion) {
+      if (row.version_uri !== versionUri || row.mutation_id !== mutation.id) {
+        throw new CorruptLocalArtifactStoreError("Artifact version URI index collision");
+      }
+    }
+    if (existingVersion.length === 0) {
+      this.#db.prepare(`
+        INSERT INTO artifact_version_index(version_uri, mutation_id)
+        VALUES (?, ?)
+      `).run(versionUri, mutation.id);
+    }
+  }
+
+  #migrateV1ToV2(): void {
+    const catalogTables = this.#db.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name IN (
+        'artifact_catalog_meta', 'artifact_resource_index', 'artifact_version_index'
+      )
+      ORDER BY name
+    `).all() as unknown as { readonly name: string }[];
+    if (catalogTables.length > 0) {
+      throw new CorruptLocalArtifactStoreError(
+        "Artifact catalog tables exist while schema marker is still v1",
+      );
+    }
+
+    this.#transaction(() => {
+      this.#createCatalogTables();
+      const rows = this.#db.prepare(`
+        SELECT mutation_id, source_key, external_type, external_id, kind,
+               effective_at, recorded_at, blob_digest, record_json
+        FROM artifact_mutations
+        ORDER BY mutation_id
+      `).all() as unknown as MutationRow[];
+      for (const row of rows) this.#indexMutation(this.#validatedMutationRow(row));
+      this.#db.prepare(`
+        UPDATE artifact_store_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(STORE_SCHEMA_VERSION, STORE_COMPONENT);
+    });
   }
 
   #blobPath(digest: ArtifactDigest): string {
@@ -455,6 +665,7 @@ export class LocalArtifactStore implements ArtifactStore {
         const existing = find.get(mutation.id) as JsonRow | undefined;
         if (existing !== undefined) {
           if (existing.record_json !== json) throw new ArtifactMutationCollisionError(mutation.id);
+          this.#indexMutation(mutation);
           continue;
         }
         insert.run(
@@ -468,6 +679,7 @@ export class LocalArtifactStore implements ArtifactStore {
           mutation.kind === "upsert" ? mutation.blob.digest : null,
           json,
         );
+        this.#indexMutation(mutation);
         inserted += 1;
       }
       this.#db.exec("COMMIT");
@@ -542,6 +754,78 @@ export class LocalArtifactStore implements ArtifactStore {
       normalized.externalId,
     ) as unknown as MutationRow[];
     return rows.map((row) => this.#validatedMutationRow(row));
+  }
+
+  async listArtifactResources(input: {
+    readonly cursor?: ArtifactCatalogCursor;
+    readonly limit?: number;
+  } = {}): Promise<ArtifactCatalogPage> {
+    const limit = positiveLimit(input.limit ?? 100, "artifact catalog limit");
+    if (limit > 1_000) throw new RangeError("artifact catalog limit must not exceed 1000");
+    const afterUri = input.cursor === undefined
+      ? ""
+      : cursorResourceUri(input.cursor, this.#catalogId);
+    if (input.cursor !== undefined) {
+      const known = this.#db.prepare(`
+        SELECT 1 AS present FROM artifact_resource_index WHERE resource_uri = ?
+      `).get(afterUri) as { readonly present: number } | undefined;
+      if (known === undefined) throw new InvalidArtifactCatalogCursorError(input.cursor);
+    }
+    const rows = this.#db.prepare(`
+      SELECT resource_uri, source_key, external_type, external_id
+      FROM artifact_resource_index
+      WHERE resource_uri > ?
+      ORDER BY resource_uri
+      LIMIT ?
+    `).all(afterUri, limit + 1) as unknown as ResourceIndexRow[];
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const resources = pageRows.map((row) => ({
+      uri: row.resource_uri,
+      resource: {
+        sourceKey: row.source_key,
+        externalType: row.external_type,
+        externalId: row.external_id,
+      },
+    }));
+    const lastUri = resources.at(-1)?.uri;
+    return {
+      resources,
+      ...(lastUri === undefined ? {} : { nextCursor: catalogCursor(this.#catalogId, lastUri) }),
+      hasMore,
+    };
+  }
+
+  async artifactResourceByUri(uri: string): Promise<ArtifactResourceIdentity | undefined> {
+    const row = this.#db.prepare(`
+      SELECT resource_uri, source_key, external_type, external_id
+      FROM artifact_resource_index
+      WHERE resource_uri = ?
+    `).get(uri) as ResourceIndexRow | undefined;
+    if (row === undefined) return undefined;
+    const resource = {
+      sourceKey: row.source_key,
+      externalType: row.external_type,
+      externalId: row.external_id,
+    };
+    if (localArtifactResourceUri(resource) !== row.resource_uri) {
+      throw new CorruptLocalArtifactStoreError("Artifact resource index disagrees with identity");
+    }
+    return resource;
+  }
+
+  async artifactVersionByUri(uri: string): Promise<ArtifactMutation | undefined> {
+    const row = this.#db.prepare(`
+      SELECT version_uri, mutation_id
+      FROM artifact_version_index
+      WHERE version_uri = ?
+    `).get(uri) as VersionIndexRow | undefined;
+    if (row === undefined) return undefined;
+    const mutation = await this.mutation(row.mutation_id);
+    if (mutation === undefined || localArtifactVersionUri(mutation) !== row.version_uri) {
+      throw new CorruptLocalArtifactStoreError("Artifact version index disagrees with mutation");
+    }
+    return mutation;
   }
 
   async snapshot(): Promise<ArtifactStoreSnapshot> {

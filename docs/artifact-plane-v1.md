@@ -311,20 +311,13 @@ Raw mutation IDs, source identity, title, and source URI do not appear in the UR
 
 These fingerprints avoid accidental identifier/credential exposure in MCP resource URIs and logs. They are identifiers, not an encryption or secret-storage mechanism; source identities themselves must still be non-secret.
 
-## MCP compatibility
+## URI catalog and access projection
 
-The current MCP `2026-07-28` generation supports Resources with URI/MIME content and cacheable `resources/list` / `resources/read` responses.
+LocalArtifactStore schema v2 adds rebuildable indexes from opaque resource/version URIs back to trusted internal identities/mutations. The immutable mutation log remains source of truth; catalog rows are acceleration indexes.
 
-Artifact storage remains below that transport layer. A future MCP projection can map:
+The catalog is deliberately separate from authorization. URI opacity reduces accidental source-identifier leakage but does not grant access. Blob digests and blob URIs are content identity, never permission identity.
 
-```text
-text artifact   -> TextResourceContents
-binary artifact -> BlobResourceContents
-```
-
-without changing artifact identity or storage semantics.
-
-MCP cache TTL/scope belongs to the serving/projection layer, not the raw artifact source of truth.
+`@ssrl/artifact-access` now provides the policy/bounds/audit gateway above the Artifact Plane, and `@ssrl/mcp-server` projects policy-approved resources as text or exact base64 content. MCP cache TTL/scope remains a serving-layer concern. See `docs/artifact-access-gateway-v1.md`.
 
 ## HTTP integrity compatibility
 
