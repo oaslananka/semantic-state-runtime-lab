@@ -9,6 +9,7 @@ import {
   IngestionEngine,
   SourceChangeCollisionError,
   ingestionSourceKey,
+  resolveSourceChange,
   sourceCheckpoint,
   sourceContinuation,
   type DesiredProjection,
@@ -18,6 +19,7 @@ import {
   type ProjectionMapper,
   type ResourceProjection,
   type SourceChange,
+  type SourceChangeDraft,
   type SourceCheckpoint,
   type SourceReadRequest,
   type SourceReadResult,
@@ -157,8 +159,15 @@ class DelegatingIngestionState implements IngestionStateStore {
   }
   putProjection(projection: ResourceProjection) { return this.inner.putProjection(projection); }
   listProjections(source: IngestionSourceKey) { return this.inner.listProjections(source); }
-  assertChangeIdentity(source: IngestionSourceKey, changeId: string, canonicalChange: string) {
-    return this.inner.assertChangeIdentity(source, changeId, canonicalChange);
+  changeReceipt<TPayload>(source: IngestionSourceKey, change: SourceChangeDraft<TPayload>) {
+    return this.inner.changeReceipt(source, change);
+  }
+  putChangeReceipt<TPayload>(
+    source: IngestionSourceKey,
+    change: SourceChangeDraft<TPayload>,
+    resolved: SourceChange<TPayload>,
+  ) {
+    return this.inner.putChangeReceipt(source, change, resolved);
   }
   mappedProjection(source: IngestionSourceKey, changeId: string) {
     return this.inner.mappedProjection(source, changeId);
@@ -459,6 +468,65 @@ describe("IngestionEngine", () => {
     });
     expect(await inner.checkpoint(sourceKey)).toBe(sourceCheckpoint("cp-1"));
     semantic.close();
+  });
+
+  it("durably stamps missing provider timestamps once and reuses them without calling the clock on replay", async () => {
+    const semantic = new TestSemanticStateStore();
+    const ingestionState = new InMemoryIngestionStateStore();
+    let clockCalls = 0;
+    const engine = new IngestionEngine({
+      semanticState: semantic,
+      ingestionState,
+      now: () => {
+        clockCalls += 1;
+        return "2026-09-24T12:34:56Z";
+      },
+    });
+    const missingTimes: SourceChangeDraft<ProjectPayload> = {
+      changeId: "missing-times-r1",
+      externalType: "project",
+      externalId: "atlas",
+      kind: "upsert",
+      revision: "r1",
+      payload: { name: "Atlas", status: "active" },
+    };
+    const source = new CallbackSource(() => ({
+      kind: "page",
+      changes: [missingTimes],
+      next: { kind: "complete", checkpoint: sourceCheckpoint("cp-any") },
+    }));
+
+    await engine.sync({ sourceKey, source, mapper });
+    expect(clockCalls).toBe(1);
+    const firstSnapshot = await semantic.snapshot();
+    const first = firstSnapshot.observations.find((item) => item.id === "obs:atlas:r1:status");
+    expect(first?.validFrom).toBe("2026-09-24T12:34:56.000Z");
+    expect(first?.recordedAt).toBe("2026-09-24T12:34:56.000Z");
+
+    await engine.sync({ sourceKey, source, mapper });
+    expect(clockCalls).toBe(1);
+    const secondSnapshot = await semantic.snapshot();
+    expect(secondSnapshot.observations.filter((item) => item.id === "obs:atlas:r1:status"))
+      .toHaveLength(1);
+  });
+
+  it("rejects a resolved receipt that changes provider-owned source fields", async () => {
+    const state = new InMemoryIngestionStateStore();
+    const draft: SourceChangeDraft<ProjectPayload> = {
+      changeId: "receipt-integrity",
+      externalType: "project",
+      externalId: "atlas",
+      kind: "upsert",
+      revision: "r1",
+      payload: { name: "Atlas", status: "active" },
+    };
+    const resolved = resolveSourceChange(draft, "2026-09-24T12:00:00Z");
+
+    await expect(state.putChangeReceipt(sourceKey, draft, {
+      ...resolved,
+      externalId: "zeus",
+    })).rejects.toBeInstanceOf(SourceChangeCollisionError);
+    expect(await state.changeReceipt(sourceKey, draft)).toBeUndefined();
   });
 
   it("fails closed when one source change id is replayed with different content", async () => {

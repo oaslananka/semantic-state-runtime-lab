@@ -39,15 +39,20 @@ export function sourceContinuation(value: string): SourceContinuation {
   return value as SourceContinuation;
 }
 
-export interface SourceChange<TPayload = unknown> {
+export interface SourceChangeDraft<TPayload = unknown> {
   readonly changeId: string;
   readonly externalType: string;
   readonly externalId: string;
   readonly kind: "upsert" | "delete";
-  readonly effectiveAt: string;
-  readonly recordedAt: string;
+  readonly effectiveAt?: string;
+  readonly recordedAt?: string;
   readonly revision?: string;
   readonly payload?: TPayload;
+}
+
+export interface SourceChange<TPayload = unknown> extends SourceChangeDraft<TPayload> {
+  readonly effectiveAt: string;
+  readonly recordedAt: string;
 }
 
 export interface SourceReadRequest {
@@ -63,7 +68,7 @@ export type SourcePageNext =
 export type SourceReadResult<TPayload = unknown> =
   | {
       readonly kind: "page";
-      readonly changes: readonly SourceChange<TPayload>[];
+      readonly changes: readonly SourceChangeDraft<TPayload>[];
       readonly next: SourcePageNext;
     }
   | { readonly kind: "reset-required"; readonly reason: string };
@@ -116,11 +121,15 @@ export interface IngestionStateStore {
   ): Promise<ResourceProjection | undefined>;
   putProjection(projection: ResourceProjection): Promise<void>;
   listProjections(sourceKey: IngestionSourceKey): Promise<readonly ResourceProjection[]>;
-  assertChangeIdentity(
+  changeReceipt<TPayload>(
     sourceKey: IngestionSourceKey,
-    changeId: string,
-    canonicalChange: string,
-  ): Promise<"inserted" | "existing">;
+    change: SourceChangeDraft<TPayload>,
+  ): Promise<SourceChange<TPayload> | undefined>;
+  putChangeReceipt<TPayload>(
+    sourceKey: IngestionSourceKey,
+    change: SourceChangeDraft<TPayload>,
+    resolved: SourceChange<TPayload>,
+  ): Promise<SourceChange<TPayload>>;
   mappedProjection(
     sourceKey: IngestionSourceKey,
     changeId: string,
@@ -206,19 +215,23 @@ function isoTimestamp(value: string, label: string): string {
   return new Date(millis).toISOString();
 }
 
-export function normalizeSourceChange<TPayload>(
-  change: SourceChange<TPayload>,
-): SourceChange<TPayload> {
+export function normalizeSourceChangeDraft<TPayload>(
+  change: SourceChangeDraft<TPayload>,
+): SourceChangeDraft<TPayload> {
   if (change.kind !== "upsert" && change.kind !== "delete") {
     throw new InvalidSourceChangeError("Source change kind must be upsert or delete");
   }
-  const normalized: SourceChange<TPayload> = {
+  const normalized: SourceChangeDraft<TPayload> = {
     changeId: requiredString(change.changeId, "changeId"),
     externalType: requiredString(change.externalType, "externalType"),
     externalId: requiredString(change.externalId, "externalId"),
     kind: change.kind,
-    effectiveAt: isoTimestamp(change.effectiveAt, "effectiveAt"),
-    recordedAt: isoTimestamp(change.recordedAt, "recordedAt"),
+    ...(change.effectiveAt === undefined
+      ? {}
+      : { effectiveAt: isoTimestamp(change.effectiveAt, "effectiveAt") }),
+    ...(change.recordedAt === undefined
+      ? {}
+      : { recordedAt: isoTimestamp(change.recordedAt, "recordedAt") }),
     ...(change.revision === undefined
       ? {}
       : { revision: requiredString(change.revision, "revision") }),
@@ -228,8 +241,91 @@ export function normalizeSourceChange<TPayload>(
   return normalized;
 }
 
+export function resolveSourceChange<TPayload>(
+  draft: SourceChangeDraft<TPayload>,
+  firstObservedAt: string,
+): SourceChange<TPayload> {
+  const normalized = normalizeSourceChangeDraft(draft);
+  const observedAt = isoTimestamp(firstObservedAt, "firstObservedAt");
+  const recordedAt = normalized.recordedAt ?? observedAt;
+  const effectiveAt = normalized.effectiveAt ?? normalized.recordedAt ?? observedAt;
+  return {
+    ...normalized,
+    effectiveAt,
+    recordedAt,
+  };
+}
+
+export function normalizeSourceChange<TPayload>(
+  change: SourceChange<TPayload>,
+): SourceChange<TPayload> {
+  return resolveSourceChange(change, change.recordedAt);
+}
+
+export function canonicalSourceChangeDraftJson(change: SourceChangeDraft): string {
+  return canonicalJson(normalizeSourceChangeDraft(change));
+}
+
 export function canonicalSourceChangeJson(change: SourceChange): string {
   return canonicalJson(normalizeSourceChange(change));
+}
+
+
+export function resolvedSourceChangeMatchesDraft<TPayload>(
+  draft: SourceChangeDraft<TPayload>,
+  resolved: SourceChange<TPayload>,
+): boolean {
+  const normalizedDraft = normalizeSourceChangeDraft(draft);
+  const normalizedResolved = normalizeSourceChange(resolved);
+  const draftIdentity = canonicalJson({
+    changeId: normalizedDraft.changeId,
+    externalType: normalizedDraft.externalType,
+    externalId: normalizedDraft.externalId,
+    kind: normalizedDraft.kind,
+    ...(normalizedDraft.revision === undefined ? {} : { revision: normalizedDraft.revision }),
+    ...(normalizedDraft.payload === undefined ? {} : { payload: normalizedDraft.payload }),
+  });
+  const resolvedIdentity = canonicalJson({
+    changeId: normalizedResolved.changeId,
+    externalType: normalizedResolved.externalType,
+    externalId: normalizedResolved.externalId,
+    kind: normalizedResolved.kind,
+    ...(normalizedResolved.revision === undefined ? {} : { revision: normalizedResolved.revision }),
+    ...(normalizedResolved.payload === undefined ? {} : { payload: normalizedResolved.payload }),
+  });
+  return draftIdentity === resolvedIdentity
+    && (normalizedDraft.effectiveAt === undefined
+      || normalizedDraft.effectiveAt === normalizedResolved.effectiveAt)
+    && (normalizedDraft.recordedAt === undefined
+      || normalizedDraft.recordedAt === normalizedResolved.recordedAt);
+}
+
+function parsedSourceChangeJson(value: string, label: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new InvalidSourceChangeError(`${label} is invalid JSON`);
+  }
+}
+
+export function parseSourceChangeDraftJson<TPayload = unknown>(value: string): SourceChangeDraft<TPayload> {
+  const parsed = parsedSourceChangeJson(value, "Source change draft");
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new InvalidSourceChangeError("Source change draft JSON must be an object");
+  }
+  return normalizeSourceChangeDraft(parsed as SourceChangeDraft<TPayload>);
+}
+
+export function parseSourceChangeJson<TPayload = unknown>(value: string): SourceChange<TPayload> {
+  const parsed = parsedSourceChangeJson(value, "Resolved source change");
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new InvalidSourceChangeError("Resolved source change JSON must be an object");
+  }
+  const candidate = parsed as SourceChange<TPayload>;
+  if (candidate.effectiveAt === undefined || candidate.recordedAt === undefined) {
+    throw new InvalidSourceChangeError("Resolved source change must contain timestamps");
+  }
+  return normalizeSourceChange(candidate);
 }
 
 function projectionSlotTarget(slot: ProjectedSlot): ProjectionSlotTarget {
@@ -570,12 +666,16 @@ export class IngestionEngine {
 
   async #processChange<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
-    readonly change: SourceChange<TPayload>;
+    readonly change: SourceChangeDraft<TPayload>;
     readonly mapper: ProjectionMapper<TPayload>;
   }): Promise<SemanticAppendCounts> {
-    const change = normalizeSourceChange(input.change);
-    const changeJson = canonicalJson(change);
-    await this.#ingestionState.assertChangeIdentity(input.sourceKey, change.changeId, changeJson);
+    const draft = normalizeSourceChangeDraft(input.change);
+    const existing = await this.#ingestionState.changeReceipt(input.sourceKey, draft);
+    const change = existing ?? await this.#ingestionState.putChangeReceipt(
+      input.sourceKey,
+      draft,
+      resolveSourceChange(draft, this.#now()),
+    );
     const previous = await this.#ingestionState.projection(
       input.sourceKey,
       change.externalType,
@@ -606,13 +706,13 @@ export class IngestionEngine {
 
   async #processSourceChanges<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
-    readonly changes: readonly SourceChange<TPayload>[];
+    readonly changes: readonly SourceChangeDraft<TPayload>[];
     readonly mapper: ProjectionMapper<TPayload>;
     readonly generation: FullSyncGeneration | undefined;
   }): Promise<ProcessedSourceChanges> {
     let semanticAppends = zeroAppendCounts();
     for (const rawChange of input.changes) {
-      const change = normalizeSourceChange(rawChange);
+      const change = normalizeSourceChangeDraft(rawChange);
       semanticAppends = addAppendCounts(
         semanticAppends,
         await this.#processChange({ sourceKey: input.sourceKey, change, mapper: input.mapper }),
@@ -759,7 +859,8 @@ export class IngestionEngine {
 }
 
 interface ChangeReceipt {
-  readonly canonicalChange: string;
+  readonly canonicalProviderChange: string;
+  readonly resolvedChange: SourceChange;
   mappedProjection?: DesiredProjection;
 }
 
@@ -822,21 +923,44 @@ export class InMemoryIngestionStateStore implements IngestionStateStore {
       .toSorted(compareResourceIdentity);
   }
 
-  async assertChangeIdentity(
+  async changeReceipt<TPayload>(
     sourceKey: IngestionSourceKey,
-    changeId: string,
-    canonicalChange: string,
-  ): Promise<"inserted" | "existing"> {
-    const key = canonicalJson([sourceKey, changeId]);
+    change: SourceChangeDraft<TPayload>,
+  ): Promise<SourceChange<TPayload> | undefined> {
+    const normalized = normalizeSourceChangeDraft(change);
+    const key = canonicalJson([sourceKey, normalized.changeId]);
     const existing = this.#receipts.get(key);
-    if (existing !== undefined) {
-      if (existing.canonicalChange !== canonicalChange) {
-        throw new SourceChangeCollisionError(sourceKey, changeId);
-      }
-      return "existing";
+    if (existing === undefined) return undefined;
+    if (existing.canonicalProviderChange !== canonicalSourceChangeDraftJson(normalized)) {
+      throw new SourceChangeCollisionError(sourceKey, normalized.changeId);
     }
-    this.#receipts.set(key, { canonicalChange });
-    return "inserted";
+    return existing.resolvedChange as SourceChange<TPayload>;
+  }
+
+  async putChangeReceipt<TPayload>(
+    sourceKey: IngestionSourceKey,
+    change: SourceChangeDraft<TPayload>,
+    resolved: SourceChange<TPayload>,
+  ): Promise<SourceChange<TPayload>> {
+    const normalizedDraft = normalizeSourceChangeDraft(change);
+    const normalizedResolved = normalizeSourceChange(resolved);
+    if (!resolvedSourceChangeMatchesDraft(normalizedDraft, normalizedResolved)) {
+      throw new SourceChangeCollisionError(sourceKey, normalizedDraft.changeId);
+    }
+    const key = canonicalJson([sourceKey, normalizedDraft.changeId]);
+    const existing = this.#receipts.get(key);
+    const providerJson = canonicalSourceChangeDraftJson(normalizedDraft);
+    if (existing !== undefined) {
+      if (existing.canonicalProviderChange !== providerJson) {
+        throw new SourceChangeCollisionError(sourceKey, normalizedDraft.changeId);
+      }
+      return existing.resolvedChange as SourceChange<TPayload>;
+    }
+    this.#receipts.set(key, {
+      canonicalProviderChange: providerJson,
+      resolvedChange: normalizedResolved,
+    });
+    return normalizedResolved;
   }
 
   async mappedProjection(

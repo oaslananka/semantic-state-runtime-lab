@@ -50,3 +50,9 @@ Its main result is negative in the useful sense: it does not establish a proprie
 It compares legacy untyped retrieval with a typed semantic frontier, then compares BM25 and BM25/lexical RRF on that exact same typed frontier. The typed BM25 and RRF paths currently have identical task success, reinforcing that the measured improvement comes from identity/graph semantics rather than a special ranker.
 
 See `docs/entity-graph-context-v1.md` for the contract, policy boundary, results, and limitations.
+
+## Google Calendar adapter v1 fixture
+
+`pnpm benchmark:google-calendar:v1` is a deterministic provider-adapter accounting benchmark. It uses scripted Google Calendar responses plus the real SQLite ingestion/semantic stores and existing Context Capsule worker; it does not use live credentials and makes no latency claim.
+
+The fixture covers a multi-page initial sync, an incremental update + sparse delete, and a 410-triggered authoritative full resync with unseen-resource sweep. See `docs/google-calendar-adapter-v1.md` for the current expected counts and semantics.

@@ -176,6 +176,28 @@ importers:
         specifier: 5.0.1
         version: 5.0.1(@types/node@26.6.2)(vite@8.3.0(@types/node@26.6.2)(esbuild@0.28.2)(tsx@4.23.15)(yaml@2.9.1))
 
+  packages/connector-google-calendar:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/ingestion':
+        specifier: workspace:*
+        version: link:../ingestion
+    devDependencies:
+      '@ssrl/materializer':
+        specifier: workspace:*
+        version: link:../materializer
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+      '@ssrl/storage-sqlite':
+        specifier: workspace:*
+        version: link:../storage-sqlite
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/connector-markdown-fs:
     dependencies:
       '@ssrl/connector-sdk':

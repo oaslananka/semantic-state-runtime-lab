@@ -3,12 +3,18 @@ import {
   FullSyncCompletionCollisionError,
   MappedProjectionCollisionError,
   SourceChangeCollisionError,
+  canonicalSourceChangeDraftJson,
+  canonicalSourceChangeJson,
   desiredProjectionJson,
   fullSyncGenerationId,
   ingestionSourceKey,
   newFullSyncGeneration,
+  normalizeSourceChange,
+  normalizeSourceChangeDraft,
   parseDesiredProjectionJson,
+  parseSourceChangeJson,
   parseResourceProjectionJson,
+  resolvedSourceChangeMatchesDraft,
   resourceProjectionJson,
   sourceCheckpoint,
   type DesiredProjection,
@@ -16,11 +22,13 @@ import {
   type IngestionSourceKey,
   type IngestionStateStore,
   type ResourceProjection,
+  type SourceChange,
+  type SourceChangeDraft,
   type SourceCheckpoint,
 } from "@ssrl/ingestion";
 
 const INGESTION_COMPONENT = "ingestion-state-store";
-const INGESTION_SCHEMA_VERSION = 1;
+const INGESTION_SCHEMA_VERSION = 2;
 
 export interface SQLiteIngestionStateStoreOptions {
   readonly path: string;
@@ -45,7 +53,8 @@ interface ProjectionRow {
 }
 
 interface ReceiptRow {
-  readonly change_json: string;
+  readonly provider_change_json: string;
+  readonly resolved_change_json: string;
   readonly projection_json: string | null;
 }
 
@@ -175,9 +184,12 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     if (version > INGESTION_SCHEMA_VERSION) {
       throw new UnsupportedIngestionStateSchemaError(version, INGESTION_SCHEMA_VERSION);
     }
-    if (version !== INGESTION_SCHEMA_VERSION) {
-      throw new CorruptIngestionStateDatabaseError(`Unsupported ingestion state schema version ${version}`);
+    if (version === INGESTION_SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.#migrateV1ToV2();
+      return;
     }
+    throw new CorruptIngestionStateDatabaseError(`Unsupported ingestion state schema version ${version}`);
   }
 
   #createFreshSchema(): void {
@@ -222,7 +234,8 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
         CREATE TABLE ingestion_change_receipts (
           source_key TEXT NOT NULL,
           change_id TEXT NOT NULL,
-          change_json TEXT NOT NULL CHECK(json_valid(change_json)),
+          provider_change_json TEXT NOT NULL CHECK(json_valid(provider_change_json)),
+          resolved_change_json TEXT NOT NULL CHECK(json_valid(resolved_change_json)),
           projection_json TEXT CHECK(projection_json IS NULL OR json_valid(projection_json)),
           PRIMARY KEY(source_key, change_id)
         ) STRICT;
@@ -251,6 +264,40 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
         INSERT INTO ingestion_state_meta(component, schema_version)
         VALUES (?, ?)
       `).run(INGESTION_COMPONENT, INGESTION_SCHEMA_VERSION);
+    });
+  }
+
+  #migrateV1ToV2(): void {
+    this.#transaction(() => {
+      this.#db.exec(`
+        ALTER TABLE ingestion_change_receipts RENAME TO ingestion_change_receipts_v1;
+
+        CREATE TABLE ingestion_change_receipts (
+          source_key TEXT NOT NULL,
+          change_id TEXT NOT NULL,
+          provider_change_json TEXT NOT NULL CHECK(json_valid(provider_change_json)),
+          resolved_change_json TEXT NOT NULL CHECK(json_valid(resolved_change_json)),
+          projection_json TEXT CHECK(projection_json IS NULL OR json_valid(projection_json)),
+          PRIMARY KEY(source_key, change_id)
+        ) STRICT;
+
+        INSERT INTO ingestion_change_receipts(
+          source_key,
+          change_id,
+          provider_change_json,
+          resolved_change_json,
+          projection_json
+        )
+        SELECT source_key, change_id, change_json, change_json, projection_json
+        FROM ingestion_change_receipts_v1;
+
+        DROP TABLE ingestion_change_receipts_v1;
+      `);
+      this.#db.prepare(`
+        UPDATE ingestion_state_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(INGESTION_SCHEMA_VERSION, INGESTION_COMPONENT);
     });
   }
 
@@ -334,27 +381,79 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     return rows.map((row) => this.#projectionRow(row));
   }
 
-  async assertChangeIdentity(
-    sourceKey: IngestionSourceKey,
-    changeId: string,
-    canonicalChange: string,
-  ): Promise<"inserted" | "existing"> {
-    const existing = this.#db.prepare(`
-      SELECT change_json, projection_json
+  #receiptRow(sourceKey: IngestionSourceKey, changeId: string): ReceiptRow | undefined {
+    return this.#db.prepare(`
+      SELECT provider_change_json, resolved_change_json, projection_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
-    if (existing !== undefined) {
-      if (existing.change_json !== canonicalChange) {
-        throw new SourceChangeCollisionError(sourceKey, changeId);
-      }
-      return "existing";
+  }
+
+  #resolvedReceipt<TPayload>(
+    sourceKey: IngestionSourceKey,
+    draft: SourceChangeDraft<TPayload>,
+    row: ReceiptRow,
+  ): SourceChange<TPayload> {
+    const providerJson = canonicalSourceChangeDraftJson(draft);
+    if (row.provider_change_json !== providerJson) {
+      throw new SourceChangeCollisionError(sourceKey, draft.changeId);
     }
-    this.#db.prepare(`
-      INSERT INTO ingestion_change_receipts(source_key, change_id, change_json, projection_json)
-      VALUES (?, ?, ?, NULL)
-    `).run(sourceKey, changeId, canonicalChange);
-    return "inserted";
+    let resolved: SourceChange<TPayload>;
+    try {
+      resolved = parseSourceChangeJson<TPayload>(row.resolved_change_json);
+    } catch (cause) {
+      throw new CorruptIngestionStateDatabaseError(
+        cause instanceof Error ? cause.message : "Resolved source change JSON is invalid",
+      );
+    }
+    if (!resolvedSourceChangeMatchesDraft(draft, resolved)) {
+      throw new CorruptIngestionStateDatabaseError(
+        `Resolved source change disagrees with provider receipt ${draft.changeId}`,
+      );
+    }
+    return resolved;
+  }
+
+  async changeReceipt<TPayload>(
+    sourceKey: IngestionSourceKey,
+    change: SourceChangeDraft<TPayload>,
+  ): Promise<SourceChange<TPayload> | undefined> {
+    const draft = normalizeSourceChangeDraft(change);
+    const row = this.#receiptRow(sourceKey, draft.changeId);
+    return row === undefined ? undefined : this.#resolvedReceipt(sourceKey, draft, row);
+  }
+
+  async putChangeReceipt<TPayload>(
+    sourceKey: IngestionSourceKey,
+    change: SourceChangeDraft<TPayload>,
+    resolved: SourceChange<TPayload>,
+  ): Promise<SourceChange<TPayload>> {
+    const draft = normalizeSourceChangeDraft(change);
+    const normalizedResolved = normalizeSourceChange(resolved);
+    if (!resolvedSourceChangeMatchesDraft(draft, normalizedResolved)) {
+      throw new SourceChangeCollisionError(sourceKey, draft.changeId);
+    }
+    const existing = this.#receiptRow(sourceKey, draft.changeId);
+    if (existing !== undefined) return this.#resolvedReceipt(sourceKey, draft, existing);
+
+    const providerJson = canonicalSourceChangeDraftJson(draft);
+    const resolvedJson = canonicalSourceChangeJson(normalizedResolved);
+    try {
+      this.#db.prepare(`
+        INSERT INTO ingestion_change_receipts(
+          source_key,
+          change_id,
+          provider_change_json,
+          resolved_change_json,
+          projection_json
+        ) VALUES (?, ?, ?, ?, NULL)
+      `).run(sourceKey, draft.changeId, providerJson, resolvedJson);
+      return normalizedResolved;
+    } catch (cause) {
+      const raced = this.#receiptRow(sourceKey, draft.changeId);
+      if (raced !== undefined) return this.#resolvedReceipt(sourceKey, draft, raced);
+      throw cause;
+    }
   }
 
   async mappedProjection(
@@ -362,7 +461,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     changeId: string,
   ): Promise<DesiredProjection | undefined> {
     const row = this.#db.prepare(`
-      SELECT change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, projection_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
@@ -383,7 +482,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
   ): Promise<"inserted" | "existing"> {
     const json = desiredProjectionJson(projection);
     const row = this.#db.prepare(`
-      SELECT change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, projection_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
@@ -404,7 +503,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     if (Number(updated.changes) === 1) return "inserted";
 
     const raced = this.#db.prepare(`
-      SELECT change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, projection_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;

@@ -8,9 +8,11 @@ import {
   MappedProjectionCollisionError,
   SourceChangeCollisionError,
   ingestionSourceKey,
+  resolveSourceChange,
   resourceProjectionJson,
   sourceCheckpoint,
   type ResourceProjection,
+  type SourceChangeDraft,
 } from "@ssrl/ingestion";
 import {
   CorruptIngestionStateDatabaseError,
@@ -47,6 +49,28 @@ function projection(
   };
 }
 
+function draft(
+  changeId: string,
+  overrides: Partial<SourceChangeDraft<{ readonly value?: string }>> = {},
+): SourceChangeDraft<{ readonly value?: string }> {
+  return {
+    changeId,
+    externalType: "project",
+    externalId: "atlas",
+    kind: "upsert",
+    payload: { value: "active" },
+    ...overrides,
+  };
+}
+
+async function persistReceipt(
+  store: SQLiteIngestionStateStore,
+  item: SourceChangeDraft,
+  observedAt = "2026-09-24T12:00:00Z",
+) {
+  return store.putChangeReceipt(source, item, resolveSourceChange(item, observedAt));
+}
+
 describe("SQLiteIngestionStateStore", () => {
   it("persists source-scoped checkpoints and projections across close/reopen", async () => {
     const path = await databasePath();
@@ -66,21 +90,49 @@ describe("SQLiteIngestionStateStore", () => {
     reopened.close();
   });
 
-  it("stores a source change identity once and fails closed on different replay content", async () => {
+  it("stores provider draft and resolved receipt once and fails closed on different replay content", async () => {
     const path = await databasePath();
     const store = new SQLiteIngestionStateStore({ path });
-    expect(await store.assertChangeIdentity(source, "change-1", '{"a":1}')).toBe("inserted");
-    expect(await store.assertChangeIdentity(source, "change-1", '{"a":1}')).toBe("existing");
-    await expect(store.assertChangeIdentity(source, "change-1", '{"a":2}'))
+    const item = draft("change-1");
+
+    expect(await store.changeReceipt(source, item)).toBeUndefined();
+    const resolved = await persistReceipt(store, item, "2026-09-24T12:00:00Z");
+    expect(resolved.effectiveAt).toBe("2026-09-24T12:00:00.000Z");
+    expect(resolved.recordedAt).toBe("2026-09-24T12:00:00.000Z");
+    expect(await store.changeReceipt(source, item)).toEqual(resolved);
+    expect(await store.putChangeReceipt(
+      source,
+      item,
+      resolveSourceChange(item, "2026-09-25T00:00:00Z"),
+    )).toEqual(resolved);
+
+    await expect(store.changeReceipt(source, draft("change-1", { payload: { value: "different" } })))
       .rejects.toBeInstanceOf(SourceChangeCollisionError);
-    expect(await store.assertChangeIdentity(otherSource, "change-1", '{"a":2}')).toBe("inserted");
+    expect(await store.changeReceipt(otherSource, item)).toBeUndefined();
+    store.close();
+  });
+
+  it("rejects a resolved receipt that changes provider-owned source fields", async () => {
+    const path = await databasePath();
+    const store = new SQLiteIngestionStateStore({ path });
+    const item = draft("receipt-integrity");
+    const resolved = resolveSourceChange(item, "2026-09-24T12:00:00Z");
+
+    await expect(store.putChangeReceipt(source, item, {
+      ...resolved,
+      kind: "delete",
+    })).rejects.toBeInstanceOf(SourceChangeCollisionError);
+    expect(await store.changeReceipt(source, item)).toBeUndefined();
     store.close();
   });
 
   it("persists the canonical mapped plan and rejects a different plan for the same change", async () => {
     const path = await databasePath();
     const first = new SQLiteIngestionStateStore({ path });
-    await first.assertChangeIdentity(source, "change-plan", '{"changeId":"change-plan"}');
+    await persistReceipt(first, draft("change-plan", {
+      effectiveAt: "2026-09-24T00:00:00Z",
+      recordedAt: "2026-09-24T00:01:00Z",
+    }));
     const desired = {
       additiveEntities: [{ entityId: "entity://project/atlas" as const, entityType: "Project" }],
       slots: [{
@@ -131,6 +183,47 @@ describe("SQLiteIngestionStateStore", () => {
       }],
     })).rejects.toBeInstanceOf(MappedProjectionCollisionError);
     reopened.close();
+  });
+
+  it("migrates v1 receipts without changing their resolved source change", async () => {
+    const path = await databasePath();
+    const first = new SQLiteIngestionStateStore({ path });
+    const item = draft("legacy-change", {
+      effectiveAt: "2026-09-24T00:00:00Z",
+      recordedAt: "2026-09-24T00:01:00Z",
+    });
+    const expected = await persistReceipt(first, item);
+    first.close();
+
+    const raw = new DatabaseSync(path);
+    raw.exec(`
+      ALTER TABLE ingestion_change_receipts RENAME TO ingestion_change_receipts_v2;
+      CREATE TABLE ingestion_change_receipts (
+        source_key TEXT NOT NULL,
+        change_id TEXT NOT NULL,
+        change_json TEXT NOT NULL CHECK(json_valid(change_json)),
+        projection_json TEXT CHECK(projection_json IS NULL OR json_valid(projection_json)),
+        PRIMARY KEY(source_key, change_id)
+      ) STRICT;
+      INSERT INTO ingestion_change_receipts(source_key, change_id, change_json, projection_json)
+      SELECT source_key, change_id, resolved_change_json, projection_json
+      FROM ingestion_change_receipts_v2;
+      DROP TABLE ingestion_change_receipts_v2;
+      UPDATE ingestion_state_meta
+      SET schema_version = 1
+      WHERE component = 'ingestion-state-store';
+    `);
+    raw.close();
+
+    const migrated = new SQLiteIngestionStateStore({ path });
+    expect(await migrated.changeReceipt(source, item)).toEqual(expected);
+    migrated.close();
+
+    const inspect = new DatabaseSync(path);
+    expect(inspect.prepare(`
+      SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    inspect.close();
   });
 
   it("persists an active full-sync generation and seen set across close/reopen", async () => {
