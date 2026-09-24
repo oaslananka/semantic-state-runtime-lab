@@ -68,7 +68,7 @@ function draft(
   };
 }
 
-function desiredProjection(): DesiredProjection {
+function desiredProjection(status: string = "active"): DesiredProjection {
   return {
     additiveEntities: [{ entityId: "entity://project/atlas" as const, entityType: "Project" }],
     slots: [{
@@ -78,13 +78,21 @@ function desiredProjection(): DesiredProjection {
         id: "obs:atlas:r1:status",
         entityId: "entity://project/atlas" as const,
         property: "Project.status",
-        value: "active",
+        value: status,
         source: { provider: "synthetic", externalId: "atlas", revision: "r1" },
         validFrom: "2026-09-24T00:00:00Z",
         recordedAt: "2026-09-24T00:01:00Z",
       },
     }],
   };
+}
+
+function expectSchemaVersion3(path: string): void {
+  const inspect = new DatabaseSync(path);
+  expect(inspect.prepare(`
+    SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
+  `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
+  inspect.close();
 }
 
 async function persistReceipt(
@@ -179,22 +187,7 @@ describe("SQLiteIngestionStateStore", () => {
     });
     expect(await reopened.putMappedPlan(source, "change-plan", { semantic: desired, artifactAction: { kind: "preserve" } })).toBe("existing");
     await expect(reopened.putMappedPlan(source, "change-plan", {
-      semantic: {
-        additiveEntities: [{ entityId: "entity://project/atlas" as const, entityType: "Project" }],
-        slots: [{
-        key: "status",
-        kind: "observation",
-        record: {
-          id: "obs:atlas:r1:status",
-          entityId: "entity://project/atlas" as const,
-          property: "Project.status",
-          value: "paused",
-          source: { provider: "synthetic", externalId: "atlas", revision: "r1" },
-          validFrom: "2026-09-24T00:00:00Z",
-          recordedAt: "2026-09-24T00:01:00Z",
-        },
-        }],
-      },
+      semantic: desiredProjection("paused"),
       artifactAction: { kind: "preserve" },
     })).rejects.toBeInstanceOf(MappedProjectionCollisionError);
     reopened.close();
@@ -306,11 +299,7 @@ describe("SQLiteIngestionStateStore", () => {
     expect(await migrated.changeReceipt(source, item)).toEqual(expected);
     migrated.close();
 
-    const inspect = new DatabaseSync(path);
-    expect(inspect.prepare(`
-      SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
-    `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
-    inspect.close();
+    expectSchemaVersion3(path);
   });
 
   it("migrates v2 semantic mapped projections to preserve-artifact plans without losing restart state", async () => {
@@ -399,11 +388,7 @@ describe("SQLiteIngestionStateStore", () => {
     expect(await migrated.unseenProjections(generation.id)).toEqual([]);
     migrated.close();
 
-    const inspect = new DatabaseSync(path);
-    expect(inspect.prepare(`
-      SELECT schema_version FROM ingestion_state_meta WHERE component = 'ingestion-state-store'
-    `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
-    inspect.close();
+    expectSchemaVersion3(path);
   });
 
   it("persists an active full-sync generation and seen set across close/reopen", async () => {
