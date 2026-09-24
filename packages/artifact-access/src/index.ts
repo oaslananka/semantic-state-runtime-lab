@@ -6,7 +6,6 @@ import {
   type ArtifactBlobReadResult,
   type ArtifactCatalog,
   type ArtifactCatalogCursor,
-  type ArtifactMutation,
   type ArtifactResourceIdentity,
   type ArtifactStore,
   type ArtifactUpsert,
@@ -274,6 +273,33 @@ export class ArtifactAccessGateway {
     throw new ArtifactAccessNotFoundError();
   }
 
+  async #listedDescriptor(
+    uri: string,
+    principal: AccessPrincipal | undefined,
+    validAt: string,
+    knownAt: string,
+  ): Promise<ArtifactResourceDescriptor | undefined> {
+    const mutation = await this.#currentMutation(uri, validAt, knownAt);
+    if (mutation === undefined) return undefined;
+    const access = await this.#authorization({
+      operation: "metadata",
+      principal,
+      target: "current",
+      publicUri: uri,
+      mutation,
+    });
+    if (access.effect === "deny") return undefined;
+    const resource = await descriptor(uri, mutation);
+    await this.#emit({
+      operation: "metadata",
+      publicUri: uri,
+      target: "current",
+      outcome: "allow",
+      ...(principal === undefined ? {} : { subject: principal.subject }),
+    });
+    return resource;
+  }
+
   async list(request: ArtifactListRequest = {}): Promise<ArtifactAccessPage> {
     const principal = this.#principal(request.principal, "metadata");
     const limit = gatewayLimit(request.limit ?? 100, "artifact access list limit");
@@ -299,24 +325,8 @@ export class ArtifactAccessGateway {
       cursor = page.nextCursor ?? cursor;
       hasMore = page.hasMore;
       if (candidate === undefined) break;
-      const mutation = await this.#currentMutation(candidate.uri, validAt, knownAt);
-      if (mutation === undefined) continue;
-      const access = await this.#authorization({
-        operation: "metadata",
-        principal,
-        target: "current",
-        publicUri: candidate.uri,
-        mutation,
-      });
-      if (access.effect === "deny") continue;
-      resources.push(await descriptor(candidate.uri, mutation));
-      await this.#emit({
-        operation: "metadata",
-        publicUri: candidate.uri,
-        target: "current",
-        outcome: "allow",
-        ...(principal === undefined ? {} : { subject: principal.subject }),
-      });
+      const visible = await this.#listedDescriptor(candidate.uri, principal, validAt, knownAt);
+      if (visible !== undefined) resources.push(visible);
     }
 
     return {
