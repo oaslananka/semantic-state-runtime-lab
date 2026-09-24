@@ -5,10 +5,12 @@
   "type": "module",
   "dependencies": {
     "@ssrl/core": "workspace:*",
-    "@ssrl/state-store": "workspace:*"
+    "@ssrl/state-store": "workspace:*",
+    "@ssrl/artifact-store": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.2",
+    "@ssrl/storage-local-artifacts": "workspace:*"
   },
   "exports": {
     ".": {

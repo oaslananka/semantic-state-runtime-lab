@@ -243,6 +243,9 @@ importers:
 
   packages/ingestion:
     dependencies:
+      '@ssrl/artifact-store':
+        specifier: workspace:*
+        version: link:../artifact-store
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
@@ -250,6 +253,9 @@ importers:
         specifier: workspace:*
         version: link:../state-store
     devDependencies:
+      '@ssrl/storage-local-artifacts':
+        specifier: workspace:*
+        version: link:../storage-local-artifacts
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
@@ -403,6 +409,9 @@ importers:
         specifier: workspace:*
         version: link:../state-store
     devDependencies:
+      '@ssrl/artifact-store':
+        specifier: workspace:*
+        version: link:../artifact-store
       '@ssrl/context':
         specifier: workspace:*
         version: link:../context

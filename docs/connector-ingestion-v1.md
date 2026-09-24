@@ -7,17 +7,19 @@ It does **not** claim exactly-once source delivery. Providers may replay pages, 
 ```text
 provider delta/full stream
         ↓
-SourceChange envelope
+SourceChange envelope (structured metadata only)
         ↓
 durable change receipt
         ↓
+semantic + optional transient artifact mapping
+        ↓
+raw blob CAS install
+        ↓
 durable mapped plan
         ↓
-projection diff
+artifact mutation append
         ↓
-assertions + retractions
-        ↓
-SemanticStateStore.append()
+assertions + retractions append
         ↓
 durable resource projection
         ↓
@@ -113,17 +115,19 @@ new deploy mapper emits semantic id B for the same source change
 
 Without an additional boundary, replay could create a ghost assertion.
 
-Therefore an upsert's normalized `DesiredProjection` is persisted **before** semantic append:
+Therefore the normalized semantic projection plus artifact action is persisted as a `MappedIngestionPlan` **before** artifact/semantic append:
 
 ```text
 source receipt
   -> map once
+  -> optional raw blob CAS install
   -> persist canonical mapped plan
+  -> artifact mutation append
   -> semantic append
   -> resource projection
 ```
 
-On replay, the engine loads the stored mapped plan and does not call the mapper again.
+On replay, the engine loads the stored mapped plan and does not call either the semantic mapper or artifact mapper again. Raw bytes are never stored inside source receipts or mapped-plan JSON. See `docs/artifact-aware-ingestion-v1.md`.
 
 A different plan for the same source change fails closed with `MappedProjectionCollisionError`.
 
@@ -189,14 +193,14 @@ Retraction `effectiveFrom` and `recordedAt` come directly from the normalized so
 
 ## Crash ordering
 
-For one source change:
+For one source change with artifact support:
 
 ```text
 1. load or persist durable provider-draft + resolved source-change receipt
-2. load or persist durable mapped plan
-3. load previous resource projection
-4. derive semantic batch
-5. SemanticStateStore.append(batch)
+2. load previous resource projection
+3. if no mapped plan exists: map semantic state; optionally install raw blob; persist canonical mapped plan
+4. append planned artifact mutation, if any
+5. derive and append semantic batch
 6. persist next resource projection
 ```
 
@@ -205,6 +209,8 @@ For one completed incremental round:
 ```text
 7. persist new provider checkpoint
 ```
+
+These are separate stores. This is a deterministic idempotent saga, not cross-store ACID or 2PC.
 
 ### Crash after semantic append, before projection
 
@@ -266,7 +272,7 @@ The backend-neutral `IngestionStateStore` persists:
 - active/completed full-sync generations;
 - generation seen sets.
 
-`SQLiteIngestionStateStore` is the first backend.
+`SQLiteIngestionStateStore` is the first backend. Schema v3 stores `mapped_plan_json`; v2 semantic-only plans migrate to `{ semantic, artifactAction: { kind: "preserve" } }` without discarding checkpoints, projections, receipts, or full-sync generation state.
 
 v1 requires a dedicated SQLite database. It refuses to silently share the runtime-journal or semantic-state SQLite files, keeping schema ownership explicit.
 
@@ -311,7 +317,16 @@ Tests cover:
 - sourceKey scope isolation;
 - full-sync finalize replay idempotency;
 - checkpoint/projection close/reopen persistence;
-- ingestion-generated semantic changes drive the existing capsule worker.
+- ingestion-generated semantic changes drive the existing capsule worker;
+- raw binary payload rejection at the source-change boundary;
+- artifact blob/plan/mutation/semantic/projection/checkpoint ordering;
+- crash after blob install but before mapped-plan persistence;
+- persisted artifact-plan replay without rerunning either mapper;
+- missing/corrupt planned blob fails closed;
+- artifact append and semantic append failure recovery;
+- configured no-content, structured-only upsert, provider delete, and full-sync artifact lifecycle;
+- artifact-bearing plan SQLite close/reopen/collision;
+- v2 → v3 mapped-plan migration with restart state preserved.
 
 ## Non-goals in v1
 

@@ -5,20 +5,20 @@ import {
   SourceChangeCollisionError,
   canonicalSourceChangeDraftJson,
   canonicalSourceChangeJson,
-  desiredProjectionJson,
   fullSyncGenerationId,
+  mappedIngestionPlanJson,
   ingestionSourceKey,
   newFullSyncGeneration,
   normalizeSourceChange,
   normalizeSourceChangeDraft,
-  parseDesiredProjectionJson,
+  parseMappedIngestionPlanJson,
   parseSourceChangeJson,
   parseResourceProjectionJson,
   resolvedSourceChangeMatchesDraft,
   resourceProjectionJson,
   sourceCheckpoint,
-  type DesiredProjection,
   type FullSyncGeneration,
+  type MappedIngestionPlan,
   type IngestionSourceKey,
   type IngestionStateStore,
   type ResourceProjection,
@@ -28,7 +28,7 @@ import {
 } from "@ssrl/ingestion";
 
 const INGESTION_COMPONENT = "ingestion-state-store";
-const INGESTION_SCHEMA_VERSION = 2;
+const INGESTION_SCHEMA_VERSION = 3;
 
 export interface SQLiteIngestionStateStoreOptions {
   readonly path: string;
@@ -55,7 +55,7 @@ interface ProjectionRow {
 interface ReceiptRow {
   readonly provider_change_json: string;
   readonly resolved_change_json: string;
-  readonly projection_json: string | null;
+  readonly mapped_plan_json: string | null;
 }
 
 interface GenerationRow {
@@ -187,6 +187,11 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     if (version === INGESTION_SCHEMA_VERSION) return;
     if (version === 1) {
       this.#migrateV1ToV2();
+      this.#migrateV2ToV3();
+      return;
+    }
+    if (version === 2) {
+      this.#migrateV2ToV3();
       return;
     }
     throw new CorruptIngestionStateDatabaseError(`Unsupported ingestion state schema version ${version}`);
@@ -236,7 +241,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
           change_id TEXT NOT NULL,
           provider_change_json TEXT NOT NULL CHECK(json_valid(provider_change_json)),
           resolved_change_json TEXT NOT NULL CHECK(json_valid(resolved_change_json)),
-          projection_json TEXT CHECK(projection_json IS NULL OR json_valid(projection_json)),
+          mapped_plan_json TEXT CHECK(mapped_plan_json IS NULL OR json_valid(mapped_plan_json)),
           PRIMARY KEY(source_key, change_id)
         ) STRICT;
 
@@ -293,6 +298,75 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
 
         DROP TABLE ingestion_change_receipts_v1;
       `);
+      this.#db.prepare(`
+        UPDATE ingestion_state_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(2, INGESTION_COMPONENT);
+    });
+  }
+
+  #migrateV2ToV3(): void {
+    this.#transaction(() => {
+      this.#db.exec(`
+        ALTER TABLE ingestion_change_receipts RENAME TO ingestion_change_receipts_v2;
+
+        CREATE TABLE ingestion_change_receipts (
+          source_key TEXT NOT NULL,
+          change_id TEXT NOT NULL,
+          provider_change_json TEXT NOT NULL CHECK(json_valid(provider_change_json)),
+          resolved_change_json TEXT NOT NULL CHECK(json_valid(resolved_change_json)),
+          mapped_plan_json TEXT CHECK(mapped_plan_json IS NULL OR json_valid(mapped_plan_json)),
+          PRIMARY KEY(source_key, change_id)
+        ) STRICT;
+      `);
+      const rows = this.#db.prepare(`
+        SELECT source_key, change_id, provider_change_json, resolved_change_json, projection_json
+        FROM ingestion_change_receipts_v2
+        ORDER BY source_key, change_id
+      `).all() as unknown as {
+        readonly source_key: string;
+        readonly change_id: string;
+        readonly provider_change_json: string;
+        readonly resolved_change_json: string;
+        readonly projection_json: string | null;
+      }[];
+      const insert = this.#db.prepare(`
+        INSERT INTO ingestion_change_receipts(
+          source_key, change_id, provider_change_json, resolved_change_json, mapped_plan_json
+        ) VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const row of rows) {
+        let planJson: string | null = null;
+        if (row.projection_json !== null) {
+          let semantic;
+          try {
+            semantic = JSON.parse(row.projection_json) as unknown;
+          } catch {
+            throw new CorruptIngestionStateDatabaseError(
+              `Mapped projection ${row.source_key}/${row.change_id} is invalid JSON`,
+            );
+          }
+          try {
+            planJson = mappedIngestionPlanJson({
+              semantic: semantic as never,
+              artifactAction: { kind: "preserve" },
+            });
+          } catch (cause) {
+            throw new CorruptIngestionStateDatabaseError(
+              cause instanceof Error ? cause.message : "Mapped projection is invalid",
+            );
+          }
+        }
+        insert.run(
+          row.source_key,
+          row.change_id,
+          row.provider_change_json,
+          row.resolved_change_json,
+          planJson,
+        );
+      }
+      this.#db.exec("DROP TABLE ingestion_change_receipts_v2");
       this.#db.prepare(`
         UPDATE ingestion_state_meta
         SET schema_version = ?
@@ -383,7 +457,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
 
   #receiptRow(sourceKey: IngestionSourceKey, changeId: string): ReceiptRow | undefined {
     return this.#db.prepare(`
-      SELECT provider_change_json, resolved_change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, mapped_plan_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
@@ -445,7 +519,7 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
           change_id,
           provider_change_json,
           resolved_change_json,
-          projection_json
+          mapped_plan_json
         ) VALUES (?, ?, ?, ?, NULL)
       `).run(sourceKey, draft.changeId, providerJson, resolvedJson);
       return normalizedResolved;
@@ -456,58 +530,58 @@ export class SQLiteIngestionStateStore implements IngestionStateStore {
     }
   }
 
-  async mappedProjection(
+  async mappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-  ): Promise<DesiredProjection | undefined> {
+  ): Promise<MappedIngestionPlan | undefined> {
     const row = this.#db.prepare(`
-      SELECT provider_change_json, resolved_change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, mapped_plan_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
-    if (row?.projection_json == null) return undefined;
+    if (row?.mapped_plan_json == null) return undefined;
     try {
-      return parseDesiredProjectionJson(row.projection_json);
+      return parseMappedIngestionPlanJson(row.mapped_plan_json);
     } catch (cause) {
       throw new CorruptIngestionStateDatabaseError(
-        cause instanceof Error ? cause.message : "Mapped projection JSON is invalid",
+        cause instanceof Error ? cause.message : "Mapped ingestion plan JSON is invalid",
       );
     }
   }
 
-  async putMappedProjection(
+  async putMappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-    projection: DesiredProjection,
+    plan: MappedIngestionPlan,
   ): Promise<"inserted" | "existing"> {
-    const json = desiredProjectionJson(projection);
+    const json = mappedIngestionPlanJson(plan);
     const row = this.#db.prepare(`
-      SELECT provider_change_json, resolved_change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, mapped_plan_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
     if (row === undefined) {
-      throw new Error(`Cannot persist mapped projection before source change receipt ${changeId}`);
+      throw new Error(`Cannot persist mapped ingestion plan before source change receipt ${changeId}`);
     }
-    if (row.projection_json !== null) {
-      if (row.projection_json !== json) {
+    if (row.mapped_plan_json !== null) {
+      if (row.mapped_plan_json !== json) {
         throw new MappedProjectionCollisionError(sourceKey, changeId);
       }
       return "existing";
     }
     const updated = this.#db.prepare(`
       UPDATE ingestion_change_receipts
-      SET projection_json = ?
-      WHERE source_key = ? AND change_id = ? AND projection_json IS NULL
+      SET mapped_plan_json = ?
+      WHERE source_key = ? AND change_id = ? AND mapped_plan_json IS NULL
     `).run(json, sourceKey, changeId);
     if (Number(updated.changes) === 1) return "inserted";
 
     const raced = this.#db.prepare(`
-      SELECT provider_change_json, resolved_change_json, projection_json
+      SELECT provider_change_json, resolved_change_json, mapped_plan_json
       FROM ingestion_change_receipts
       WHERE source_key = ? AND change_id = ?
     `).get(sourceKey, changeId) as ReceiptRow | undefined;
-    if (raced?.projection_json === json) return "existing";
+    if (raced?.mapped_plan_json === json) return "existing";
     throw new MappedProjectionCollisionError(sourceKey, changeId);
   }
 

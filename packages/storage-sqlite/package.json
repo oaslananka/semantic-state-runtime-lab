@@ -11,7 +11,8 @@
   },
   "devDependencies": {
     "@types/node": "26.6.2",
-    "@ssrl/context": "workspace:*"
+    "@ssrl/context": "workspace:*",
+    "@ssrl/artifact-store": "workspace:*"
   },
   "exports": {
     ".": {

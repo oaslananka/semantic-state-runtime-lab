@@ -1,4 +1,12 @@
 import {
+  artifactMutationJson,
+  normalizeArtifactMediaType,
+  normalizeArtifactMutation,
+  type ArtifactMutation,
+  type ArtifactResourceIdentity,
+  type ArtifactStore,
+} from "@ssrl/artifact-store";
+import {
   canonicalJson,
   type SemanticRetraction,
   type TemporalObservation,
@@ -91,6 +99,34 @@ export interface ProjectionMapper<TPayload = unknown> {
   project(change: SourceChange<TPayload>): Promise<DesiredProjection> | DesiredProjection;
 }
 
+
+export interface ArtifactProjectionDraft {
+  readonly bytes: Uint8Array;
+  readonly mediaType: string;
+  readonly title?: string;
+  readonly sourceUri?: string;
+}
+
+export interface ArtifactProjectionMapper<TPayload = unknown> {
+  projectArtifact(
+    change: SourceChange<TPayload>,
+  ): Promise<ArtifactProjectionDraft | undefined> | ArtifactProjectionDraft | undefined;
+}
+
+export type ArtifactPlanAction =
+  | { readonly kind: "preserve" }
+  | { readonly kind: "apply"; readonly mutation: ArtifactMutation };
+
+export interface MappedIngestionPlan {
+  /** Absent for provider/resource deletions. */
+  readonly semantic?: DesiredProjection;
+  readonly artifactAction: ArtifactPlanAction;
+}
+
+export interface ResourceArtifactProjection {
+  readonly latestMutationId: string;
+}
+
 export interface ProjectionSlotTarget {
   readonly key: string;
   readonly kind: "observation" | "relation";
@@ -103,6 +139,7 @@ export interface ResourceProjection {
   readonly externalId: string;
   readonly deleted: boolean;
   readonly slots: readonly ProjectionSlotTarget[];
+  readonly artifact?: ResourceArtifactProjection;
 }
 
 export interface FullSyncGeneration {
@@ -130,14 +167,14 @@ export interface IngestionStateStore {
     change: SourceChangeDraft<TPayload>,
     resolved: SourceChange<TPayload>,
   ): Promise<SourceChange<TPayload>>;
-  mappedProjection(
+  mappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-  ): Promise<DesiredProjection | undefined>;
-  putMappedProjection(
+  ): Promise<MappedIngestionPlan | undefined>;
+  putMappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-    projection: DesiredProjection,
+    plan: MappedIngestionPlan,
   ): Promise<"inserted" | "existing">;
   activeFullSyncGeneration(sourceKey: IngestionSourceKey): Promise<FullSyncGeneration | undefined>;
   beginFullSyncGeneration(
@@ -185,7 +222,7 @@ export class MappedProjectionCollisionError extends Error {
     readonly sourceKey: IngestionSourceKey,
     readonly changeId: string,
   ) {
-    super(`Mapped projection for source change ${changeId} on ${sourceKey} changed across replay`);
+    super(`Mapped ingestion plan for source change ${changeId} on ${sourceKey} changed across replay`);
     this.name = "MappedProjectionCollisionError";
   }
 }
@@ -215,11 +252,26 @@ function isoTimestamp(value: string, label: string): string {
   return new Date(millis).toISOString();
 }
 
+function containsBinaryPayload(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null || typeof value !== "object") return false;
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return true;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((item) => containsBinaryPayload(item, seen));
+  return Object.values(value as Record<string, unknown>)
+    .some((item) => containsBinaryPayload(item, seen));
+}
+
 export function normalizeSourceChangeDraft<TPayload>(
   change: SourceChangeDraft<TPayload>,
 ): SourceChangeDraft<TPayload> {
   if (change.kind !== "upsert" && change.kind !== "delete") {
     throw new InvalidSourceChangeError("Source change kind must be upsert or delete");
+  }
+  if (change.payload !== undefined && containsBinaryPayload(change.payload)) {
+    throw new InvalidSourceChangeError(
+      "Source change payload must not contain binary buffers; route raw bytes through ArtifactProjectionMapper",
+    );
   }
   const normalized: SourceChangeDraft<TPayload> = {
     changeId: requiredString(change.changeId, "changeId"),
@@ -386,19 +438,64 @@ export function parseDesiredProjectionJson(value: string): DesiredProjection {
   return normalizeDesiredProjection(record as DesiredProjection);
 }
 
+
+export function normalizeMappedIngestionPlan(plan: MappedIngestionPlan): MappedIngestionPlan {
+  if (plan.artifactAction.kind !== "preserve" && plan.artifactAction.kind !== "apply") {
+    throw new InvalidProjectionError("Mapped ingestion artifact action must be preserve or apply");
+  }
+  const semantic = plan.semantic === undefined
+    ? undefined
+    : normalizeDesiredProjection(plan.semantic);
+  const artifactAction: ArtifactPlanAction = plan.artifactAction.kind === "preserve"
+    ? { kind: "preserve" }
+    : { kind: "apply", mutation: normalizeArtifactMutation(plan.artifactAction.mutation) };
+  return {
+    ...(semantic === undefined ? {} : { semantic }),
+    artifactAction,
+  };
+}
+
+export function mappedIngestionPlanJson(plan: MappedIngestionPlan): string {
+  return canonicalJson(normalizeMappedIngestionPlan(plan));
+}
+
+export function parseMappedIngestionPlanJson(value: string): MappedIngestionPlan {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new InvalidProjectionError("Mapped ingestion plan JSON is invalid");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new InvalidProjectionError("Mapped ingestion plan JSON must be an object");
+  }
+  const plan = parsed as Partial<MappedIngestionPlan>;
+  if (plan.artifactAction === undefined) {
+    throw new InvalidProjectionError("Mapped ingestion plan requires artifactAction");
+  }
+  return normalizeMappedIngestionPlan(plan as MappedIngestionPlan);
+}
+
 function nextProjection(
   sourceKey: IngestionSourceKey,
   change: SourceChange,
-  desired: DesiredProjection | undefined,
+  previous: ResourceProjection | undefined,
+  plan: MappedIngestionPlan,
 ): ResourceProjection {
+  const artifact = plan.artifactAction.kind === "preserve"
+    ? previous?.artifact
+    : plan.artifactAction.mutation.kind === "upsert"
+      ? { latestMutationId: plan.artifactAction.mutation.id }
+      : undefined;
   return {
     sourceKey,
     externalType: change.externalType,
     externalId: change.externalId,
     deleted: change.kind === "delete",
-    slots: desired === undefined
+    slots: plan.semantic === undefined
       ? []
-      : desired.slots.map(projectionSlotTarget).toSorted((a, b) => a.key.localeCompare(b.key)),
+      : plan.semantic.slots.map(projectionSlotTarget).toSorted((a, b) => a.key.localeCompare(b.key)),
+    ...(change.kind === "delete" || artifact === undefined ? {} : { artifact }),
   };
 }
 
@@ -425,7 +522,25 @@ export function normalizeResourceProjection(projection: ResourceProjection): Res
   if (projection.deleted && slots.length > 0) {
     throw new TypeError("Deleted projection cannot keep open slots");
   }
-  return { sourceKey, externalType, externalId, deleted: projection.deleted, slots };
+  const artifact = projection.artifact === undefined
+    ? undefined
+    : {
+        latestMutationId: requiredString(
+          projection.artifact.latestMutationId,
+          "Projection artifact latestMutationId",
+        ),
+      };
+  if (projection.deleted && artifact !== undefined) {
+    throw new TypeError("Deleted projection cannot keep a live artifact target");
+  }
+  return {
+    sourceKey,
+    externalType,
+    externalId,
+    deleted: projection.deleted,
+    slots,
+    ...(artifact === undefined ? {} : { artifact }),
+  };
 }
 
 export function resourceProjectionJson(projection: ResourceProjection): string {
@@ -486,6 +601,74 @@ export async function ensureFullSyncGeneration(
 
 function deterministicTupleId(prefix: string, values: readonly string[]): string {
   return `${prefix}:${canonicalJson(values)}`;
+}
+
+
+export function artifactMutationId(input: {
+  readonly sourceKey: IngestionSourceKey;
+  readonly change: SourceChange;
+  readonly kind: "upsert" | "delete";
+  readonly blobDigest?: string;
+  readonly previousMutationId?: string;
+}): string {
+  return deterministicTupleId("ssrl-artifact-mutation-v1", [
+    input.sourceKey,
+    input.change.externalType,
+    input.change.externalId,
+    input.change.changeId,
+    input.kind,
+    input.blobDigest ?? "",
+    input.previousMutationId ?? "",
+  ]);
+}
+
+function artifactResourceIdentity(
+  sourceKey: IngestionSourceKey,
+  change: SourceChange,
+): ArtifactResourceIdentity {
+  return {
+    sourceKey,
+    externalType: change.externalType,
+    externalId: change.externalId,
+  };
+}
+
+function normalizeArtifactProjectionDraft(draft: ArtifactProjectionDraft): ArtifactProjectionDraft {
+  if (!(draft.bytes instanceof Uint8Array)) {
+    throw new InvalidProjectionError("Artifact projection bytes must be Uint8Array");
+  }
+  const title = draft.title === undefined
+    ? undefined
+    : requiredString(draft.title, "Artifact projection title");
+  const sourceUri = draft.sourceUri === undefined
+    ? undefined
+    : requiredString(draft.sourceUri, "Artifact projection sourceUri");
+  return {
+    bytes: draft.bytes,
+    mediaType: normalizeArtifactMediaType(draft.mediaType),
+    ...(title === undefined ? {} : { title }),
+    ...(sourceUri === undefined ? {} : { sourceUri }),
+  };
+}
+
+function artifactDeleteMutation(input: {
+  readonly sourceKey: IngestionSourceKey;
+  readonly change: SourceChange;
+  readonly previousMutationId: string;
+}): ArtifactMutation {
+  return normalizeArtifactMutation({
+    id: artifactMutationId({
+      sourceKey: input.sourceKey,
+      change: input.change,
+      kind: "delete",
+      previousMutationId: input.previousMutationId,
+    }),
+    resource: artifactResourceIdentity(input.sourceKey, input.change),
+    kind: "delete",
+    effectiveAt: input.change.effectiveAt,
+    recordedAt: input.change.recordedAt,
+    ...(input.change.revision === undefined ? {} : { revision: input.change.revision }),
+  });
 }
 
 export function ingestionRetractionId(input: {
@@ -630,6 +813,7 @@ function sourceReadRequest(
 export interface IngestionEngineOptions {
   readonly semanticState: SemanticStateStore;
   readonly ingestionState: IngestionStateStore;
+  readonly artifactStore?: ArtifactStore;
   readonly now?: () => string;
 }
 
@@ -640,12 +824,14 @@ export interface IngestionSyncResult {
   readonly changesProcessed: number;
   readonly sweptResources: number;
   readonly semanticAppends: SemanticAppendCounts;
+  readonly artifactMutationsAppended: number;
   readonly checkpoint: SourceCheckpoint;
   readonly resetPerformed: boolean;
 }
 
 interface ProcessedSourceChanges {
   readonly semanticAppends: SemanticAppendCounts;
+  readonly artifactMutationsAppended: number;
   readonly changesProcessed: number;
 }
 
@@ -656,19 +842,110 @@ interface FullSyncSweepResult extends ProcessedSourceChanges {
 export class IngestionEngine {
   readonly #semanticState: SemanticStateStore;
   readonly #ingestionState: IngestionStateStore;
+  readonly #artifactStore: ArtifactStore | undefined;
   readonly #now: () => string;
 
   constructor(options: IngestionEngineOptions) {
     this.#semanticState = options.semanticState;
     this.#ingestionState = options.ingestionState;
+    this.#artifactStore = options.artifactStore;
     this.#now = options.now ?? (() => new Date().toISOString());
+  }
+
+  async #artifactAction<TPayload>(input: {
+    readonly sourceKey: IngestionSourceKey;
+    readonly change: SourceChange<TPayload>;
+    readonly previous: ResourceProjection | undefined;
+    readonly artifactMapper?: ArtifactProjectionMapper<TPayload>;
+  }): Promise<ArtifactPlanAction> {
+    const previousMutationId = input.previous?.artifact?.latestMutationId;
+    if (input.change.kind === "delete") {
+      return previousMutationId === undefined
+        ? { kind: "preserve" }
+        : {
+            kind: "apply",
+            mutation: artifactDeleteMutation({
+              sourceKey: input.sourceKey,
+              change: input.change,
+              previousMutationId,
+            }),
+          };
+    }
+    if (input.artifactMapper === undefined) return { kind: "preserve" };
+    if (this.#artifactStore === undefined) {
+      throw new Error("ArtifactProjectionMapper requires an ArtifactStore");
+    }
+    const projected = await input.artifactMapper.projectArtifact(input.change);
+    if (projected === undefined) {
+      return previousMutationId === undefined
+        ? { kind: "preserve" }
+        : {
+            kind: "apply",
+            mutation: artifactDeleteMutation({
+              sourceKey: input.sourceKey,
+              change: input.change,
+              previousMutationId,
+            }),
+          };
+    }
+    const draft = normalizeArtifactProjectionDraft(projected);
+    const blob = await this.#artifactStore.putBlob(draft.bytes, draft.mediaType);
+    return {
+      kind: "apply",
+      mutation: normalizeArtifactMutation({
+        id: artifactMutationId({
+          sourceKey: input.sourceKey,
+          change: input.change,
+          kind: "upsert",
+          blobDigest: blob.digest,
+        }),
+        resource: artifactResourceIdentity(input.sourceKey, input.change),
+        kind: "upsert",
+        effectiveAt: input.change.effectiveAt,
+        recordedAt: input.change.recordedAt,
+        ...(input.change.revision === undefined ? {} : { revision: input.change.revision }),
+        ...(draft.title === undefined ? {} : { title: draft.title }),
+        ...(draft.sourceUri === undefined ? {} : { sourceUri: draft.sourceUri }),
+        blob,
+      }),
+    };
+  }
+
+  async #mappedPlan<TPayload>(input: {
+    readonly sourceKey: IngestionSourceKey;
+    readonly change: SourceChange<TPayload>;
+    readonly previous: ResourceProjection | undefined;
+    readonly mapper: ProjectionMapper<TPayload>;
+    readonly artifactMapper?: ArtifactProjectionMapper<TPayload>;
+  }): Promise<MappedIngestionPlan> {
+    const existing = await this.#ingestionState.mappedPlan(input.sourceKey, input.change.changeId);
+    if (existing !== undefined) return existing;
+    const semantic = input.change.kind === "upsert"
+      ? normalizeDesiredProjection(await input.mapper.project(input.change))
+      : undefined;
+    const artifactAction = await this.#artifactAction(input);
+    const plan = normalizeMappedIngestionPlan({
+      ...(semantic === undefined ? {} : { semantic }),
+      artifactAction,
+    });
+    await this.#ingestionState.putMappedPlan(input.sourceKey, input.change.changeId, plan);
+    return plan;
+  }
+
+  async #applyArtifactAction(action: ArtifactPlanAction): Promise<number> {
+    if (action.kind === "preserve") return 0;
+    if (this.#artifactStore === undefined) {
+      throw new Error("Mapped ingestion plan requires an ArtifactStore");
+    }
+    return this.#artifactStore.append([action.mutation]);
   }
 
   async #processChange<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
     readonly change: SourceChangeDraft<TPayload>;
     readonly mapper: ProjectionMapper<TPayload>;
-  }): Promise<SemanticAppendCounts> {
+    readonly artifactMapper?: ArtifactProjectionMapper<TPayload>;
+  }): Promise<ProcessedSourceChanges> {
     const draft = normalizeSourceChangeDraft(input.change);
     const existing = await this.#ingestionState.changeReceipt(input.sourceKey, draft);
     const change = existing ?? await this.#ingestionState.putChangeReceipt(
@@ -681,42 +958,48 @@ export class IngestionEngine {
       change.externalType,
       change.externalId,
     );
-
-    let desired: DesiredProjection | undefined;
-    if (change.kind === "upsert") {
-      desired = await this.#ingestionState.mappedProjection(input.sourceKey, change.changeId);
-      if (desired === undefined) {
-        desired = normalizeDesiredProjection(await input.mapper.project(change));
-        await this.#ingestionState.putMappedProjection(
-          input.sourceKey,
-          change.changeId,
-          desired,
-        );
-      }
-    }
-    const batch = desired === undefined
+    const plan = await this.#mappedPlan({
+      sourceKey: input.sourceKey,
+      change,
+      previous,
+      mapper: input.mapper,
+      ...(input.artifactMapper === undefined ? {} : { artifactMapper: input.artifactMapper }),
+    });
+    const artifactMutationsAppended = await this.#applyArtifactAction(plan.artifactAction);
+    const batch = plan.semantic === undefined
       ? semanticBatchForDelete({ sourceKey: input.sourceKey, change, previous })
-      : semanticBatchForUpsert({ sourceKey: input.sourceKey, change, previous, desired });
-    const counts = hasSemanticBatch(batch)
+      : semanticBatchForUpsert({
+          sourceKey: input.sourceKey,
+          change,
+          previous,
+          desired: plan.semantic,
+        });
+    const semanticAppends = hasSemanticBatch(batch)
       ? await this.#semanticState.append(batch)
       : zeroAppendCounts();
-    await this.#ingestionState.putProjection(nextProjection(input.sourceKey, change, desired));
-    return counts;
+    await this.#ingestionState.putProjection(nextProjection(input.sourceKey, change, previous, plan));
+    return { semanticAppends, artifactMutationsAppended, changesProcessed: 1 };
   }
 
   async #processSourceChanges<TPayload>(input: {
     readonly sourceKey: IngestionSourceKey;
     readonly changes: readonly SourceChangeDraft<TPayload>[];
     readonly mapper: ProjectionMapper<TPayload>;
+    readonly artifactMapper?: ArtifactProjectionMapper<TPayload>;
     readonly generation: FullSyncGeneration | undefined;
   }): Promise<ProcessedSourceChanges> {
     let semanticAppends = zeroAppendCounts();
+    let artifactMutationsAppended = 0;
     for (const rawChange of input.changes) {
       const change = normalizeSourceChangeDraft(rawChange);
-      semanticAppends = addAppendCounts(
-        semanticAppends,
-        await this.#processChange({ sourceKey: input.sourceKey, change, mapper: input.mapper }),
-      );
+      const processed = await this.#processChange({
+        sourceKey: input.sourceKey,
+        change,
+        mapper: input.mapper,
+        ...(input.artifactMapper === undefined ? {} : { artifactMapper: input.artifactMapper }),
+      });
+      semanticAppends = addAppendCounts(semanticAppends, processed.semanticAppends);
+      artifactMutationsAppended += processed.artifactMutationsAppended;
       if (input.generation !== undefined) {
         await this.#ingestionState.markSeen(
           input.generation.id,
@@ -725,7 +1008,11 @@ export class IngestionEngine {
         );
       }
     }
-    return { semanticAppends, changesProcessed: input.changes.length };
+    return {
+      semanticAppends,
+      artifactMutationsAppended,
+      changesProcessed: input.changes.length,
+    };
   }
 
   async #sweepFullSync<TPayload>(input: {
@@ -737,6 +1024,7 @@ export class IngestionEngine {
       .filter((projection) => !projection.deleted)
       .toSorted(compareResourceIdentity);
     let semanticAppends = zeroAppendCounts();
+    let artifactMutationsAppended = 0;
     for (const projection of unseen) {
       const deletion: SourceChange<TPayload> = {
         changeId: deterministicTupleId("ssrl-full-sync-delete-v1", [
@@ -750,13 +1038,17 @@ export class IngestionEngine {
         effectiveAt: input.generation.observedAt,
         recordedAt: input.generation.observedAt,
       };
-      semanticAppends = addAppendCounts(
-        semanticAppends,
-        await this.#processChange({ sourceKey: input.sourceKey, change: deletion, mapper: input.mapper }),
-      );
+      const processed = await this.#processChange({
+        sourceKey: input.sourceKey,
+        change: deletion,
+        mapper: input.mapper,
+      });
+      semanticAppends = addAppendCounts(semanticAppends, processed.semanticAppends);
+      artifactMutationsAppended += processed.artifactMutationsAppended;
     }
     return {
       semanticAppends,
+      artifactMutationsAppended,
       changesProcessed: unseen.length,
       sweptResources: unseen.length,
     };
@@ -780,7 +1072,12 @@ export class IngestionEngine {
   }): Promise<FullSyncSweepResult> {
     if (input.generation === undefined) {
       await this.#ingestionState.setCheckpoint(input.sourceKey, input.checkpoint);
-      return { semanticAppends: zeroAppendCounts(), changesProcessed: 0, sweptResources: 0 };
+      return {
+        semanticAppends: zeroAppendCounts(),
+        artifactMutationsAppended: 0,
+        changesProcessed: 0,
+        sweptResources: 0,
+      };
     }
     const sweep = await this.#sweepFullSync({
       sourceKey: input.sourceKey,
@@ -795,6 +1092,7 @@ export class IngestionEngine {
     readonly sourceKey: IngestionSourceKey;
     readonly source: IncrementalSource<TPayload>;
     readonly mapper: ProjectionMapper<TPayload>;
+    readonly artifactMapper?: ArtifactProjectionMapper<TPayload>;
   }): Promise<IngestionSyncResult> {
     const durableCheckpoint = await this.#ingestionState.checkpoint(input.sourceKey);
     let generation = await this.#ingestionState.activeFullSyncGeneration(input.sourceKey);
@@ -804,6 +1102,7 @@ export class IngestionEngine {
     let changesProcessed = 0;
     let sweptResources = 0;
     let semanticAppends = zeroAppendCounts();
+    let artifactMutationsAppended = 0;
     let resetPerformed = generation !== undefined;
 
     for (;;) {
@@ -824,9 +1123,11 @@ export class IngestionEngine {
         sourceKey: input.sourceKey,
         changes: result.changes,
         mapper: input.mapper,
+        ...(input.artifactMapper === undefined ? {} : { artifactMapper: input.artifactMapper }),
         generation,
       });
       semanticAppends = addAppendCounts(semanticAppends, processed.semanticAppends);
+      artifactMutationsAppended += processed.artifactMutationsAppended;
       changesProcessed += processed.changesProcessed;
 
       if (result.next.kind === "continue") {
@@ -841,6 +1142,7 @@ export class IngestionEngine {
         checkpoint: result.next.checkpoint,
       });
       semanticAppends = addAppendCounts(semanticAppends, completion.semanticAppends);
+      artifactMutationsAppended += completion.artifactMutationsAppended;
       changesProcessed += completion.changesProcessed;
       sweptResources += completion.sweptResources;
 
@@ -851,6 +1153,7 @@ export class IngestionEngine {
         changesProcessed,
         sweptResources,
         semanticAppends,
+        artifactMutationsAppended,
         checkpoint: result.next.checkpoint,
         resetPerformed,
       };
@@ -861,7 +1164,7 @@ export class IngestionEngine {
 interface ChangeReceipt {
   readonly canonicalProviderChange: string;
   readonly resolvedChange: SourceChange;
-  mappedProjection?: DesiredProjection;
+  mappedPlan?: MappedIngestionPlan;
 }
 
 interface GenerationState extends FullSyncGeneration {
@@ -963,32 +1266,32 @@ export class InMemoryIngestionStateStore implements IngestionStateStore {
     return normalizedResolved;
   }
 
-  async mappedProjection(
+  async mappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-  ): Promise<DesiredProjection | undefined> {
+  ): Promise<MappedIngestionPlan | undefined> {
     const receipt = this.#receipts.get(canonicalJson([sourceKey, changeId]));
-    return receipt?.mappedProjection;
+    return receipt?.mappedPlan;
   }
 
-  async putMappedProjection(
+  async putMappedPlan(
     sourceKey: IngestionSourceKey,
     changeId: string,
-    projection: DesiredProjection,
+    plan: MappedIngestionPlan,
   ): Promise<"inserted" | "existing"> {
     const key = canonicalJson([sourceKey, changeId]);
     const receipt = this.#receipts.get(key);
     if (receipt === undefined) {
-      throw new Error(`Cannot persist mapped projection before source change receipt ${changeId}`);
+      throw new Error(`Cannot persist mapped ingestion plan before source change receipt ${changeId}`);
     }
-    const normalized = normalizeDesiredProjection(projection);
-    if (receipt.mappedProjection !== undefined) {
-      if (desiredProjectionJson(receipt.mappedProjection) !== desiredProjectionJson(normalized)) {
+    const normalized = normalizeMappedIngestionPlan(plan);
+    if (receipt.mappedPlan !== undefined) {
+      if (mappedIngestionPlanJson(receipt.mappedPlan) !== mappedIngestionPlanJson(normalized)) {
         throw new MappedProjectionCollisionError(sourceKey, changeId);
       }
       return "existing";
     }
-    receipt.mappedProjection = normalized;
+    receipt.mappedPlan = normalized;
     return "inserted";
   }
 
