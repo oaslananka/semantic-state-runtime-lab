@@ -1,0 +1,20 @@
+{
+  "name": "@ssrl/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@hpke/core": "1.9.0",
+    "@ssrl/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}
