@@ -24,6 +24,10 @@ import {
   ReplicationRecordUnavailableError,
 } from "@ssrl/replication-access";
 import type { SemanticStateStore } from "@ssrl/state-store";
+import type {
+  ReplicationHttpAuthentication,
+  ReplicationHttpAuthenticator,
+} from "./authentication.js";
 import {
   REPLICATION_BLOB_DIGEST_HEADER,
   REPLICATION_BLOB_INSTALL_MEDIA_TYPE,
@@ -55,10 +59,6 @@ const HARD_MAX_JSON_REQUEST_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_BLOB_INSTALL_REQUEST_BYTES = 65 * 1024 * 1024;
 const HARD_MAX_BLOB_INSTALL_REQUEST_BYTES = 1024 * 1024 * 1024;
 const MAX_BLOB_INSTALL_METADATA_BYTES = 1024 * 1024;
-
-export interface ReplicationHttpAuthenticator {
-  authenticate(request: Request): AccessPrincipal | Response | Promise<AccessPrincipal | Response>;
-}
 
 export interface ReplicationHttpServerOptions {
   readonly gateway: ReplicationAccessGateway;
@@ -184,8 +184,12 @@ function jsonContentType(request: Request): void {
   exactContentType(request, "application/json");
 }
 
-async function boundedBody(request: Request, maxBytes: number): Promise<Uint8Array> {
-  return collectBoundedBytes({
+async function boundedBody(
+  request: Request,
+  maxBytes: number,
+  authentication: ReplicationHttpAuthentication,
+): Promise<Uint8Array> {
+  const bytes = await collectBoundedBytes({
     body: request.body,
     contentLength: request.headers.get("content-length"),
     maxBytes,
@@ -200,12 +204,32 @@ async function boundedBody(request: Request, maxBytes: number): Promise<Uint8Arr
       "Request body exceeds limit",
     ),
   });
+  if (authentication.verifyBody !== undefined) {
+    let verified = false;
+    try {
+      verified = await authentication.verifyBody(bytes);
+    } catch {
+      verified = false;
+    }
+    if (!verified) {
+      throw new ReplicationHttpProtocolError(
+        401,
+        "authentication-failed",
+        "Replication authentication failed",
+      );
+    }
+  }
+  return bytes;
 }
 
-async function jsonBody(request: Request, maxBytes: number): Promise<unknown> {
+async function jsonBody(
+  request: Request,
+  maxBytes: number,
+  authentication: ReplicationHttpAuthentication,
+): Promise<unknown> {
   jsonContentType(request);
   return parseUtf8Json(
-    await boundedBody(request, maxBytes),
+    await boundedBody(request, maxBytes, authentication),
     () => new ReplicationHttpProtocolError(400, "invalid-json", "Request body is not valid UTF-8 JSON"),
     () => new ReplicationHttpProtocolError(400, "invalid-json", "Request body is not valid JSON"),
   );
@@ -226,9 +250,10 @@ function installBlobMetadata(value: unknown): InstallBlobFrameMetadata {
 async function blobInstallFrame(
   request: Request,
   maxRequestBytes: number,
+  authentication: ReplicationHttpAuthentication,
 ): Promise<{ readonly metadata: InstallBlobFrameMetadata; readonly bytes: Uint8Array }> {
   exactContentType(request, REPLICATION_BLOB_INSTALL_MEDIA_TYPE);
-  const frame = await boundedBody(request, maxRequestBytes);
+  const frame = await boundedBody(request, maxRequestBytes, authentication);
   if (frame.byteLength < 4) {
     throw new ReplicationHttpProtocolError(400, "invalid-blob-frame", "Blob install frame is truncated");
   }
@@ -482,13 +507,26 @@ function requirePost(request: Request): void {
 
 const knownRoutes = new Set<string>(Object.values(REPLICATION_HTTP_ROUTES));
 
+function authenticationContext(
+  value: AccessPrincipal | ReplicationHttpAuthentication,
+): ReplicationHttpAuthentication {
+  if ("principal" in value) {
+    return {
+      principal: normalizeAccessPrincipal(value.principal),
+      ...(value.verifyBody === undefined ? {} : { verifyBody: value.verifyBody }),
+    };
+  }
+  return { principal: normalizeAccessPrincipal(value) };
+}
+
 async function handleBlobInstall(
   options: ReplicationHttpServerOptions,
-  principal: AccessPrincipal,
+  authentication: ReplicationHttpAuthentication,
   request: Request,
   maxBlobInstallRequestBytes: number,
 ): Promise<Response> {
-  const frame = await blobInstallFrame(request, maxBlobInstallRequestBytes);
+  const principal = authentication.principal;
+  const frame = await blobInstallFrame(request, maxBlobInstallRequestBytes, authentication);
   const result = await options.gateway.installArtifactBlob(options.artifactStore, {
     principal,
     projectionId: frame.metadata.projectionId,
@@ -591,20 +629,21 @@ export function createReplicationHttpHandler(options: ReplicationHttpServerOptio
         validateOrigin(request, allowedOrigins);
         const authenticated = await options.authenticator.authenticate(request);
         if (authenticated instanceof Response) return authenticated;
-        const principal = normalizeAccessPrincipal(authenticated);
+        const authentication = authenticationContext(authenticated);
+        const principal = authentication.principal;
         requirePost(request);
         const path = new URL(request.url).pathname;
         if (!knownRoutes.has(path)) {
           return errorResponse(404, "route-not-found", "Replication route does not exist");
         }
         if (path === REPLICATION_HTTP_ROUTES.installBlob) {
-          return await handleBlobInstall(options, principal, request, maxBlobInstallRequestBytes);
+          return await handleBlobInstall(options, authentication, request, maxBlobInstallRequestBytes);
         }
         return await handleJsonRoute(
           options,
           principal,
           path,
-          await jsonBody(request, maxJsonRequestBytes),
+          await jsonBody(request, maxJsonRequestBytes, authentication),
         );
       } catch (error) {
         return mappedError(error);

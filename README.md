@@ -42,7 +42,8 @@ Implemented checkpoints include:
 - MCP `context.compile` projection with authenticated `context:read` preflight;
 - policy-scoped prefix-Merkle replication with bounded resumable sessions;
 - principal-scoped immutable record + artifact blob transfer;
-- authenticated bounded replication HTTP with real two-node semantic/artifact convergence.
+- authenticated bounded replication HTTP with real two-node semantic/artifact convergence;
+- optional Ed25519 device-bound HTTP Message Signature authentication with replay defense.
 
 ## Design posture
 
