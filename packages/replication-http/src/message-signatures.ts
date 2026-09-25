@@ -1,7 +1,4 @@
-import {
-  normalizeAccessPrincipal,
-  type AccessPrincipal,
-} from "@ssrl/access";
+import { normalizeAccessPrincipal } from "@ssrl/access";
 import type {
   ReplicationDeviceCredential,
   ReplicationDeviceKeyResolver,

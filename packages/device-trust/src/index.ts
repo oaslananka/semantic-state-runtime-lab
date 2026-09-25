@@ -289,10 +289,11 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 function base64Url(bytes: Uint8Array): string {
-  return bytesToBase64(bytes)
+  let encoded = bytesToBase64(bytes)
     .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/u, "");
+    .replaceAll("/", "_");
+  while (encoded.endsWith("=")) encoded = encoded.slice(0, -1);
+  return encoded;
 }
 
 function base64UrlBytes(value: string): Uint8Array | undefined {
@@ -416,21 +417,25 @@ export async function normalizeTrustedDeviceKey(key: TrustedDeviceKey): Promise<
   };
 }
 
+function normalizeDeviceTrustActor(actor: DeviceTrustActor): DeviceTrustActor {
+  if (actor.mode === "local-bootstrap") return { mode: "local-bootstrap" };
+  if (actor.mode === "trusted-device") {
+    return {
+      mode: "trusted-device",
+      deviceId: requiredString(actor.deviceId, "actor deviceId"),
+      keyId: requiredString(actor.keyId, "actor keyId"),
+    };
+  }
+  throw new TypeError("device trust actor mode is invalid");
+}
+
 export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustEvent {
   const base = {
     eventId: requiredString(event.eventId, "eventId"),
     occurredAt: normalizeTimestamp(event.occurredAt, "event occurredAt"),
     principal: normalizeAccessPrincipal(event.principal),
     deviceId: requiredString(event.deviceId, "event deviceId"),
-    actor: event.actor.mode === "local-bootstrap"
-      ? { mode: "local-bootstrap" as const }
-      : event.actor.mode === "trusted-device"
-        ? {
-          mode: "trusted-device" as const,
-          deviceId: requiredString(event.actor.deviceId, "actor deviceId"),
-          keyId: requiredString(event.actor.keyId, "actor keyId"),
-        }
-        : (() => { throw new TypeError("device trust actor mode is invalid"); })(),
+    actor: normalizeDeviceTrustActor(event.actor),
   };
   switch (event.type) {
     case "bootstrap-device":
@@ -626,11 +631,11 @@ export class DeviceTrustManager {
     readonly key: TrustedDeviceKey;
   }> {
     const key = await this.#repository.key(requiredString(keyId, "authorizingKeyId"));
-    if (key === undefined || key.status !== "active") {
+    if (key?.status !== "active") {
       throw new DeviceTrustAuthorizationError("authorizing device key is not active");
     }
     const device = await this.#repository.device(key.deviceId);
-    if (device === undefined || device.status !== "active") {
+    if (device?.status !== "active") {
       throw new DeviceTrustAuthorizationError("authorizing device is not active");
     }
     return { device, key };
@@ -785,7 +790,7 @@ export class DeviceTrustManager {
     signature: Uint8Array,
   ): Promise<StoredDeviceTrustChallenge> {
     const stored = await this.#repository.challenge(requiredString(challengeId, "challengeId"));
-    if (stored === undefined || stored.challenge.operation !== operation) {
+    if (stored?.challenge.operation !== operation) {
       throw new DeviceTrustChallengeError("device trust challenge is unknown or has the wrong operation");
     }
     if (!(await verifyDeviceTrustChallenge(stored.challenge, signature))) {
@@ -919,7 +924,7 @@ export class DeviceTrustManager {
     }
     const authorization = await this.#activeAuthorization(authorizingKeyId);
     const target = await this.#repository.key(targetKeyId);
-    if (target === undefined || target.status !== "active") {
+    if (target?.status !== "active") {
       throw new DeviceTrustConflictError("target key is not active");
     }
     const targetDevice = await this.#repository.device(target.deviceId);
@@ -957,7 +962,7 @@ export class DeviceTrustManager {
     }
     const authorization = await this.#activeAuthorization(authorizingKeyId);
     const target = await this.#repository.device(targetDeviceId);
-    if (target === undefined || target.status !== "active") {
+    if (target?.status !== "active") {
       throw new DeviceTrustConflictError("target device is not active");
     }
     if (!principalMatches(target.principal, authorization.device.principal)) {

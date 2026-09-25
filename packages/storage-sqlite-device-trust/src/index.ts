@@ -5,7 +5,6 @@ import {
   DeviceTrustConflictError,
   deviceTrustChallengeJson,
   deviceTrustEventJson,
-  normalizeDeviceTrustChallenge,
   normalizeDeviceTrustEvent,
   normalizeTrustedDevice,
   normalizeTrustedDeviceKey,
@@ -455,23 +454,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     );
   }
 
-  async #insertKey(key: TrustedDeviceKey): Promise<void> {
-    this.#db.prepare(`
-      INSERT INTO trusted_device_keys(
-        key_id, device_id, public_jwk_json, activated_at, status,
-        revoked_at, predecessor_key_id, record_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      key.keyId,
-      key.deviceId,
-      JSON.stringify(key.publicKeyJwk),
-      key.activatedAt,
-      key.status,
-      key.revokedAt ?? null,
-      key.predecessorKeyId ?? null,
-      await trustedDeviceKeyJson(key),
-    );
-  }
+
 
   #assertChallengeUsable(challenge: DeviceTrustChallenge, now: string): void {
     const row = this.#db.prepare(`
@@ -503,11 +486,11 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       throw new DeviceTrustAuthorizationError("trust-management event requires trusted-device actor");
     }
     const key = this.#keyRow(event.actor.keyId);
-    if (key === undefined || key.status !== "active" || key.device_id !== event.actor.deviceId) {
+    if (key?.status !== "active" || key.device_id !== event.actor.deviceId) {
       throw new DeviceTrustAuthorizationError("trust-management actor key is not active");
     }
     const device = this.#deviceRow(event.actor.deviceId);
-    if (device === undefined || device.status !== "active") {
+    if (device?.status !== "active") {
       throw new DeviceTrustAuthorizationError("trust-management actor device is not active");
     }
     if (device.principal_json !== JSON.stringify(event.principal)) {
@@ -783,12 +766,10 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       const current = this.#keyRow(predecessor.keyId);
       const device = this.#deviceRow(transition.deviceId);
       if (
-        current === undefined
-        || current.status !== "active"
+        current?.status !== "active"
         || current.device_id !== transition.deviceId
         || current.record_json !== predecessorUpdate.before
-        || device === undefined
-        || device.status !== "active"
+        || device?.status !== "active"
       ) {
         throw new DeviceTrustConflictError("rotation predecessor/device is no longer active");
       }
@@ -844,8 +825,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       const current = this.#keyRow(target.keyId);
       if (
         device === undefined
-        || current === undefined
-        || current.status !== "active"
+        || current?.status !== "active"
         || current.record_json !== targetUpdate.before
         || actor.device.principal_json !== device.principal_json
         || event.deviceId !== target.deviceId
@@ -895,8 +875,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       const actor = this.#activeActor(event);
       const currentDevice = this.#deviceRow(target.deviceId);
       if (
-        currentDevice === undefined
-        || currentDevice.status !== "active"
+        currentDevice?.status !== "active"
         || currentDevice.record_json !== targetJson
         || actor.device.principal_json !== currentDevice.principal_json
         || event.deviceId !== target.deviceId
