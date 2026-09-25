@@ -1,17 +1,23 @@
+import { normalizeAccessPrincipal, type AccessPrincipal } from "@ssrl/access";
 import { DatabaseSync } from "node:sqlite";
 import {
   DeviceTrustAuthorizationError,
   DeviceTrustChallengeError,
   DeviceTrustConflictError,
   deviceTrustChallengeJson,
+  deviceRecoveryChallengeJson,
   deviceTrustEventJson,
   normalizeDeviceTrustEvent,
   normalizeTrustedDevice,
   normalizeTrustedDeviceKey,
+  normalizeTrustedRecoveryCredential,
   trustedDeviceJson,
   trustedDeviceKeyJson,
+  trustedRecoveryCredentialJson,
+  validateDeviceRecoveryChallengeKeyIds,
   validateDeviceTrustChallengeKeyId,
   type BootstrapDeviceTransition,
+  type DeviceRecoveryChallenge,
   type DeviceTrustChallenge,
   type DeviceTrustEvent,
   type DeviceTrustMutationResult,
@@ -19,16 +25,22 @@ import {
   type EnrollDeviceTransition,
   type ReplicationDeviceCredential,
   type ReplicationSignatureReplayInput,
+  type RecoverTrustSetTransition,
+  type RecoveryCredentialMutationResult,
+  type RecoveryTrustSetMutationResult,
   type RevokeDeviceTransition,
   type RevokeKeyTransition,
   type RotateKeyTransition,
+  type SetRecoveryCredentialTransition,
+  type StoredDeviceRecoveryChallenge,
   type StoredDeviceTrustChallenge,
   type TrustedDevice,
   type TrustedDeviceKey,
+  type TrustedRecoveryCredential,
 } from "@ssrl/device-trust";
 
 const COMPONENT = "device-trust";
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export interface SQLiteDeviceTrustStoreOptions {
   readonly path: string;
@@ -83,6 +95,31 @@ interface ChallengeRow {
 interface ResolveRow {
   readonly key_json: string;
   readonly device_json: string;
+}
+
+
+interface RecoveryCredentialRow {
+  readonly key_id: string;
+  readonly principal_json: string;
+  readonly public_jwk_json: string;
+  readonly generation: number | bigint;
+  readonly activated_at: string;
+  readonly status: string;
+  readonly retired_at: string | null;
+  readonly predecessor_key_id: string | null;
+  readonly record_json: string;
+}
+
+interface RecoveryChallengeRow {
+  readonly challenge_id: string;
+  readonly recovery_key_id: string;
+  readonly recovery_generation: number | bigint;
+  readonly device_id: string;
+  readonly key_id: string;
+  readonly next_recovery_key_id: string;
+  readonly expires_at: string;
+  readonly consumed_at: string | null;
+  readonly challenge_json: string;
 }
 
 export class UnsupportedDeviceTrustSchemaError extends Error {
@@ -222,9 +259,80 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       throw new CorruptDeviceTrustDatabaseError(`Invalid device trust schema version ${String(row.schema_version)}`);
     }
     if (version > SCHEMA_VERSION) throw new UnsupportedDeviceTrustSchemaError(version, SCHEMA_VERSION);
-    if (version !== SCHEMA_VERSION) {
-      throw new CorruptDeviceTrustDatabaseError(`Unsupported device trust schema version ${version}`);
+    if (version === SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.#migrateV1ToV2();
+      return;
     }
+    throw new CorruptDeviceTrustDatabaseError(`Unsupported device trust schema version ${version}`);
+  }
+
+  #createRecoveryTables(): void {
+    this.#db.exec(`
+      CREATE TABLE trusted_recovery_credentials (
+        key_id TEXT PRIMARY KEY,
+        principal_json TEXT NOT NULL CHECK(json_valid(principal_json)),
+        public_jwk_json TEXT NOT NULL UNIQUE CHECK(json_valid(public_jwk_json)),
+        generation INTEGER NOT NULL CHECK(generation >= 1),
+        activated_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+        retired_at TEXT,
+        predecessor_key_id TEXT REFERENCES trusted_recovery_credentials(key_id),
+        record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+        UNIQUE(principal_json, generation)
+      ) STRICT;
+
+      CREATE UNIQUE INDEX trusted_recovery_credentials_active_principal
+        ON trusted_recovery_credentials(principal_json)
+        WHERE status = 'active';
+
+      CREATE TABLE device_recovery_challenges (
+        challenge_id TEXT PRIMARY KEY,
+        recovery_key_id TEXT NOT NULL REFERENCES trusted_recovery_credentials(key_id),
+        recovery_generation INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        next_recovery_key_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        challenge_json TEXT NOT NULL CHECK(json_valid(challenge_json))
+      ) STRICT;
+
+      CREATE INDEX device_recovery_challenges_expiry
+        ON device_recovery_challenges(expires_at, consumed_at, challenge_id);
+    `);
+  }
+
+  #migrateV1ToV2(): void {
+    this.#transaction(() => {
+      this.#createRecoveryTables();
+      this.#db.exec(`
+        ALTER TABLE device_trust_events RENAME TO device_trust_events_v1;
+        CREATE TABLE device_trust_events (
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL CHECK(event_type IN (
+            'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device',
+            'set-recovery-credential', 'recover-trust-set'
+          )),
+          device_id TEXT NOT NULL,
+          key_id TEXT,
+          occurred_at TEXT NOT NULL,
+          event_json TEXT NOT NULL CHECK(json_valid(event_json))
+        ) STRICT;
+        INSERT INTO device_trust_events(event_id, event_type, device_id, key_id, occurred_at, event_json)
+        SELECT event_id, event_type, device_id, key_id, occurred_at, event_json
+        FROM device_trust_events_v1;
+        DROP TABLE device_trust_events_v1;
+        CREATE INDEX device_trust_events_device_time
+          ON device_trust_events(device_id, occurred_at, event_id);
+      `);
+      this.#db.prepare(`
+        UPDATE device_trust_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(SCHEMA_VERSION, COMPONENT);
+    });
   }
 
   #createSchema(): void {
@@ -265,7 +373,8 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         CREATE TABLE device_trust_events (
           event_id TEXT PRIMARY KEY,
           event_type TEXT NOT NULL CHECK(event_type IN (
-            'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device'
+            'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device',
+            'set-recovery-credential', 'recover-trust-set'
           )),
           device_id TEXT NOT NULL,
           key_id TEXT,
@@ -300,6 +409,39 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
 
         CREATE INDEX replication_signature_replays_expiry
           ON replication_signature_replays(expires_at, key_id, nonce);
+
+        CREATE TABLE trusted_recovery_credentials (
+          key_id TEXT PRIMARY KEY,
+          principal_json TEXT NOT NULL CHECK(json_valid(principal_json)),
+          public_jwk_json TEXT NOT NULL UNIQUE CHECK(json_valid(public_jwk_json)),
+          generation INTEGER NOT NULL CHECK(generation >= 1),
+          activated_at TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('active', 'retired')),
+          retired_at TEXT,
+          predecessor_key_id TEXT REFERENCES trusted_recovery_credentials(key_id),
+          record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+          UNIQUE(principal_json, generation)
+        ) STRICT;
+
+        CREATE UNIQUE INDEX trusted_recovery_credentials_active_principal
+          ON trusted_recovery_credentials(principal_json)
+          WHERE status = 'active';
+
+        CREATE TABLE device_recovery_challenges (
+          challenge_id TEXT PRIMARY KEY,
+          recovery_key_id TEXT NOT NULL REFERENCES trusted_recovery_credentials(key_id),
+          recovery_generation INTEGER NOT NULL,
+          device_id TEXT NOT NULL,
+          key_id TEXT NOT NULL,
+          next_recovery_key_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          challenge_json TEXT NOT NULL CHECK(json_valid(challenge_json))
+        ) STRICT;
+
+        CREATE INDEX device_recovery_challenges_expiry
+          ON device_recovery_challenges(expires_at, consumed_at, challenge_id);
       `);
       this.#db.prepare(`
         INSERT INTO device_trust_meta(component, schema_version)
@@ -323,6 +465,15 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       FROM trusted_device_keys
       WHERE key_id = ?
     `).get(keyId) as KeyRow | undefined;
+  }
+
+  #recoveryCredentialRow(keyId: string): RecoveryCredentialRow | undefined {
+    return this.#db.prepare(`
+      SELECT key_id, principal_json, public_jwk_json, generation, activated_at,
+             status, retired_at, predecessor_key_id, record_json
+      FROM trusted_recovery_credentials
+      WHERE key_id = ?
+    `).get(keyId) as RecoveryCredentialRow | undefined;
   }
 
   #eventRow(eventId: string): EventRow | undefined {
@@ -370,6 +521,36 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     return key;
   }
 
+  async #validatedRecoveryCredentialRow(
+    row: RecoveryCredentialRow,
+  ): Promise<TrustedRecoveryCredential> {
+    const credential = await corruptAsync(
+      `Recovery credential ${row.key_id}`,
+      () => normalizeTrustedRecoveryCredential(
+        parsedObject(
+          row.record_json,
+          `recovery credential ${row.key_id}`,
+        ) as unknown as TrustedRecoveryCredential,
+      ),
+    );
+    if (
+      credential.keyId !== row.key_id
+      || JSON.stringify(credential.principal) !== row.principal_json
+      || JSON.stringify(credential.publicKeyJwk) !== row.public_jwk_json
+      || credential.generation !== Number(row.generation)
+      || credential.activatedAt !== row.activated_at
+      || credential.status !== row.status
+      || (credential.retiredAt ?? null) !== row.retired_at
+      || (credential.predecessorKeyId ?? null) !== row.predecessor_key_id
+      || await trustedRecoveryCredentialJson(credential) !== row.record_json
+    ) {
+      throw new CorruptDeviceTrustDatabaseError(
+        `Recovery credential row ${row.key_id} disagrees with record_json`,
+      );
+    }
+    return credential;
+  }
+
   #validatedEventRow(row: EventRow): DeviceTrustEvent {
     const event = corruptSync(`Device trust event ${row.event_id}`, () => normalizeDeviceTrustEvent(
       parsedObject(row.event_json, `event ${row.event_id}`) as unknown as DeviceTrustEvent,
@@ -415,6 +596,40 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     };
   }
 
+  async #validatedRecoveryChallengeRow(
+    row: RecoveryChallengeRow,
+  ): Promise<StoredDeviceRecoveryChallenge> {
+    const challenge = await corruptAsync(
+      `Device recovery challenge ${row.challenge_id}`,
+      () => validateDeviceRecoveryChallengeKeyIds(
+        parsedObject(
+          row.challenge_json,
+          `recovery challenge ${row.challenge_id}`,
+        ) as unknown as DeviceRecoveryChallenge,
+      ),
+    );
+    if (
+      challenge.challengeId !== row.challenge_id
+      || challenge.recoveryKeyId !== row.recovery_key_id
+      || challenge.recoveryGeneration !== Number(row.recovery_generation)
+      || challenge.deviceId !== row.device_id
+      || challenge.keyId !== row.key_id
+      || challenge.nextRecoveryKeyId !== row.next_recovery_key_id
+      || challenge.expiresAt !== row.expires_at
+      || await deviceRecoveryChallengeJson(challenge) !== row.challenge_json
+    ) {
+      throw new CorruptDeviceTrustDatabaseError(
+        `Recovery challenge row ${row.challenge_id} disagrees with challenge_json`,
+      );
+    }
+    return {
+      challenge,
+      ...(row.consumed_at === null
+        ? {}
+        : { consumedAt: canonicalTimestamp(row.consumed_at, "recovery consumedAt") }),
+    };
+  }
+
   #eventReplay(event: DeviceTrustEvent): boolean {
     const row = this.#eventRow(event.eventId);
     if (row === undefined) return false;
@@ -456,6 +671,55 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
 
 
 
+  #insertRecoveryCredential(credential: TrustedRecoveryCredential, recordJson: string): void {
+    this.#db.prepare(`
+      INSERT INTO trusted_recovery_credentials(
+        key_id, principal_json, public_jwk_json, generation, activated_at,
+        status, retired_at, predecessor_key_id, record_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      credential.keyId,
+      JSON.stringify(credential.principal),
+      JSON.stringify(credential.publicKeyJwk),
+      credential.generation,
+      credential.activatedAt,
+      credential.status,
+      credential.retiredAt ?? null,
+      credential.predecessorKeyId ?? null,
+      recordJson,
+    );
+  }
+
+  async #retiredRecoveryUpdate(
+    credential: TrustedRecoveryCredential,
+    now: string,
+  ): Promise<{ readonly before: string; readonly after: string }> {
+    return {
+      before: await trustedRecoveryCredentialJson(credential),
+      after: await trustedRecoveryCredentialJson(await normalizeTrustedRecoveryCredential({
+        ...credential,
+        status: "retired",
+        retiredAt: now,
+      })),
+    };
+  }
+
+  #updateActiveRecoveryCredential(
+    keyId: string,
+    before: string,
+    after: string,
+    now: string,
+  ): void {
+    const updated = this.#db.prepare(`
+      UPDATE trusted_recovery_credentials
+      SET status = 'retired', retired_at = ?, record_json = ?
+      WHERE key_id = ? AND status = 'active' AND record_json = ?
+    `).run(now, after, keyId, before);
+    if (changes(updated.changes) !== 1) {
+      throw new DeviceTrustConflictError("recovery credential changed during retirement");
+    }
+  }
+
   #assertChallengeUsable(challenge: DeviceTrustChallenge, now: string): void {
     const row = this.#db.prepare(`
       SELECT challenge_id, operation, key_id, authorized_by_device_id,
@@ -478,6 +742,39 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     `).run(now, challengeId);
     if (changes(result.changes) !== 1) {
       throw new DeviceTrustChallengeError("device trust challenge could not be consumed exactly once");
+    }
+  }
+
+  #assertRecoveryChallengeUsable(
+    challenge: DeviceRecoveryChallenge,
+    challengeJson: string,
+    now: string,
+  ): void {
+    const row = this.#db.prepare(`
+      SELECT challenge_id, recovery_key_id, recovery_generation, device_id, key_id,
+             next_recovery_key_id, expires_at, consumed_at, challenge_json
+      FROM device_recovery_challenges
+      WHERE challenge_id = ?
+    `).get(challenge.challengeId) as RecoveryChallengeRow | undefined;
+    if (row?.challenge_json !== challengeJson) {
+      throw new DeviceTrustChallengeError("device recovery challenge does not match durable registry state");
+    }
+    if (row.consumed_at !== null) {
+      throw new DeviceTrustChallengeError("device recovery challenge has already been consumed");
+    }
+    if (Date.parse(row.expires_at) < Date.parse(now)) {
+      throw new DeviceTrustChallengeError("device recovery challenge has expired");
+    }
+  }
+
+  #consumeRecoveryChallenge(challengeId: string, now: string): void {
+    const result = this.#db.prepare(`
+      UPDATE device_recovery_challenges
+      SET consumed_at = ?
+      WHERE challenge_id = ? AND consumed_at IS NULL
+    `).run(now, challengeId);
+    if (changes(result.changes) !== 1) {
+      throw new DeviceTrustChallengeError("device recovery challenge could not be consumed exactly once");
     }
   }
 
@@ -572,6 +869,35 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     return row === undefined ? undefined : this.#validatedChallengeRow(row);
   }
 
+  async recoveryCredential(keyId: string): Promise<TrustedRecoveryCredential | undefined> {
+    const row = this.#recoveryCredentialRow(keyId);
+    return row === undefined ? undefined : this.#validatedRecoveryCredentialRow(row);
+  }
+
+  async activeRecoveryCredential(
+    principal: AccessPrincipal,
+  ): Promise<TrustedRecoveryCredential | undefined> {
+    const row = this.#db.prepare(`
+      SELECT key_id, principal_json, public_jwk_json, generation, activated_at,
+             status, retired_at, predecessor_key_id, record_json
+      FROM trusted_recovery_credentials
+      WHERE principal_json = ? AND status = 'active'
+    `).get(JSON.stringify(normalizeAccessPrincipal(principal))) as RecoveryCredentialRow | undefined;
+    return row === undefined ? undefined : this.#validatedRecoveryCredentialRow(row);
+  }
+
+  async recoveryChallenge(
+    challengeId: string,
+  ): Promise<StoredDeviceRecoveryChallenge | undefined> {
+    const row = this.#db.prepare(`
+      SELECT challenge_id, recovery_key_id, recovery_generation, device_id, key_id,
+             next_recovery_key_id, expires_at, consumed_at, challenge_json
+      FROM device_recovery_challenges
+      WHERE challenge_id = ?
+    `).get(challengeId) as RecoveryChallengeRow | undefined;
+    return row === undefined ? undefined : this.#validatedRecoveryChallengeRow(row);
+  }
+
   async resolve(keyId: string): Promise<ReplicationDeviceCredential | undefined> {
     const row = this.#db.prepare(`
       SELECT k.record_json AS key_json, d.record_json AS device_json
@@ -636,6 +962,64 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         challenge.keyId,
         challenge.authorizedByDeviceId,
         challenge.authorizedByKeyId,
+        challenge.createdAt,
+        challenge.expiresAt,
+        json,
+      );
+    });
+  }
+
+  async issueRecoveryChallenge(challengeInput: DeviceRecoveryChallenge): Promise<void> {
+    const challenge = await validateDeviceRecoveryChallengeKeyIds(challengeInput);
+    const json = await deviceRecoveryChallengeJson(challenge);
+    this.#transaction(() => {
+      const current = this.#recoveryCredentialRow(challenge.recoveryKeyId);
+      if (
+        current?.status !== "active"
+        || Number(current?.generation) !== challenge.recoveryGeneration
+        || current?.principal_json !== JSON.stringify(challenge.principal)
+        || current?.public_jwk_json !== JSON.stringify(challenge.recoveryPublicKeyJwk)
+      ) {
+        throw new DeviceTrustAuthorizationError("recovery challenge authorizer is not active");
+      }
+      if (this.#deviceRow(challenge.deviceId) !== undefined) {
+        throw new DeviceTrustConflictError("recovery replacement deviceId must be fresh");
+      }
+      if (
+        this.#keyRow(challenge.keyId) !== undefined
+        || this.#recoveryCredentialRow(challenge.keyId) !== undefined
+      ) {
+        throw new DeviceTrustConflictError("recovery replacement device key must be fresh");
+      }
+      if (
+        this.#keyRow(challenge.nextRecoveryKeyId) !== undefined
+        || this.#recoveryCredentialRow(challenge.nextRecoveryKeyId) !== undefined
+      ) {
+        throw new DeviceTrustConflictError("next recovery key must be fresh");
+      }
+      const existing = this.#db.prepare(`
+        SELECT challenge_json FROM device_recovery_challenges WHERE challenge_id = ?
+      `).get(challenge.challengeId) as { readonly challenge_json: string } | undefined;
+      if (existing !== undefined) {
+        if (existing.challenge_json !== json) {
+          throw new DeviceTrustConflictError(
+            `recovery challenge ${challenge.challengeId} collides with different content`,
+          );
+        }
+        return;
+      }
+      this.#db.prepare(`
+        INSERT INTO device_recovery_challenges(
+          challenge_id, recovery_key_id, recovery_generation, device_id, key_id,
+          next_recovery_key_id, created_at, expires_at, consumed_at, challenge_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+      `).run(
+        challenge.challengeId,
+        challenge.recoveryKeyId,
+        challenge.recoveryGeneration,
+        challenge.deviceId,
+        challenge.keyId,
+        challenge.nextRecoveryKeyId,
         challenge.createdAt,
         challenge.expiresAt,
         json,
@@ -907,6 +1291,319 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     return { outcome, event, device };
   }
 
+  async setRecoveryCredential(
+    transition: SetRecoveryCredentialTransition,
+  ): Promise<RecoveryCredentialMutationResult> {
+    const event = normalizeDeviceTrustEvent(transition.event) as SetRecoveryCredentialTransition["event"];
+    const credential = await normalizeTrustedRecoveryCredential(transition.credential);
+    const now = canonicalTimestamp(transition.now, "recovery credential now");
+    const credentialJson = await trustedRecoveryCredentialJson(credential);
+    const previous = transition.previousRecoveryKeyId === undefined
+      ? undefined
+      : await this.recoveryCredential(transition.previousRecoveryKeyId);
+    if (transition.previousRecoveryKeyId !== undefined && previous === undefined) {
+      throw new DeviceTrustConflictError("previous recovery credential does not exist");
+    }
+    const previousUpdate = previous === undefined
+      ? undefined
+      : await this.#retiredRecoveryUpdate(previous, now);
+    if (
+      event.type !== "set-recovery-credential"
+      || event.actor.mode !== "trusted-device"
+      || event.recoveryKeyId !== credential.keyId
+      || event.recoveryGeneration !== credential.generation
+      || event.deviceId !== event.actor.deviceId
+      || credential.status !== "active"
+      || JSON.stringify(event.principal) !== JSON.stringify(credential.principal)
+      || (previous === undefined
+        ? credential.generation !== 1 || credential.predecessorKeyId !== undefined
+        : credential.generation !== previous.generation + 1
+          || credential.predecessorKeyId !== previous.keyId)
+    ) {
+      throw new DeviceTrustConflictError("recovery credential transition records do not agree");
+    }
+
+    const outcome = this.#transaction((): "inserted" | "replayed" => {
+      if (this.#eventReplay(event)) return "replayed";
+      const actor = this.#activeActor(event);
+      if (actor.device.principal_json !== JSON.stringify(credential.principal)) {
+        throw new DeviceTrustAuthorizationError("recovery credential principal does not match actor");
+      }
+      if (this.#keyRow(credential.keyId) !== undefined) {
+        throw new DeviceTrustConflictError("recovery key material cannot reuse a device key");
+      }
+      if (this.#recoveryCredentialRow(credential.keyId) !== undefined) {
+        throw new DeviceTrustConflictError("recovery credential key has already been used");
+      }
+      const active = this.#db.prepare(`
+        SELECT key_id, principal_json, public_jwk_json, generation, activated_at,
+               status, retired_at, predecessor_key_id, record_json
+        FROM trusted_recovery_credentials
+        WHERE principal_json = ? AND status = 'active'
+      `).get(JSON.stringify(credential.principal)) as RecoveryCredentialRow | undefined;
+      if (previous === undefined) {
+        if (active !== undefined) {
+          throw new DeviceTrustConflictError("principal already has an active recovery credential");
+        }
+      } else {
+        if (
+          active?.key_id !== previous.keyId
+          || active.record_json !== previousUpdate?.before
+          || active.status !== "active"
+        ) {
+          throw new DeviceTrustConflictError("previous recovery credential is no longer active");
+        }
+        this.#updateActiveRecoveryCredential(
+          previous.keyId,
+          previousUpdate.before,
+          previousUpdate.after,
+          now,
+        );
+      }
+      this.#insertRecoveryCredential(credential, credentialJson);
+      this.#insertEvent(event);
+      return "inserted";
+    });
+    const materialized = await this.recoveryCredential(credential.keyId);
+    if (materialized === undefined) {
+      throw new CorruptDeviceTrustDatabaseError("materialized recovery credential is missing");
+    }
+    return { outcome, event, credential: materialized };
+  }
+
+  async recoverTrustSet(
+    transition: RecoverTrustSetTransition,
+  ): Promise<RecoveryTrustSetMutationResult> {
+    const event = normalizeDeviceTrustEvent(transition.event) as RecoverTrustSetTransition["event"];
+    const challenge = await validateDeviceRecoveryChallengeKeyIds(transition.challenge);
+    const challengeJson = await deviceRecoveryChallengeJson(challenge);
+    const device = normalizeTrustedDevice(transition.device);
+    const key = await normalizeTrustedDeviceKey(transition.key);
+    const recoveryCredential = await normalizeTrustedRecoveryCredential(
+      transition.recoveryCredential,
+    );
+    const now = canonicalTimestamp(transition.now, "trust recovery now");
+    const keyJson = await trustedDeviceKeyJson(key);
+    const recoveryJson = await trustedRecoveryCredentialJson(recoveryCredential);
+
+    if (
+      event.type !== "recover-trust-set"
+      || event.actor.mode !== "recovery-credential"
+      || event.challengeId !== challenge.challengeId
+      || event.deviceId !== device.deviceId
+      || event.keyId !== key.keyId
+      || key.deviceId !== device.deviceId
+      || challenge.deviceId !== device.deviceId
+      || challenge.keyId !== key.keyId
+      || event.recoveryKeyId !== transition.previousRecoveryKeyId
+      || event.recoveryKeyId !== challenge.recoveryKeyId
+      || event.recoveryGeneration !== challenge.recoveryGeneration
+      || event.nextRecoveryKeyId !== recoveryCredential.keyId
+      || event.nextRecoveryKeyId !== challenge.nextRecoveryKeyId
+      || event.nextRecoveryGeneration !== recoveryCredential.generation
+      || event.nextRecoveryGeneration !== challenge.nextRecoveryGeneration
+      || recoveryCredential.predecessorKeyId !== transition.previousRecoveryKeyId
+      || recoveryCredential.status !== "active"
+      || JSON.stringify(event.principal) !== JSON.stringify(device.principal)
+      || JSON.stringify(challenge.principal) !== JSON.stringify(device.principal)
+      || JSON.stringify(recoveryCredential.principal) !== JSON.stringify(device.principal)
+    ) {
+      throw new DeviceTrustConflictError("trust recovery transition records do not agree");
+    }
+
+    if (this.#eventReplay(event)) {
+      const [replayedDevice, replayedKey, replayedRecovery] = await Promise.all([
+        this.device(device.deviceId),
+        this.key(key.keyId),
+        this.recoveryCredential(recoveryCredential.keyId),
+      ]);
+      if (
+        replayedDevice === undefined
+        || replayedKey === undefined
+        || replayedRecovery === undefined
+      ) {
+        throw new CorruptDeviceTrustDatabaseError(
+          "replayed trust recovery event has missing materialized state",
+        );
+      }
+      return {
+        outcome: "replayed",
+        event,
+        device: replayedDevice,
+        key: replayedKey,
+        recoveryCredential: replayedRecovery,
+      };
+    }
+
+    const previous = await this.recoveryCredential(transition.previousRecoveryKeyId);
+    if (previous === undefined) {
+      throw new DeviceTrustConflictError("recovery authorizing credential does not exist");
+    }
+    if (
+      previous.status !== "active"
+      || previous.generation !== challenge.recoveryGeneration
+      || previous.keyId !== challenge.recoveryKeyId
+      || JSON.stringify(previous.principal) !== JSON.stringify(challenge.principal)
+      || JSON.stringify(previous.publicKeyJwk) !== JSON.stringify(challenge.recoveryPublicKeyJwk)
+      || event.actor.keyId !== previous.keyId
+      || event.actor.generation !== previous.generation
+    ) {
+      throw new DeviceTrustAuthorizationError("recovery authorizer no longer matches challenge state");
+    }
+    const previousUpdate = await this.#retiredRecoveryUpdate(previous, now);
+    const principalJson = JSON.stringify(device.principal);
+
+    const deviceRows = this.#db.prepare(`
+      SELECT device_id, principal_json, display_name, enrolled_at, status, revoked_at, record_json
+      FROM trusted_devices
+      WHERE principal_json = ? AND status = 'active'
+      ORDER BY device_id
+    `).all(principalJson) as unknown as DeviceRow[];
+    const activeDevices = await Promise.all(
+      deviceRows.map((row) => this.#validatedDeviceRow(row)),
+    );
+    const deviceUpdates = activeDevices.map((current) => ({
+      current,
+      before: trustedDeviceJson(current),
+      after: trustedDeviceJson(normalizeTrustedDevice({
+        ...current,
+        status: "revoked",
+        revokedAt: now,
+      })),
+    }));
+
+    const keyRows = this.#db.prepare(`
+      SELECT k.key_id, k.device_id, k.public_jwk_json, k.activated_at, k.status,
+             k.revoked_at, k.predecessor_key_id, k.record_json
+      FROM trusted_device_keys k
+      JOIN trusted_devices d ON d.device_id = k.device_id
+      WHERE d.principal_json = ? AND k.status = 'active'
+      ORDER BY k.key_id
+    `).all(principalJson) as unknown as KeyRow[];
+    const activeKeys = await Promise.all(keyRows.map((row) => this.#validatedKeyRow(row)));
+    const keyUpdates = await Promise.all(activeKeys.map(async (current) => ({
+      current,
+      ...await this.#revokedKeyUpdate(current, now),
+    })));
+    const expectedDeviceIds = deviceUpdates.map((update) => update.current.deviceId);
+    const expectedKeyIds = keyUpdates.map((update) => update.current.keyId);
+
+    const outcome = this.#transaction((): "inserted" | "replayed" => {
+      if (this.#eventReplay(event)) return "replayed";
+      this.#assertRecoveryChallengeUsable(challenge, challengeJson, now);
+
+      const currentRecovery = this.#recoveryCredentialRow(previous.keyId);
+      if (
+        currentRecovery?.status !== "active"
+        || currentRecovery.record_json !== previousUpdate.before
+      ) {
+        throw new DeviceTrustAuthorizationError("recovery credential is no longer active");
+      }
+      if (
+        this.#deviceRow(device.deviceId) !== undefined
+        || this.#keyRow(key.keyId) !== undefined
+        || this.#recoveryCredentialRow(key.keyId) !== undefined
+        || this.#keyRow(recoveryCredential.keyId) !== undefined
+        || this.#recoveryCredentialRow(recoveryCredential.keyId) !== undefined
+      ) {
+        throw new DeviceTrustConflictError("recovery replacement identities are no longer fresh");
+      }
+
+      const currentDeviceIds = (this.#db.prepare(`
+        SELECT device_id FROM trusted_devices
+        WHERE principal_json = ? AND status = 'active'
+        ORDER BY device_id
+      `).all(principalJson) as unknown as { readonly device_id: string }[])
+        .map((row) => row.device_id);
+      const currentKeyIds = (this.#db.prepare(`
+        SELECT k.key_id
+        FROM trusted_device_keys k
+        JOIN trusted_devices d ON d.device_id = k.device_id
+        WHERE d.principal_json = ? AND k.status = 'active'
+        ORDER BY k.key_id
+      `).all(principalJson) as unknown as { readonly key_id: string }[])
+        .map((row) => row.key_id);
+      if (
+        JSON.stringify(currentDeviceIds) !== JSON.stringify(expectedDeviceIds)
+        || JSON.stringify(currentKeyIds) !== JSON.stringify(expectedKeyIds)
+      ) {
+        throw new DeviceTrustConflictError("principal trust set changed during recovery");
+      }
+
+      for (const update of keyUpdates) {
+        const current = this.#keyRow(update.current.keyId);
+        if (current?.record_json !== update.before || current.status !== "active") {
+          throw new DeviceTrustConflictError(
+            `device key ${update.current.keyId} changed during recovery`,
+          );
+        }
+        this.#updateActiveKey(
+          update.current.keyId,
+          update.before,
+          update.after,
+          now,
+          `recovery device key ${update.current.keyId}`,
+        );
+      }
+      for (const update of deviceUpdates) {
+        const updated = this.#db.prepare(`
+          UPDATE trusted_devices
+          SET status = 'revoked', revoked_at = ?, record_json = ?
+          WHERE device_id = ? AND status = 'active' AND record_json = ?
+        `).run(now, update.after, update.current.deviceId, update.before);
+        if (changes(updated.changes) !== 1) {
+          throw new DeviceTrustConflictError(
+            `device ${update.current.deviceId} changed during recovery`,
+          );
+        }
+      }
+
+      this.#updateActiveRecoveryCredential(
+        previous.keyId,
+        previousUpdate.before,
+        previousUpdate.after,
+        now,
+      );
+      this.#insertDevice(device);
+      this.#db.prepare(`
+        INSERT INTO trusted_device_keys(
+          key_id, device_id, public_jwk_json, activated_at, status,
+          revoked_at, predecessor_key_id, record_json
+        ) VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?)
+      `).run(
+        key.keyId,
+        key.deviceId,
+        JSON.stringify(key.publicKeyJwk),
+        key.activatedAt,
+        keyJson,
+      );
+      this.#insertRecoveryCredential(recoveryCredential, recoveryJson);
+      this.#insertEvent(event);
+      this.#consumeRecoveryChallenge(challenge.challengeId, now);
+      return "inserted";
+    });
+
+    const [materializedDevice, materializedKey, materializedRecovery] = await Promise.all([
+      this.device(device.deviceId),
+      this.key(key.keyId),
+      this.recoveryCredential(recoveryCredential.keyId),
+    ]);
+    if (
+      materializedDevice === undefined
+      || materializedKey === undefined
+      || materializedRecovery === undefined
+    ) {
+      throw new CorruptDeviceTrustDatabaseError("materialized trust recovery state is missing");
+    }
+    return {
+      outcome,
+      event,
+      device: materializedDevice,
+      key: materializedKey,
+      recoveryCredential: materializedRecovery,
+    };
+  }
+
   consume(input: ReplicationSignatureReplayInput): boolean {
     if (!Number.isSafeInteger(input.expiresAt) || !Number.isSafeInteger(input.now)) {
       throw new TypeError("replication replay times must be integer epoch seconds");
@@ -943,11 +1640,17 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         DELETE FROM device_trust_challenges
         WHERE expires_at < ?
       `).run(timestamp);
+      const recoveryChallenges = this.#db.prepare(`
+        DELETE FROM device_recovery_challenges
+        WHERE expires_at < ? AND consumed_at IS NULL
+      `).run(timestamp);
       const replays = this.#db.prepare(`
         DELETE FROM replication_signature_replays
         WHERE expires_at < ?
       `).run(epochSeconds);
-      return changes(challenges.changes) + changes(replays.changes);
+      return changes(challenges.changes)
+        + changes(recoveryChallenges.changes)
+        + changes(replays.changes);
     });
   }
 

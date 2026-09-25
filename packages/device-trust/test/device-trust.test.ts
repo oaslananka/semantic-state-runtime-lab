@@ -7,10 +7,16 @@ import {
   deviceEnrollmentOfferJson,
   ed25519JwkThumbprintUri,
   normalizeEd25519PublicJwk,
+  signDeviceRecoveryChallenge,
   signDeviceTrustChallenge,
   signEnrollmentChallengeForOffer,
+  signRecoveryProvisioningProof,
+  verifyDeviceRecoveryChallengeSignature,
   verifyDeviceTrustChallenge,
+  verifyRecoveryProvisioningProof,
+  type DeviceRecoveryChallenge,
   type DeviceTrustChallenge,
+  type RecoveryProvisioningProof,
 } from "../src/index.js";
 
 const rfc8037PublicJwk = {
@@ -108,6 +114,121 @@ describe("device trust cryptographic identity", () => {
       offer,
       keys.privateKey,
     )).rejects.toBeInstanceOf(DeviceTrustChallengeError);
+  });
+
+  it("binds recovery provisioning PoP to principal, authorizer, generation and audience", async () => {
+    const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", keys.publicKey));
+    const recoveryKeyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+    const proof: RecoveryProvisioningProof = {
+      schema: "ssrl-recovery-provisioning-proof-v1",
+      eventId: "event-recovery-provision",
+      principal: { subject: "user:alice", scopes: ["replication"] },
+      authorizingDeviceId: "device:laptop",
+      authorizingKeyId: "trusted-key",
+      recoveryPublicKeyJwk: publicKeyJwk,
+      recoveryKeyId,
+      recoveryGeneration: 1,
+      audience: "ssrl://device-trust/recovery",
+    };
+    const signature = await signRecoveryProvisioningProof(proof, keys.privateKey);
+
+    await expect(verifyRecoveryProvisioningProof(proof, signature)).resolves.toBe(true);
+    await expect(verifyRecoveryProvisioningProof(
+      { ...proof, recoveryGeneration: 2 },
+      signature,
+    )).resolves.toBe(false);
+    await expect(verifyRecoveryProvisioningProof(
+      { ...proof, audience: "ssrl://other" },
+      signature,
+    )).resolves.toBe(false);
+  });
+
+  it("binds all three recovery signatures to the same replacement device, next recovery key and audience", async () => {
+    const current = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const device = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const next = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const currentJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", current.publicKey));
+    const deviceJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", device.publicKey));
+    const nextJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", next.publicKey));
+    const challenge: DeviceRecoveryChallenge = {
+      schema: "ssrl-device-recovery-challenge-v1",
+      challengeId: "recovery-challenge-1",
+      challenge: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGH",
+      principal: { subject: "user:alice", scopes: ["replication"] },
+      recoveryKeyId: await ed25519JwkThumbprintUri(currentJwk),
+      recoveryGeneration: 1,
+      recoveryPublicKeyJwk: currentJwk,
+      deviceId: "device:replacement",
+      displayName: "Alice Replacement",
+      publicKeyJwk: deviceJwk,
+      keyId: await ed25519JwkThumbprintUri(deviceJwk),
+      nextRecoveryPublicKeyJwk: nextJwk,
+      nextRecoveryKeyId: await ed25519JwkThumbprintUri(nextJwk),
+      nextRecoveryGeneration: 2,
+      audience: "ssrl://device-trust/recovery",
+      createdAt: "2026-09-25T00:00:00Z",
+      expiresAt: "2026-09-25T00:05:00Z",
+    };
+    const currentSignature = await signDeviceRecoveryChallenge(challenge, current.privateKey);
+    const deviceSignature = await signDeviceRecoveryChallenge(challenge, device.privateKey);
+    const nextSignature = await signDeviceRecoveryChallenge(challenge, next.privateKey);
+
+    await expect(verifyDeviceRecoveryChallengeSignature(
+      challenge,
+      challenge.recoveryPublicKeyJwk,
+      currentSignature,
+    )).resolves.toBe(true);
+    await expect(verifyDeviceRecoveryChallengeSignature(
+      challenge,
+      challenge.publicKeyJwk,
+      deviceSignature,
+    )).resolves.toBe(true);
+    await expect(verifyDeviceRecoveryChallengeSignature(
+      challenge,
+      challenge.nextRecoveryPublicKeyJwk,
+      nextSignature,
+    )).resolves.toBe(true);
+
+    const otherDevice = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const otherNext = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const otherDeviceJwk = normalizeEd25519PublicJwk(
+      await crypto.subtle.exportKey("jwk", otherDevice.publicKey),
+    );
+    const otherNextJwk = normalizeEd25519PublicJwk(
+      await crypto.subtle.exportKey("jwk", otherNext.publicKey),
+    );
+    for (const changed of [
+      { ...challenge, deviceId: "device:mallory" },
+      { ...challenge, displayName: "Mallory Device" },
+      { ...challenge, audience: "ssrl://other" },
+      {
+        ...challenge,
+        publicKeyJwk: otherDeviceJwk,
+        keyId: await ed25519JwkThumbprintUri(otherDeviceJwk),
+      },
+      {
+        ...challenge,
+        nextRecoveryPublicKeyJwk: otherNextJwk,
+        nextRecoveryKeyId: await ed25519JwkThumbprintUri(otherNextJwk),
+      },
+    ]) {
+      await expect(verifyDeviceRecoveryChallengeSignature(
+        changed,
+        challenge.recoveryPublicKeyJwk,
+        currentSignature,
+      )).resolves.toBe(false);
+      await expect(verifyDeviceRecoveryChallengeSignature(
+        changed,
+        challenge.publicKeyJwk,
+        deviceSignature,
+      )).resolves.toBe(false);
+      await expect(verifyDeviceRecoveryChallengeSignature(
+        changed,
+        challenge.nextRecoveryPublicKeyJwk,
+        nextSignature,
+      )).resolves.toBe(false);
+    }
   });
 
   it("binds proof-of-possession to challenge operation, principal, device, key and audience", async () => {

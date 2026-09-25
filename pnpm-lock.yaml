@@ -704,13 +704,13 @@ importers:
 
   packages/storage-sqlite-device-trust:
     dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
       '@ssrl/device-trust':
         specifier: workspace:*
         version: link:../device-trust
     devDependencies:
-      '@ssrl/access':
-        specifier: workspace:*
-        version: link:../access
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
