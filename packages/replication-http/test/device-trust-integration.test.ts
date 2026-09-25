@@ -8,6 +8,7 @@ import {
   normalizeEd25519PublicJwk,
   signDeviceTrustChallenge,
 } from "@ssrl/device-trust";
+import { generateX25519KeyPair } from "@ssrl/e2e";
 import { SQLiteDeviceTrustStore } from "@ssrl/storage-sqlite-device-trust";
 import {
   HttpMessageSignatureAuthenticator,
@@ -29,7 +30,13 @@ afterEach(async () => {
 async function keyPair() {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", pair.publicKey));
-  return { ...pair, publicKeyJwk, keyId: await ed25519JwkThumbprintUri(publicKeyJwk) };
+  const encryption = await generateX25519KeyPair();
+  return {
+    ...pair,
+    publicKeyJwk,
+    keyId: await ed25519JwkThumbprintUri(publicKeyJwk),
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
+  };
 }
 
 async function signedRequest(input: {
@@ -77,6 +84,7 @@ describe("durable trusted-device replication authentication", () => {
       displayName: "Laptop",
       principal: { subject: "user:alice", scopes: ["replication"] },
       publicKeyJwk: keys.publicKeyJwk,
+      encryptionPublicKeyJwk: keys.encryptionPublicKeyJwk,
     });
     const body = JSON.stringify({ projectionId: "personal" });
     const request = await signedRequest({
@@ -124,6 +132,7 @@ describe("durable trusted-device replication authentication", () => {
       displayName: "Laptop",
       principal: { subject: "user:alice", scopes: ["replication"] },
       publicKeyJwk: first.publicKeyJwk,
+      encryptionPublicKeyJwk: first.encryptionPublicKeyJwk,
     });
     const oldRequest = await signedRequest({
       keyId: first.keyId,
@@ -137,6 +146,7 @@ describe("durable trusted-device replication authentication", () => {
     const challenge = await trust.startRotation({
       authorizingKeyId: first.keyId,
       publicKeyJwk: next.publicKeyJwk,
+      encryptionPublicKeyJwk: next.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/local",
     });
     await trust.completeRotation({

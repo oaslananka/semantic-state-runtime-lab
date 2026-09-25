@@ -1,5 +1,6 @@
 import { normalizeAccessPrincipal, type AccessPrincipal } from "@ssrl/access";
 import { canonicalJson } from "@ssrl/core";
+import { normalizeX25519PublicJwk, type X25519PublicJwk } from "@ssrl/e2e";
 import {
   DeviceTrustAuthorizationError,
   DeviceTrustChallengeError,
@@ -173,12 +174,19 @@ async function parsedOffer(value: unknown, audience: string): Promise<DeviceEnro
   const offer = objectRecord(value, "offer", invalidRequest);
   exactObjectKeys(
     offer,
-    ["schema", "deviceId", "displayName", "publicKeyJwk", "keyId", "audience"],
+    [
+      "schema", "deviceId", "displayName", "publicKeyJwk", "keyId",
+      "encryptionPublicKeyJwk", "encryptionKeyId", "audience",
+    ],
     "offer",
     invalidRequest,
   );
   const jwk = objectRecord(offer.publicKeyJwk, "offer.publicKeyJwk", invalidRequest);
   exactObjectKeys(jwk, ["kty", "crv", "x"], "offer.publicKeyJwk", invalidRequest);
+  const encryptionPublicKeyJwk = parsedEncryptionPublicJwk(
+    offer.encryptionPublicKeyJwk,
+    "offer.encryptionPublicKeyJwk",
+  );
   const normalized = await normalizeDeviceEnrollmentOffer({
     schema: nonEmptyString(offer.schema, "offer.schema", invalidRequest) as DeviceEnrollmentOffer["schema"],
     deviceId: nonEmptyString(offer.deviceId, "offer.deviceId", invalidRequest),
@@ -189,6 +197,8 @@ async function parsedOffer(value: unknown, audience: string): Promise<DeviceEnro
       x: nonEmptyString(jwk.x, "offer.publicKeyJwk.x", invalidRequest),
     } as JsonWebKey),
     keyId: nonEmptyString(offer.keyId, "offer.keyId", invalidRequest),
+    encryptionPublicKeyJwk,
+    encryptionKeyId: nonEmptyString(offer.encryptionKeyId, "offer.encryptionKeyId", invalidRequest),
     audience: nonEmptyString(offer.audience, "offer.audience", invalidRequest),
   });
   if (normalized.audience !== audience) throw invalidRequest("offer audience does not match this trust registry");
@@ -200,6 +210,25 @@ function parsedPublicJwk(value: unknown, label = "publicKeyJwk"): JsonWebKey {
   exactObjectKeys(jwk, ["kty", "crv", "x"], label, invalidRequest);
   try {
     return normalizeEd25519PublicJwk({
+      kty: nonEmptyString(jwk.kty, `${label}.kty`, invalidRequest),
+      crv: nonEmptyString(jwk.crv, `${label}.crv`, invalidRequest),
+      x: nonEmptyString(jwk.x, `${label}.x`, invalidRequest),
+    } as JsonWebKey);
+  } catch (cause) {
+    if (cause instanceof DeviceTrustHttpProtocolError) throw cause;
+    const detail = cause instanceof Error ? cause.message : `${label} is invalid`;
+    throw invalidRequest(detail);
+  }
+}
+
+function parsedEncryptionPublicJwk(
+  value: unknown,
+  label = "encryptionPublicKeyJwk",
+): X25519PublicJwk {
+  const jwk = objectRecord(value, label, invalidRequest);
+  exactObjectKeys(jwk, ["kty", "crv", "x"], label, invalidRequest);
+  try {
+    return normalizeX25519PublicJwk({
       kty: nonEmptyString(jwk.kty, `${label}.kty`, invalidRequest),
       crv: nonEmptyString(jwk.crv, `${label}.crv`, invalidRequest),
       x: nonEmptyString(jwk.x, `${label}.x`, invalidRequest),
@@ -297,22 +326,39 @@ function completionInput(body: Readonly<Record<string, unknown>>): {
 function recoveryProvisioningInput(body: Readonly<Record<string, unknown>>): {
   readonly eventId: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
 } {
-  exactObjectKeys(body, ["eventId", "publicKeyJwk"], "request body", invalidRequest);
+  exactObjectKeys(
+    body,
+    ["eventId", "publicKeyJwk", "encryptionPublicKeyJwk"],
+    "request body",
+    invalidRequest,
+  );
   return {
     eventId: nonEmptyString(body.eventId, "eventId", invalidRequest),
     publicKeyJwk: parsedPublicJwk(body.publicKeyJwk),
+    encryptionPublicKeyJwk: parsedEncryptionPublicJwk(body.encryptionPublicKeyJwk),
   };
 }
 
 function recoveryCommitInput(body: Readonly<Record<string, unknown>>): {
   readonly eventId: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
   readonly signature: Uint8Array;
 } {
-  exactObjectKeys(body, ["eventId", "publicKeyJwk", "signature"], "request body", invalidRequest);
+  exactObjectKeys(
+    body,
+    ["eventId", "publicKeyJwk", "encryptionPublicKeyJwk", "signature"],
+    "request body",
+    invalidRequest,
+  );
   return {
-    ...recoveryProvisioningInput({ eventId: body.eventId, publicKeyJwk: body.publicKeyJwk }),
+    ...recoveryProvisioningInput({
+      eventId: body.eventId,
+      publicKeyJwk: body.publicKeyJwk,
+      encryptionPublicKeyJwk: body.encryptionPublicKeyJwk,
+    }),
     signature: base64UrlToSignature(nonEmptyString(body.signature, "signature", invalidRequest)),
   };
 }
@@ -322,11 +368,17 @@ function recoveryStartInput(body: Readonly<Record<string, unknown>>): {
   readonly deviceId: string;
   readonly displayName: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly deviceEncryptionPublicKeyJwk: JsonWebKey;
   readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+  readonly nextRecoveryEncryptionPublicKeyJwk: JsonWebKey;
 } {
   exactObjectKeys(
     body,
-    ["recoveryKeyId", "deviceId", "displayName", "publicKeyJwk", "nextRecoveryPublicKeyJwk"],
+    [
+      "recoveryKeyId", "deviceId", "displayName", "publicKeyJwk",
+      "deviceEncryptionPublicKeyJwk", "nextRecoveryPublicKeyJwk",
+      "nextRecoveryEncryptionPublicKeyJwk",
+    ],
     "request body",
     invalidRequest,
   );
@@ -335,9 +387,17 @@ function recoveryStartInput(body: Readonly<Record<string, unknown>>): {
     deviceId: nonEmptyString(body.deviceId, "deviceId", invalidRequest),
     displayName: nonEmptyString(body.displayName, "displayName", invalidRequest),
     publicKeyJwk: parsedPublicJwk(body.publicKeyJwk),
+    deviceEncryptionPublicKeyJwk: parsedEncryptionPublicJwk(
+      body.deviceEncryptionPublicKeyJwk,
+      "deviceEncryptionPublicKeyJwk",
+    ),
     nextRecoveryPublicKeyJwk: parsedPublicJwk(
       body.nextRecoveryPublicKeyJwk,
       "nextRecoveryPublicKeyJwk",
+    ),
+    nextRecoveryEncryptionPublicKeyJwk: parsedEncryptionPublicJwk(
+      body.nextRecoveryEncryptionPublicKeyJwk,
+      "nextRecoveryEncryptionPublicKeyJwk",
     ),
   };
 }
@@ -509,14 +569,21 @@ export function createDeviceTrustHttpHandler(
             deviceId: offer.deviceId,
             displayName: offer.displayName,
             publicKeyJwk: offer.publicKeyJwk,
+            encryptionPublicKeyJwk: offer.encryptionPublicKeyJwk,
             audience,
           }));
         }
         if (pathname === DEVICE_TRUST_HTTP_ROUTES.startRotation) {
-          exactObjectKeys(signed.body, ["publicKeyJwk"], "request body", invalidRequest);
+          exactObjectKeys(
+            signed.body,
+            ["publicKeyJwk", "encryptionPublicKeyJwk"],
+            "request body",
+            invalidRequest,
+          );
           return challengeResponse(await options.manager.startRotation({
             authorizingKeyId,
             publicKeyJwk: parsedPublicJwk(signed.body.publicKeyJwk),
+            encryptionPublicKeyJwk: parsedEncryptionPublicJwk(signed.body.encryptionPublicKeyJwk),
             audience,
           }));
         }

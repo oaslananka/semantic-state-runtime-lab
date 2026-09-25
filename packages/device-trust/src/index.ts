@@ -3,10 +3,24 @@ import {
   type AccessPrincipal,
 } from "@ssrl/access";
 import { canonicalJson } from "@ssrl/core";
+import {
+  normalizeX25519PublicJwk,
+  type X25519PublicJwk,
+} from "@ssrl/e2e";
+import {
+  encryptionKeyIdentity,
+  normalizeTrustedEncryptionKeyBinding,
+  type ActiveEncryptionRecipient,
+  type EncryptionBindingSubjectKind,
+  type TrustedDeviceEncryptionKeyBinding,
+  type TrustedEncryptionKeyBinding,
+  type TrustedRecoveryEncryptionKeyBinding,
+} from "./encryption-binding.js";
 
 const JWK_THUMBPRINT_URI_PREFIX = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
 const DEVICE_TRUST_PROOF_SCHEMA = "ssrl-device-trust-proof-v1" as const;
 const RECOVERY_PROVISIONING_PROOF_SCHEMA = "ssrl-recovery-provisioning-proof-v1" as const;
+export const ENCRYPTION_BINDING_PROOF_SCHEMA = "ssrl-encryption-binding-proof-v1" as const;
 export const DEVICE_RECOVERY_CHALLENGE_SCHEMA = "ssrl-device-recovery-challenge-v1" as const;
 const DEVICE_RECOVERY_PROOF_SCHEMA = "ssrl-device-recovery-proof-v1" as const;
 export const DEVICE_ENROLLMENT_OFFER_SCHEMA = "ssrl-device-enrollment-offer-v1" as const;
@@ -25,7 +39,8 @@ export type DeviceTrustEventType =
   | "revoke-key"
   | "revoke-device"
   | "set-recovery-credential"
-  | "recover-trust-set";
+  | "recover-trust-set"
+  | "bind-encryption-key";
 
 export interface Ed25519PublicJwk {
   readonly kty: "OKP";
@@ -39,6 +54,8 @@ export interface DeviceEnrollmentOffer {
   readonly displayName: string;
   readonly publicKeyJwk: Ed25519PublicJwk;
   readonly keyId: string;
+  readonly encryptionPublicKeyJwk: X25519PublicJwk;
+  readonly encryptionKeyId: string;
   readonly audience: string;
 }
 
@@ -46,6 +63,7 @@ export interface DeviceEnrollmentOfferInput {
   readonly deviceId: string;
   readonly displayName: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
   readonly audience: string;
 }
 
@@ -105,12 +123,14 @@ interface DeviceTrustEventBase {
 export interface BootstrapDeviceEvent extends DeviceTrustEventBase {
   readonly type: "bootstrap-device";
   readonly keyId: string;
+  readonly encryptionKeyId?: string;
 }
 
 export interface EnrollDeviceEvent extends DeviceTrustEventBase {
   readonly type: "enroll-device";
   readonly keyId: string;
   readonly challengeId: string;
+  readonly encryptionKeyId?: string;
 }
 
 export interface RotateKeyEvent extends DeviceTrustEventBase {
@@ -118,6 +138,7 @@ export interface RotateKeyEvent extends DeviceTrustEventBase {
   readonly keyId: string;
   readonly predecessorKeyId: string;
   readonly challengeId: string;
+  readonly encryptionKeyId?: string;
 }
 
 export interface RevokeKeyEvent extends DeviceTrustEventBase {
@@ -133,6 +154,7 @@ export interface SetRecoveryCredentialEvent extends DeviceTrustEventBase {
   readonly type: "set-recovery-credential";
   readonly recoveryKeyId: string;
   readonly recoveryGeneration: number;
+  readonly encryptionKeyId?: string;
   readonly audience: string;
 }
 
@@ -144,6 +166,16 @@ export interface RecoverTrustSetEvent extends DeviceTrustEventBase {
   readonly recoveryGeneration: number;
   readonly nextRecoveryKeyId: string;
   readonly nextRecoveryGeneration: number;
+  readonly deviceEncryptionKeyId?: string;
+  readonly nextRecoveryEncryptionKeyId?: string;
+  readonly audience: string;
+}
+
+export interface BindEncryptionKeyEvent extends DeviceTrustEventBase {
+  readonly type: "bind-encryption-key";
+  readonly subjectKind: EncryptionBindingSubjectKind;
+  readonly subjectKeyId: string;
+  readonly encryptionKeyId: string;
   readonly audience: string;
 }
 
@@ -154,7 +186,8 @@ export type DeviceTrustEvent =
   | RevokeKeyEvent
   | RevokeDeviceEvent
   | SetRecoveryCredentialEvent
-  | RecoverTrustSetEvent;
+  | RecoverTrustSetEvent
+  | BindEncryptionKeyEvent;
 
 export interface DeviceTrustChallenge {
   readonly challengeId: string;
@@ -165,6 +198,8 @@ export interface DeviceTrustChallenge {
   readonly displayName: string;
   readonly publicKeyJwk: Ed25519PublicJwk;
   readonly keyId: string;
+  readonly encryptionPublicKeyJwk?: X25519PublicJwk;
+  readonly encryptionKeyId?: string;
   readonly audience: string;
   readonly authorizedByDeviceId: string;
   readonly authorizedByKeyId: string;
@@ -190,8 +225,12 @@ export interface DeviceRecoveryChallenge {
   readonly displayName: string;
   readonly publicKeyJwk: Ed25519PublicJwk;
   readonly keyId: string;
+  readonly deviceEncryptionPublicKeyJwk?: X25519PublicJwk;
+  readonly deviceEncryptionKeyId?: string;
   readonly nextRecoveryPublicKeyJwk: Ed25519PublicJwk;
   readonly nextRecoveryKeyId: string;
+  readonly nextRecoveryEncryptionPublicKeyJwk?: X25519PublicJwk;
+  readonly nextRecoveryEncryptionKeyId?: string;
   readonly nextRecoveryGeneration: number;
   readonly audience: string;
   readonly createdAt: string;
@@ -240,6 +279,7 @@ export interface BootstrapDeviceTransition {
   readonly event: BootstrapDeviceEvent;
   readonly device: TrustedDevice;
   readonly key: TrustedDeviceKey;
+  readonly encryptionBinding?: TrustedDeviceEncryptionKeyBinding;
 }
 
 export interface EnrollDeviceTransition {
@@ -247,6 +287,7 @@ export interface EnrollDeviceTransition {
   readonly challenge: DeviceTrustChallenge;
   readonly device: TrustedDevice;
   readonly key: TrustedDeviceKey;
+  readonly encryptionBinding?: TrustedDeviceEncryptionKeyBinding;
   readonly now: string;
 }
 
@@ -256,6 +297,7 @@ export interface RotateKeyTransition {
   readonly deviceId: string;
   readonly predecessorKeyId: string;
   readonly key: TrustedDeviceKey;
+  readonly encryptionBinding?: TrustedDeviceEncryptionKeyBinding;
   readonly now: string;
 }
 
@@ -286,9 +328,21 @@ export interface RecoveryTrustSetMutationResult {
   readonly recoveryCredential: TrustedRecoveryCredential;
 }
 
+export interface EncryptionBindingMutationResult {
+  readonly outcome: "inserted" | "replayed";
+  readonly event: BindEncryptionKeyEvent;
+  readonly binding: TrustedEncryptionKeyBinding;
+}
+
+export interface BindEncryptionKeyTransition {
+  readonly event: BindEncryptionKeyEvent;
+  readonly binding: TrustedEncryptionKeyBinding;
+}
+
 export interface SetRecoveryCredentialTransition {
   readonly event: SetRecoveryCredentialEvent;
   readonly credential: TrustedRecoveryCredential;
+  readonly encryptionBinding?: TrustedRecoveryEncryptionKeyBinding;
   readonly previousRecoveryKeyId?: string;
   readonly now: string;
 }
@@ -299,6 +353,8 @@ export interface RecoverTrustSetTransition {
   readonly device: TrustedDevice;
   readonly key: TrustedDeviceKey;
   readonly recoveryCredential: TrustedRecoveryCredential;
+  readonly deviceEncryptionBinding?: TrustedDeviceEncryptionKeyBinding;
+  readonly recoveryEncryptionBinding?: TrustedRecoveryEncryptionKeyBinding;
   readonly previousRecoveryKeyId: string;
   readonly now: string;
 }
@@ -318,6 +374,16 @@ export interface DeviceTrustRepository
   activeRecoveryCredential(
     principal: AccessPrincipal,
   ): TrustedRecoveryCredential | undefined | Promise<TrustedRecoveryCredential | undefined>;
+  encryptionBinding(
+    encryptionKeyId: string,
+  ): TrustedEncryptionKeyBinding | undefined | Promise<TrustedEncryptionKeyBinding | undefined>;
+  encryptionBindingForSubject(
+    subjectKind: EncryptionBindingSubjectKind,
+    subjectKeyId: string,
+  ): TrustedEncryptionKeyBinding | undefined | Promise<TrustedEncryptionKeyBinding | undefined>;
+  activeEncryptionRecipients(
+    principal: AccessPrincipal,
+  ): readonly ActiveEncryptionRecipient[] | Promise<readonly ActiveEncryptionRecipient[]>;
   recoveryChallenge(
     challengeId: string,
   ): StoredDeviceRecoveryChallenge | undefined | Promise<StoredDeviceRecoveryChallenge | undefined>;
@@ -334,6 +400,9 @@ export interface DeviceTrustRepository
   recoverTrustSet(
     transition: RecoverTrustSetTransition,
   ): RecoveryTrustSetMutationResult | Promise<RecoveryTrustSetMutationResult>;
+  bindEncryptionKey(
+    transition: BindEncryptionKeyTransition,
+  ): EncryptionBindingMutationResult | Promise<EncryptionBindingMutationResult>;
   pruneExpired(now: string): number | Promise<number>;
 }
 
@@ -355,6 +424,7 @@ export interface LocalBootstrapInput {
   readonly displayName: string;
   readonly principal: AccessPrincipal;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
 }
 
 export interface StartEnrollmentInput {
@@ -363,6 +433,7 @@ export interface StartEnrollmentInput {
   readonly deviceId: string;
   readonly displayName: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
   readonly audience: string;
 }
 
@@ -370,6 +441,7 @@ export interface StartRotationInput {
   /** Must come from an already-authenticated trust-management context. */
   readonly authorizingKeyId: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
   readonly audience: string;
 }
 
@@ -396,6 +468,7 @@ export interface PrepareRecoveryCredentialInput {
   readonly eventId: string;
   readonly authorizingKeyId: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
   readonly audience: string;
 }
 
@@ -408,7 +481,9 @@ export interface StartRecoveryInput {
   readonly deviceId: string;
   readonly displayName: string;
   readonly publicKeyJwk: JsonWebKey;
+  readonly deviceEncryptionPublicKeyJwk: JsonWebKey;
   readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+  readonly nextRecoveryEncryptionPublicKeyJwk: JsonWebKey;
   readonly audience: string;
 }
 
@@ -428,8 +503,38 @@ export interface RecoveryProvisioningProof {
   readonly authorizingKeyId: string;
   readonly recoveryPublicKeyJwk: Ed25519PublicJwk;
   readonly recoveryKeyId: string;
+  readonly recoveryEncryptionPublicKeyJwk: X25519PublicJwk;
+  readonly recoveryEncryptionKeyId: string;
   readonly recoveryGeneration: number;
   readonly audience: string;
+}
+
+export interface EncryptionBindingProof {
+  readonly schema: typeof ENCRYPTION_BINDING_PROOF_SCHEMA;
+  readonly eventId: string;
+  readonly subjectKind: EncryptionBindingSubjectKind;
+  readonly subjectKeyId: string;
+  readonly principal: AccessPrincipal;
+  readonly authorizingDeviceId: string;
+  readonly authorizingKeyId: string;
+  readonly encryptionPublicKeyJwk: X25519PublicJwk;
+  readonly encryptionKeyId: string;
+  readonly audience: string;
+  readonly deviceId?: string;
+  readonly recoveryGeneration?: number;
+}
+
+export interface PrepareEncryptionBindingInput {
+  readonly eventId: string;
+  readonly authorizingKeyId: string;
+  readonly subjectKind: EncryptionBindingSubjectKind;
+  readonly subjectKeyId: string;
+  readonly encryptionPublicKeyJwk: JsonWebKey;
+  readonly audience: string;
+}
+
+export interface BindEncryptionKeyInput extends PrepareEncryptionBindingInput {
+  readonly subjectSignature: Uint8Array;
 }
 
 export class DeviceTrustError extends Error {
@@ -528,6 +633,10 @@ function configuredChallengeLifetime(value: number | undefined): number {
   return result;
 }
 
+function encryptionKeyIdentityShape(value: X25519PublicJwk | JsonWebKey): X25519PublicJwk {
+  return normalizeX25519PublicJwk(value);
+}
+
 export function normalizeEd25519PublicJwk(value: JsonWebKey): Ed25519PublicJwk {
   if (
     value.kty !== "OKP"
@@ -553,12 +662,15 @@ export async function createDeviceEnrollmentOffer(
   input: DeviceEnrollmentOfferInput,
 ): Promise<DeviceEnrollmentOffer> {
   const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+  const encryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
   return {
     schema: DEVICE_ENROLLMENT_OFFER_SCHEMA,
     deviceId: requiredString(input.deviceId, "offer deviceId"),
     displayName: requiredString(input.displayName, "offer displayName"),
     publicKeyJwk,
     keyId: await ed25519JwkThumbprintUri(publicKeyJwk),
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
+    encryptionKeyId: encryption.encryptionKeyId,
     audience: requiredString(input.audience, "offer audience"),
   };
 }
@@ -572,6 +684,9 @@ export async function normalizeDeviceEnrollmentOffer(
   const normalized = await createDeviceEnrollmentOffer(value);
   if (value.keyId !== normalized.keyId) {
     throw new TypeError("device enrollment offer keyId does not match public JWK thumbprint");
+  }
+  if (value.encryptionKeyId !== normalized.encryptionKeyId) {
+    throw new TypeError("device enrollment offer encryptionKeyId does not match public JWK thumbprint");
   }
   return normalized;
 }
@@ -610,6 +725,9 @@ export async function assertEnrollmentChallengeMatchesOffer(
     || normalizedChallenge.displayName !== normalizedOffer.displayName
     || normalizedChallenge.keyId !== normalizedOffer.keyId
     || canonicalJson(normalizedChallenge.publicKeyJwk) !== canonicalJson(normalizedOffer.publicKeyJwk)
+    || normalizedChallenge.encryptionKeyId !== normalizedOffer.encryptionKeyId
+    || canonicalJson(normalizedChallenge.encryptionPublicKeyJwk)
+      !== canonicalJson(normalizedOffer.encryptionPublicKeyJwk)
     || normalizedChallenge.audience !== normalizedOffer.audience
   ) {
     throw new DeviceTrustChallengeError("enrollment challenge does not match the local device offer");
@@ -759,7 +877,14 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
       if (event.actor.mode !== "local-bootstrap") {
         throw new TypeError("bootstrap-device event requires local-bootstrap actor");
       }
-      return { ...base, type: event.type, keyId: requiredString(event.keyId, "event keyId") };
+      return {
+        ...base,
+        type: event.type,
+        keyId: requiredString(event.keyId, "event keyId"),
+        ...(event.encryptionKeyId === undefined
+          ? {}
+          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
+      };
     case "enroll-device":
       if (event.actor.mode !== "trusted-device") {
         throw new TypeError("enroll-device event requires trusted-device actor");
@@ -769,6 +894,9 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
         type: event.type,
         keyId: requiredString(event.keyId, "event keyId"),
         challengeId: requiredString(event.challengeId, "event challengeId"),
+        ...(event.encryptionKeyId === undefined
+          ? {}
+          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
       };
     case "rotate-key":
       if (event.actor.mode !== "trusted-device") {
@@ -780,6 +908,9 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
         keyId: requiredString(event.keyId, "event keyId"),
         predecessorKeyId: requiredString(event.predecessorKeyId, "event predecessorKeyId"),
         challengeId: requiredString(event.challengeId, "event challengeId"),
+        ...(event.encryptionKeyId === undefined
+          ? {}
+          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
       };
     case "revoke-key":
       if (event.actor.mode !== "trusted-device") {
@@ -800,6 +931,9 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
         type: event.type,
         recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
         recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
+        ...(event.encryptionKeyId === undefined
+          ? {}
+          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
         audience: requiredString(event.audience, "event audience"),
       };
     case "recover-trust-set":
@@ -818,6 +952,32 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
           event.nextRecoveryGeneration,
           "event nextRecoveryGeneration",
         ),
+        ...(event.deviceEncryptionKeyId === undefined
+          ? {}
+          : { deviceEncryptionKeyId: requiredString(event.deviceEncryptionKeyId, "event deviceEncryptionKeyId") }),
+        ...(event.nextRecoveryEncryptionKeyId === undefined
+          ? {}
+          : {
+            nextRecoveryEncryptionKeyId: requiredString(
+              event.nextRecoveryEncryptionKeyId,
+              "event nextRecoveryEncryptionKeyId",
+            ),
+          }),
+        audience: requiredString(event.audience, "event audience"),
+      };
+    case "bind-encryption-key":
+      if (event.actor.mode !== "trusted-device") {
+        throw new TypeError("bind-encryption-key event requires trusted-device management actor");
+      }
+      if (event.subjectKind !== "device-signing-key" && event.subjectKind !== "recovery-credential") {
+        throw new TypeError("bind-encryption-key subjectKind is invalid");
+      }
+      return {
+        ...base,
+        type: event.type,
+        subjectKind: event.subjectKind,
+        subjectKeyId: requiredString(event.subjectKeyId, "event subjectKeyId"),
+        encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId"),
         audience: requiredString(event.audience, "event audience"),
       };
     default:
@@ -846,6 +1006,14 @@ export function normalizeDeviceTrustChallenge(challenge: DeviceTrustChallenge): 
   if (challenge.operation !== "enroll-device" && challenge.operation !== "rotate-key") {
     throw new TypeError("device trust challenge operation is invalid");
   }
+  const hasEncryptionJwk = challenge.encryptionPublicKeyJwk !== undefined;
+  const hasEncryptionKeyId = challenge.encryptionKeyId !== undefined;
+  if (hasEncryptionJwk !== hasEncryptionKeyId) {
+    throw new TypeError("device trust challenge encryption binding is incomplete");
+  }
+  const encryptionPublicKeyJwk = challenge.encryptionPublicKeyJwk === undefined
+    ? undefined
+    : encryptionKeyIdentityShape(challenge.encryptionPublicKeyJwk);
   return {
     challengeId: requiredString(challenge.challengeId, "challengeId"),
     challenge: requiredString(challenge.challenge, "challenge"),
@@ -855,6 +1023,10 @@ export function normalizeDeviceTrustChallenge(challenge: DeviceTrustChallenge): 
     displayName: requiredString(challenge.displayName, "challenge displayName"),
     publicKeyJwk: normalizeEd25519PublicJwk(challenge.publicKeyJwk),
     keyId: requiredString(challenge.keyId, "challenge keyId"),
+    ...(encryptionPublicKeyJwk === undefined ? {} : {
+      encryptionPublicKeyJwk,
+      encryptionKeyId: requiredString(challenge.encryptionKeyId!, "challenge encryptionKeyId"),
+    }),
     audience: requiredString(challenge.audience, "challenge audience"),
     authorizedByDeviceId: requiredString(challenge.authorizedByDeviceId, "authorizedByDeviceId"),
     authorizedByKeyId: requiredString(challenge.authorizedByKeyId, "authorizedByKeyId"),
@@ -875,6 +1047,12 @@ export async function validateDeviceTrustChallengeKeyId(
   if (normalized.keyId !== expected) {
     throw new TypeError("challenge keyId does not match public JWK thumbprint");
   }
+  if (normalized.encryptionPublicKeyJwk !== undefined) {
+    const encryption = await encryptionKeyIdentity(normalized.encryptionPublicKeyJwk);
+    if (normalized.encryptionKeyId !== encryption.encryptionKeyId) {
+      throw new TypeError("challenge encryptionKeyId does not match public JWK thumbprint");
+    }
+  }
   return normalized;
 }
 
@@ -890,6 +1068,10 @@ export function deviceTrustProofJson(challenge: DeviceTrustChallenge): string {
     displayName: normalized.displayName,
     publicKeyJwk: normalized.publicKeyJwk,
     keyId: normalized.keyId,
+    ...(normalized.encryptionPublicKeyJwk === undefined ? {} : {
+      encryptionPublicKeyJwk: normalized.encryptionPublicKeyJwk,
+      encryptionKeyId: normalized.encryptionKeyId,
+    }),
     audience: normalized.audience,
   });
 }
@@ -989,6 +1171,10 @@ export async function normalizeRecoveryProvisioningProof(
   if (proof.recoveryKeyId !== recoveryKeyId) {
     throw new TypeError("recovery provisioning keyId does not match public JWK thumbprint");
   }
+  const recoveryEncryption = await encryptionKeyIdentity(proof.recoveryEncryptionPublicKeyJwk);
+  if (proof.recoveryEncryptionKeyId !== recoveryEncryption.encryptionKeyId) {
+    throw new TypeError("recovery provisioning encryptionKeyId does not match public JWK thumbprint");
+  }
   return {
     schema: RECOVERY_PROVISIONING_PROOF_SCHEMA,
     eventId: requiredString(proof.eventId, "recovery provisioning eventId"),
@@ -1000,6 +1186,8 @@ export async function normalizeRecoveryProvisioningProof(
     authorizingKeyId: requiredString(proof.authorizingKeyId, "recovery provisioning authorizingKeyId"),
     recoveryPublicKeyJwk,
     recoveryKeyId,
+    recoveryEncryptionPublicKeyJwk: recoveryEncryption.publicKeyJwk,
+    recoveryEncryptionKeyId: recoveryEncryption.encryptionKeyId,
     recoveryGeneration: positiveGeneration(
       proof.recoveryGeneration,
       "recovery provisioning generation",
@@ -1044,6 +1232,97 @@ export async function verifyRecoveryProvisioningProof(
   );
 }
 
+
+export async function normalizeEncryptionBindingProof(
+  proof: EncryptionBindingProof,
+): Promise<EncryptionBindingProof> {
+  if (proof.schema !== ENCRYPTION_BINDING_PROOF_SCHEMA) {
+    throw new TypeError("encryption binding proof schema is invalid");
+  }
+  if (proof.subjectKind !== "device-signing-key" && proof.subjectKind !== "recovery-credential") {
+    throw new TypeError("encryption binding proof subjectKind is invalid");
+  }
+  const encryption = await encryptionKeyIdentity(proof.encryptionPublicKeyJwk);
+  if (proof.encryptionKeyId !== encryption.encryptionKeyId) {
+    throw new TypeError("encryption binding proof encryptionKeyId does not match public JWK thumbprint");
+  }
+  const common = {
+    schema: ENCRYPTION_BINDING_PROOF_SCHEMA,
+    eventId: requiredString(proof.eventId, "encryption binding eventId"),
+    subjectKind: proof.subjectKind,
+    subjectKeyId: requiredString(proof.subjectKeyId, "encryption binding subjectKeyId"),
+    principal: normalizeAccessPrincipal(proof.principal),
+    authorizingDeviceId: requiredString(
+      proof.authorizingDeviceId,
+      "encryption binding authorizingDeviceId",
+    ),
+    authorizingKeyId: requiredString(
+      proof.authorizingKeyId,
+      "encryption binding authorizingKeyId",
+    ),
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
+    encryptionKeyId: encryption.encryptionKeyId,
+    audience: requiredString(proof.audience, "encryption binding audience"),
+  };
+  if (proof.subjectKind === "device-signing-key") {
+    if (proof.recoveryGeneration !== undefined) {
+      throw new TypeError("device encryption binding proof must not include recoveryGeneration");
+    }
+    return {
+      ...common,
+      subjectKind: "device-signing-key",
+      deviceId: requiredString(proof.deviceId ?? "", "encryption binding deviceId"),
+    };
+  }
+  if (proof.deviceId !== undefined) {
+    throw new TypeError("recovery encryption binding proof must not include deviceId");
+  }
+  return {
+    ...common,
+    subjectKind: "recovery-credential",
+    recoveryGeneration: positiveGeneration(
+      proof.recoveryGeneration ?? 0,
+      "encryption binding recoveryGeneration",
+    ),
+  };
+}
+
+export async function encryptionBindingProofJson(
+  proof: EncryptionBindingProof,
+): Promise<string> {
+  return canonicalJson(await normalizeEncryptionBindingProof(proof));
+}
+
+export async function encryptionBindingProofBytes(
+  proof: EncryptionBindingProof,
+): Promise<Uint8Array> {
+  return new TextEncoder().encode(await encryptionBindingProofJson(proof));
+}
+
+export async function signEncryptionBindingProof(
+  proof: EncryptionBindingProof,
+  privateKey: CryptoKey,
+): Promise<Uint8Array> {
+  return signEd25519Proof(privateKey, await encryptionBindingProofBytes(proof));
+}
+
+export async function verifyEncryptionBindingProof(
+  proof: EncryptionBindingProof,
+  subjectPublicKeyJwk: Ed25519PublicJwk,
+  signature: Uint8Array,
+): Promise<boolean> {
+  try {
+    const normalized = await normalizeEncryptionBindingProof(proof);
+    return verifyEd25519Proof(
+      normalizeEd25519PublicJwk(subjectPublicKeyJwk),
+      signature,
+      await encryptionBindingProofBytes(normalized),
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeDeviceRecoveryChallenge(
   challenge: DeviceRecoveryChallenge,
 ): DeviceRecoveryChallenge {
@@ -1066,6 +1345,25 @@ export function normalizeDeviceRecoveryChallenge(
   if (nextRecoveryGeneration !== recoveryGeneration + 1) {
     throw new TypeError("next recovery generation must increment current generation by one");
   }
+  const deviceEncryptionPresent = challenge.deviceEncryptionPublicKeyJwk !== undefined
+    || challenge.deviceEncryptionKeyId !== undefined;
+  const nextRecoveryEncryptionPresent = challenge.nextRecoveryEncryptionPublicKeyJwk !== undefined
+    || challenge.nextRecoveryEncryptionKeyId !== undefined;
+  if (
+    deviceEncryptionPresent
+    && (challenge.deviceEncryptionPublicKeyJwk === undefined || challenge.deviceEncryptionKeyId === undefined)
+  ) {
+    throw new TypeError("recovery device encryption binding is incomplete");
+  }
+  if (
+    nextRecoveryEncryptionPresent
+    && (
+      challenge.nextRecoveryEncryptionPublicKeyJwk === undefined
+      || challenge.nextRecoveryEncryptionKeyId === undefined
+    )
+  ) {
+    throw new TypeError("next recovery encryption binding is incomplete");
+  }
   return {
     schema: DEVICE_RECOVERY_CHALLENGE_SCHEMA,
     challengeId: requiredString(challenge.challengeId, "recovery challengeId"),
@@ -1078,8 +1376,24 @@ export function normalizeDeviceRecoveryChallenge(
     displayName: requiredString(challenge.displayName, "recovery displayName"),
     publicKeyJwk: normalizeEd25519PublicJwk(challenge.publicKeyJwk),
     keyId: requiredString(challenge.keyId, "recovery device keyId"),
+    ...(challenge.deviceEncryptionPublicKeyJwk === undefined ? {} : {
+      deviceEncryptionPublicKeyJwk: normalizeX25519PublicJwk(challenge.deviceEncryptionPublicKeyJwk),
+      deviceEncryptionKeyId: requiredString(
+        challenge.deviceEncryptionKeyId!,
+        "recovery device encryptionKeyId",
+      ),
+    }),
     nextRecoveryPublicKeyJwk: normalizeEd25519PublicJwk(challenge.nextRecoveryPublicKeyJwk),
     nextRecoveryKeyId: requiredString(challenge.nextRecoveryKeyId, "next recovery keyId"),
+    ...(challenge.nextRecoveryEncryptionPublicKeyJwk === undefined ? {} : {
+      nextRecoveryEncryptionPublicKeyJwk: normalizeX25519PublicJwk(
+        challenge.nextRecoveryEncryptionPublicKeyJwk,
+      ),
+      nextRecoveryEncryptionKeyId: requiredString(
+        challenge.nextRecoveryEncryptionKeyId!,
+        "next recovery encryptionKeyId",
+      ),
+    }),
     nextRecoveryGeneration,
     audience: requiredString(challenge.audience, "recovery audience"),
     createdAt,
@@ -1106,6 +1420,31 @@ export async function validateDeviceRecoveryChallengeKeyIds(
   if (new Set([recoveryKeyId, keyId, nextRecoveryKeyId]).size !== 3) {
     throw new TypeError("device recovery challenge requires distinct current/device/next recovery keys");
   }
+  const deviceEncryption = normalized.deviceEncryptionPublicKeyJwk === undefined
+    ? undefined
+    : await encryptionKeyIdentity(normalized.deviceEncryptionPublicKeyJwk);
+  const nextRecoveryEncryption = normalized.nextRecoveryEncryptionPublicKeyJwk === undefined
+    ? undefined
+    : await encryptionKeyIdentity(normalized.nextRecoveryEncryptionPublicKeyJwk);
+  if (
+    deviceEncryption !== undefined
+    && normalized.deviceEncryptionKeyId !== deviceEncryption.encryptionKeyId
+  ) {
+    throw new TypeError("recovery device encryptionKeyId does not match public JWK thumbprint");
+  }
+  if (
+    nextRecoveryEncryption !== undefined
+    && normalized.nextRecoveryEncryptionKeyId !== nextRecoveryEncryption.encryptionKeyId
+  ) {
+    throw new TypeError("next recovery encryptionKeyId does not match public JWK thumbprint");
+  }
+  if (
+    deviceEncryption !== undefined
+    && nextRecoveryEncryption !== undefined
+    && deviceEncryption.encryptionKeyId === nextRecoveryEncryption.encryptionKeyId
+  ) {
+    throw new TypeError("recovery device and next recovery encryption keys must be distinct");
+  }
   return normalized;
 }
 
@@ -1130,8 +1469,16 @@ export async function deviceRecoveryProofBytes(
     displayName: normalized.displayName,
     publicKeyJwk: normalized.publicKeyJwk,
     keyId: normalized.keyId,
+    ...(normalized.deviceEncryptionPublicKeyJwk === undefined ? {} : {
+      deviceEncryptionPublicKeyJwk: normalized.deviceEncryptionPublicKeyJwk,
+      deviceEncryptionKeyId: normalized.deviceEncryptionKeyId,
+    }),
     nextRecoveryPublicKeyJwk: normalized.nextRecoveryPublicKeyJwk,
     nextRecoveryKeyId: normalized.nextRecoveryKeyId,
+    ...(normalized.nextRecoveryEncryptionPublicKeyJwk === undefined ? {} : {
+      nextRecoveryEncryptionPublicKeyJwk: normalized.nextRecoveryEncryptionPublicKeyJwk,
+      nextRecoveryEncryptionKeyId: normalized.nextRecoveryEncryptionKeyId,
+    }),
     nextRecoveryGeneration: normalized.nextRecoveryGeneration,
     audience: normalized.audience,
   }));
@@ -1180,9 +1527,64 @@ function eventReplayMatchesChallenge(event: DeviceTrustEvent, challenge: DeviceT
   if (event.type !== challenge.operation) return false;
   if (event.deviceId !== challenge.deviceId || !principalMatches(event.principal, challenge.principal)) return false;
   if (event.type === "enroll-device") {
-    return event.keyId === challenge.keyId && event.challengeId === challenge.challengeId;
+    return event.keyId === challenge.keyId
+      && event.challengeId === challenge.challengeId
+      && event.encryptionKeyId === challenge.encryptionKeyId;
   }
-  return event.keyId === challenge.keyId && event.challengeId === challenge.challengeId;
+  return event.keyId === challenge.keyId
+    && event.challengeId === challenge.challengeId
+    && event.encryptionKeyId === challenge.encryptionKeyId;
+}
+
+async function deviceEncryptionBinding(input: {
+  readonly subjectKeyId: string;
+  readonly deviceId: string;
+  readonly principal: AccessPrincipal;
+  readonly publicKeyJwk: X25519PublicJwk | JsonWebKey;
+  readonly boundAt: string;
+}): Promise<TrustedDeviceEncryptionKeyBinding> {
+  const encryption = await encryptionKeyIdentity(input.publicKeyJwk);
+  const binding = await normalizeTrustedEncryptionKeyBinding({
+    subjectKind: "device-signing-key",
+    subjectKeyId: input.subjectKeyId,
+    deviceId: input.deviceId,
+    principal: input.principal,
+    encryptionKeyId: encryption.encryptionKeyId,
+    publicKeyJwk: encryption.publicKeyJwk,
+    boundAt: input.boundAt,
+  });
+  if (binding.subjectKind !== "device-signing-key") throw new TypeError("expected device encryption binding");
+  return binding;
+}
+
+async function recoveryEncryptionBinding(input: {
+  readonly subjectKeyId: string;
+  readonly generation: number;
+  readonly principal: AccessPrincipal;
+  readonly publicKeyJwk: X25519PublicJwk | JsonWebKey;
+  readonly boundAt: string;
+}): Promise<TrustedRecoveryEncryptionKeyBinding> {
+  const encryption = await encryptionKeyIdentity(input.publicKeyJwk);
+  const binding = await normalizeTrustedEncryptionKeyBinding({
+    subjectKind: "recovery-credential",
+    subjectKeyId: input.subjectKeyId,
+    recoveryGeneration: input.generation,
+    principal: input.principal,
+    encryptionKeyId: encryption.encryptionKeyId,
+    publicKeyJwk: encryption.publicKeyJwk,
+    boundAt: input.boundAt,
+  });
+  if (binding.subjectKind !== "recovery-credential") throw new TypeError("expected recovery encryption binding");
+  return binding;
+}
+
+interface ActiveEncryptionBindingSubject {
+  readonly subjectKind: EncryptionBindingSubjectKind;
+  readonly subjectKeyId: string;
+  readonly principal: AccessPrincipal;
+  readonly publicKeyJwk: Ed25519PublicJwk;
+  readonly deviceId?: string;
+  readonly recoveryGeneration?: number;
 }
 
 export class DeviceTrustManager {
@@ -1212,6 +1614,41 @@ export class DeviceTrustManager {
 
   async activeAuthorization(keyId: string): Promise<ActiveDeviceAuthorization> {
     return this.#activeAuthorization(keyId);
+  }
+
+  async #activeEncryptionBindingSubject(
+    subjectKind: EncryptionBindingSubjectKind,
+    subjectKeyIdInput: string,
+  ): Promise<ActiveEncryptionBindingSubject> {
+    const subjectKeyId = requiredString(subjectKeyIdInput, "encryption binding subjectKeyId");
+    if (subjectKind === "device-signing-key") {
+      const key = await this.#repository.key(subjectKeyId);
+      if (key?.status !== "active") {
+        throw new DeviceTrustAuthorizationError("device encryption binding subject key is not active");
+      }
+      const device = await this.#repository.device(key.deviceId);
+      if (device?.status !== "active") {
+        throw new DeviceTrustAuthorizationError("device encryption binding subject device is not active");
+      }
+      return {
+        subjectKind,
+        subjectKeyId,
+        principal: device.principal,
+        publicKeyJwk: key.publicKeyJwk,
+        deviceId: device.deviceId,
+      };
+    }
+    const credential = await this.#repository.recoveryCredential(subjectKeyId);
+    if (credential?.status !== "active") {
+      throw new DeviceTrustAuthorizationError("recovery encryption binding subject is not active");
+    }
+    return {
+      subjectKind,
+      subjectKeyId,
+      principal: credential.principal,
+      publicKeyJwk: credential.publicKeyJwk,
+      recoveryGeneration: credential.generation,
+    };
   }
 
   async #replayedKeyEvent(
@@ -1273,6 +1710,7 @@ export class DeviceTrustManager {
     const principal = normalizeAccessPrincipal(input.principal);
     const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
     const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+    const encryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
     const deviceId = requiredString(input.deviceId, "deviceId");
     const displayName = requiredString(input.displayName, "displayName");
     const existing = await this.#repository.event(eventId);
@@ -1282,6 +1720,7 @@ export class DeviceTrustManager {
         || existing.actor.mode !== "local-bootstrap"
         || existing.deviceId !== deviceId
         || existing.keyId !== keyId
+        || existing.encryptionKeyId !== encryption.encryptionKeyId
         || !principalMatches(existing.principal, principal)
       ) {
         throw new DeviceTrustConflictError(`device trust event ${eventId} collides with different content`);
@@ -1317,9 +1756,17 @@ export class DeviceTrustManager {
       principal,
       deviceId: device.deviceId,
       keyId,
+      encryptionKeyId: encryption.encryptionKeyId,
       actor: { mode: "local-bootstrap" },
     };
-    return this.#repository.bootstrapDevice({ event, device, key });
+    const encryptionBinding = await deviceEncryptionBinding({
+      subjectKeyId: keyId,
+      deviceId: device.deviceId,
+      principal,
+      publicKeyJwk: encryption.publicKeyJwk,
+      boundAt: occurredAt,
+    });
+    return this.#repository.bootstrapDevice({ event, device, key, encryptionBinding });
   }
 
   async #issueChallenge(input: {
@@ -1328,6 +1775,7 @@ export class DeviceTrustManager {
     readonly deviceId: string;
     readonly displayName: string;
     readonly publicKeyJwk: JsonWebKey;
+    readonly encryptionPublicKeyJwk: JsonWebKey;
     readonly audience: string;
   }): Promise<DeviceTrustChallenge> {
     const createdAt = nowIso(this.#now);
@@ -1336,6 +1784,7 @@ export class DeviceTrustManager {
     ).toISOString();
     const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
     const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+    const encryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
     const challenge: DeviceTrustChallenge = normalizeDeviceTrustChallenge({
       challengeId: randomToken(this.#randomBytes, 18, "challenge id"),
       challenge: randomToken(this.#randomBytes, 32, "challenge value"),
@@ -1345,6 +1794,8 @@ export class DeviceTrustManager {
       displayName: input.displayName,
       publicKeyJwk,
       keyId,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
+      encryptionKeyId: encryption.encryptionKeyId,
       audience: input.audience,
       authorizedByDeviceId: input.authorization.device.deviceId,
       authorizedByKeyId: input.authorization.key.keyId,
@@ -1367,6 +1818,7 @@ export class DeviceTrustManager {
       deviceId: requiredString(input.deviceId, "deviceId"),
       displayName: requiredString(input.displayName, "displayName"),
       publicKeyJwk: input.publicKeyJwk,
+      encryptionPublicKeyJwk: input.encryptionPublicKeyJwk,
       audience: input.audience,
     });
   }
@@ -1379,6 +1831,7 @@ export class DeviceTrustManager {
       deviceId: authorization.device.deviceId,
       displayName: authorization.device.displayName,
       publicKeyJwk: input.publicKeyJwk,
+      encryptionPublicKeyJwk: input.encryptionPublicKeyJwk,
       audience: input.audience,
     });
   }
@@ -1448,9 +1901,26 @@ export class DeviceTrustManager {
       deviceId: device.deviceId,
       keyId: key.keyId,
       challengeId: challenge.challengeId,
+      ...(challenge.encryptionKeyId === undefined ? {} : { encryptionKeyId: challenge.encryptionKeyId }),
       actor: trustedActor(authorizer.device, authorizer.key),
     };
-    return this.#repository.enrollDevice({ event, challenge, device, key, now: occurredAt });
+    const encryptionBinding = challenge.encryptionPublicKeyJwk === undefined
+      ? undefined
+      : await deviceEncryptionBinding({
+        subjectKeyId: key.keyId,
+        deviceId: device.deviceId,
+        principal: challenge.principal,
+        publicKeyJwk: challenge.encryptionPublicKeyJwk,
+        boundAt: occurredAt,
+      });
+    return this.#repository.enrollDevice({
+      event,
+      challenge,
+      device,
+      key,
+      ...(encryptionBinding === undefined ? {} : { encryptionBinding }),
+      now: occurredAt,
+    });
   }
 
   async completeRotation(input: CompleteChallengeInput): Promise<DeviceTrustMutationResult> {
@@ -1493,6 +1963,7 @@ export class DeviceTrustManager {
       keyId: key.keyId,
       predecessorKeyId: authorizer.key.keyId,
       challengeId: challenge.challengeId,
+      ...(challenge.encryptionKeyId === undefined ? {} : { encryptionKeyId: challenge.encryptionKeyId }),
       actor: trustedActor(authorizer.device, authorizer.key),
     };
     return this.#repository.rotateKey({
@@ -1501,6 +1972,15 @@ export class DeviceTrustManager {
       deviceId: challenge.deviceId,
       predecessorKeyId: authorizer.key.keyId,
       key,
+      ...(challenge.encryptionPublicKeyJwk === undefined ? {} : {
+        encryptionBinding: await deviceEncryptionBinding({
+          subjectKeyId: key.keyId,
+          deviceId: challenge.deviceId,
+          principal: challenge.principal,
+          publicKeyJwk: challenge.encryptionPublicKeyJwk,
+          boundAt: occurredAt,
+        }),
+      }),
       now: occurredAt,
     });
   }
@@ -1579,6 +2059,137 @@ export class DeviceTrustManager {
     return this.#repository.revokeDevice({ event, deviceId: target.deviceId, now: occurredAt });
   }
 
+  async prepareEncryptionBinding(
+    input: PrepareEncryptionBindingInput,
+  ): Promise<EncryptionBindingProof> {
+    const eventId = requiredString(input.eventId, "eventId");
+    const audience = requiredString(input.audience, "encryption binding audience");
+    const authorization = await this.#activeAuthorization(input.authorizingKeyId);
+    const subject = await this.#activeEncryptionBindingSubject(
+      input.subjectKind,
+      input.subjectKeyId,
+    );
+    if (!principalMatches(subject.principal, authorization.device.principal)) {
+      throw new DeviceTrustAuthorizationError(
+        "encryption binding subject belongs to a different principal",
+      );
+    }
+    const encryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
+    const existingForSubject = await this.#repository.encryptionBindingForSubject(
+      subject.subjectKind,
+      subject.subjectKeyId,
+    );
+    if (
+      existingForSubject !== undefined
+      && existingForSubject.encryptionKeyId !== encryption.encryptionKeyId
+    ) {
+      throw new DeviceTrustConflictError("encryption binding subject already has a different key");
+    }
+    const existingForKey = await this.#repository.encryptionBinding(encryption.encryptionKeyId);
+    if (
+      existingForKey !== undefined
+      && (
+        existingForKey.subjectKind !== subject.subjectKind
+        || existingForKey.subjectKeyId !== subject.subjectKeyId
+      )
+    ) {
+      throw new DeviceTrustConflictError("encryption key is already bound to another trusted subject");
+    }
+    return normalizeEncryptionBindingProof({
+      schema: ENCRYPTION_BINDING_PROOF_SCHEMA,
+      eventId,
+      subjectKind: subject.subjectKind,
+      subjectKeyId: subject.subjectKeyId,
+      principal: subject.principal,
+      authorizingDeviceId: authorization.device.deviceId,
+      authorizingKeyId: authorization.key.keyId,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
+      encryptionKeyId: encryption.encryptionKeyId,
+      audience,
+      ...(subject.deviceId === undefined ? {} : { deviceId: subject.deviceId }),
+      ...(subject.recoveryGeneration === undefined
+        ? {}
+        : { recoveryGeneration: subject.recoveryGeneration }),
+    });
+  }
+
+  async bindEncryptionKey(
+    input: BindEncryptionKeyInput,
+  ): Promise<EncryptionBindingMutationResult> {
+    const eventId = requiredString(input.eventId, "eventId");
+    const subjectKeyId = requiredString(input.subjectKeyId, "encryption binding subjectKeyId");
+    const authorizingKeyId = requiredString(input.authorizingKeyId, "authorizingKeyId");
+    const audience = requiredString(input.audience, "encryption binding audience");
+    const encryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
+    const existing = await this.#repository.event(eventId);
+    if (existing !== undefined) {
+      if (
+        existing.type !== "bind-encryption-key"
+        || existing.actor.mode !== "trusted-device"
+        || existing.actor.keyId !== authorizingKeyId
+        || existing.subjectKind !== input.subjectKind
+        || existing.subjectKeyId !== subjectKeyId
+        || existing.encryptionKeyId !== encryption.encryptionKeyId
+        || existing.audience !== audience
+      ) {
+        throw new DeviceTrustConflictError(
+          `device trust event ${eventId} collides with different encryption binding content`,
+        );
+      }
+      const binding = await this.#repository.encryptionBinding(encryption.encryptionKeyId);
+      if (
+        binding === undefined
+        || binding.subjectKind !== input.subjectKind
+        || binding.subjectKeyId !== subjectKeyId
+        || canonicalJson(binding.publicKeyJwk) !== canonicalJson(encryption.publicKeyJwk)
+      ) {
+        throw new DeviceTrustConflictError(
+          "replayed encryption binding event has missing or mismatched materialized binding",
+        );
+      }
+      return { outcome: "replayed", event: existing, binding };
+    }
+
+    const proof = await this.prepareEncryptionBinding(input);
+    const subject = await this.#activeEncryptionBindingSubject(input.subjectKind, subjectKeyId);
+    if (!(await verifyEncryptionBindingProof(proof, subject.publicKeyJwk, input.subjectSignature))) {
+      throw new DeviceTrustProofError("encryption binding subject proof is invalid");
+    }
+    const occurredAt = nowIso(this.#now);
+    const binding = subject.subjectKind === "device-signing-key"
+      ? await deviceEncryptionBinding({
+        subjectKeyId: subject.subjectKeyId,
+        deviceId: subject.deviceId!,
+        principal: subject.principal,
+        publicKeyJwk: proof.encryptionPublicKeyJwk,
+        boundAt: occurredAt,
+      })
+      : await recoveryEncryptionBinding({
+        subjectKeyId: subject.subjectKeyId,
+        generation: subject.recoveryGeneration!,
+        principal: subject.principal,
+        publicKeyJwk: proof.encryptionPublicKeyJwk,
+        boundAt: occurredAt,
+      });
+    const authorization = await this.#activeAuthorization(proof.authorizingKeyId);
+    if (!principalMatches(authorization.device.principal, subject.principal)) {
+      throw new DeviceTrustAuthorizationError("encryption binding authorizer principal changed");
+    }
+    const event: BindEncryptionKeyEvent = {
+      eventId,
+      type: "bind-encryption-key",
+      occurredAt,
+      principal: subject.principal,
+      deviceId: authorization.device.deviceId,
+      actor: trustedActor(authorization.device, authorization.key),
+      subjectKind: subject.subjectKind,
+      subjectKeyId: subject.subjectKeyId,
+      encryptionKeyId: binding.encryptionKeyId,
+      audience,
+    };
+    return this.#repository.bindEncryptionKey({ event, binding });
+  }
+
   async prepareRecoveryCredential(
     input: PrepareRecoveryCredentialInput,
   ): Promise<RecoveryProvisioningProof> {
@@ -1587,6 +2198,7 @@ export class DeviceTrustManager {
     const audience = requiredString(input.audience, "recovery audience");
     const recoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
     const recoveryKeyId = await ed25519JwkThumbprintUri(recoveryPublicKeyJwk);
+    const recoveryEncryption = await encryptionKeyIdentity(input.encryptionPublicKeyJwk);
     const existing = await this.#repository.event(eventId);
     if (existing !== undefined) {
       if (
@@ -1594,6 +2206,7 @@ export class DeviceTrustManager {
         || existing.actor.mode !== "trusted-device"
         || existing.actor.keyId !== authorizingKeyId
         || existing.recoveryKeyId !== recoveryKeyId
+        || existing.encryptionKeyId !== recoveryEncryption.encryptionKeyId
         || existing.audience !== audience
       ) {
         throw new DeviceTrustConflictError(
@@ -1608,6 +2221,8 @@ export class DeviceTrustManager {
         authorizingKeyId: existing.actor.keyId,
         recoveryPublicKeyJwk,
         recoveryKeyId,
+        recoveryEncryptionPublicKeyJwk: recoveryEncryption.publicKeyJwk,
+        recoveryEncryptionKeyId: recoveryEncryption.encryptionKeyId,
         recoveryGeneration: existing.recoveryGeneration,
         audience,
       });
@@ -1623,6 +2238,8 @@ export class DeviceTrustManager {
       authorizingKeyId: authorization.key.keyId,
       recoveryPublicKeyJwk,
       recoveryKeyId,
+      recoveryEncryptionPublicKeyJwk: recoveryEncryption.publicKeyJwk,
+      recoveryEncryptionKeyId: recoveryEncryption.encryptionKeyId,
       recoveryGeneration: (current?.generation ?? 0) + 1,
       audience,
     });
@@ -1674,11 +2291,19 @@ export class DeviceTrustManager {
       actor: trustedActor(authorization.device, authorization.key),
       recoveryKeyId: proof.recoveryKeyId,
       recoveryGeneration: proof.recoveryGeneration,
+      encryptionKeyId: proof.recoveryEncryptionKeyId,
       audience: proof.audience,
     };
     return this.#repository.setRecoveryCredential({
       event,
       credential,
+      encryptionBinding: await recoveryEncryptionBinding({
+        subjectKeyId: credential.keyId,
+        generation: credential.generation,
+        principal: credential.principal,
+        publicKeyJwk: proof.recoveryEncryptionPublicKeyJwk,
+        boundAt: occurredAt,
+      }),
       ...(current === undefined ? {} : { previousRecoveryKeyId: current.keyId }),
       now: occurredAt,
     });
@@ -1698,6 +2323,13 @@ export class DeviceTrustManager {
     const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
     const nextRecoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.nextRecoveryPublicKeyJwk);
     const nextRecoveryKeyId = await ed25519JwkThumbprintUri(nextRecoveryPublicKeyJwk);
+    const deviceEncryption = await encryptionKeyIdentity(input.deviceEncryptionPublicKeyJwk);
+    const nextRecoveryEncryption = await encryptionKeyIdentity(input.nextRecoveryEncryptionPublicKeyJwk);
+    if (deviceEncryption.encryptionKeyId === nextRecoveryEncryption.encryptionKeyId) {
+      throw new DeviceTrustConflictError(
+        "recovery replacement device and next recovery encryption keys must be distinct",
+      );
+    }
     if (new Set([recoveryKeyId, keyId, nextRecoveryKeyId]).size !== 3) {
       throw new DeviceTrustConflictError("recovery requires distinct current, device and next recovery keys");
     }
@@ -1729,8 +2361,12 @@ export class DeviceTrustManager {
       displayName: requiredString(input.displayName, "recovery displayName"),
       publicKeyJwk,
       keyId,
+      deviceEncryptionPublicKeyJwk: deviceEncryption.publicKeyJwk,
+      deviceEncryptionKeyId: deviceEncryption.encryptionKeyId,
       nextRecoveryPublicKeyJwk,
       nextRecoveryKeyId,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecoveryEncryption.publicKeyJwk,
+      nextRecoveryEncryptionKeyId: nextRecoveryEncryption.encryptionKeyId,
       nextRecoveryGeneration: recoveryCredential.generation + 1,
       audience: requiredString(input.audience, "recovery audience"),
       createdAt,
@@ -1775,6 +2411,8 @@ export class DeviceTrustManager {
         || existing.recoveryGeneration !== challenge.recoveryGeneration
         || existing.nextRecoveryKeyId !== challenge.nextRecoveryKeyId
         || existing.nextRecoveryGeneration !== challenge.nextRecoveryGeneration
+        || existing.deviceEncryptionKeyId !== challenge.deviceEncryptionKeyId
+        || existing.nextRecoveryEncryptionKeyId !== challenge.nextRecoveryEncryptionKeyId
         || existing.audience !== challenge.audience
         || !principalMatches(existing.principal, challenge.principal)
       ) {
@@ -1845,6 +2483,12 @@ export class DeviceTrustManager {
       recoveryGeneration: challenge.recoveryGeneration,
       nextRecoveryKeyId: challenge.nextRecoveryKeyId,
       nextRecoveryGeneration: challenge.nextRecoveryGeneration,
+      ...(challenge.deviceEncryptionKeyId === undefined
+        ? {}
+        : { deviceEncryptionKeyId: challenge.deviceEncryptionKeyId }),
+      ...(challenge.nextRecoveryEncryptionKeyId === undefined
+        ? {}
+        : { nextRecoveryEncryptionKeyId: challenge.nextRecoveryEncryptionKeyId }),
       audience: challenge.audience,
       actor: recoveryActor(current),
     };
@@ -1854,9 +2498,28 @@ export class DeviceTrustManager {
       device,
       key,
       recoveryCredential,
+      ...(challenge.deviceEncryptionPublicKeyJwk === undefined ? {} : {
+        deviceEncryptionBinding: await deviceEncryptionBinding({
+          subjectKeyId: key.keyId,
+          deviceId: device.deviceId,
+          principal: device.principal,
+          publicKeyJwk: challenge.deviceEncryptionPublicKeyJwk,
+          boundAt: occurredAt,
+        }),
+      }),
+      ...(challenge.nextRecoveryEncryptionPublicKeyJwk === undefined ? {} : {
+        recoveryEncryptionBinding: await recoveryEncryptionBinding({
+          subjectKeyId: recoveryCredential.keyId,
+          generation: recoveryCredential.generation,
+          principal: recoveryCredential.principal,
+          publicKeyJwk: challenge.nextRecoveryEncryptionPublicKeyJwk,
+          boundAt: occurredAt,
+        }),
+      }),
       previousRecoveryKeyId: current.keyId,
       now: occurredAt,
     });
   }
 
 }
+export * from "./encryption-binding.js";

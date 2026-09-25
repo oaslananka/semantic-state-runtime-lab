@@ -17,7 +17,8 @@
     "@ssrl/storage-local-artifacts": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
     "@types/node": "26.6.2",
-    "@ssrl/storage-sqlite-device-trust": "workspace:*"
+    "@ssrl/storage-sqlite-device-trust": "workspace:*",
+    "@ssrl/e2e": "workspace:*"
   },
   "exports": {
     ".": {

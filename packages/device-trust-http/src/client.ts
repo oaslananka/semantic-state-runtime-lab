@@ -1,4 +1,5 @@
 import { canonicalJson } from "@ssrl/core";
+import { normalizeX25519PublicJwk } from "@ssrl/e2e";
 import {
   normalizeDeviceEnrollmentOffer,
   normalizeDeviceTrustEvent,
@@ -303,11 +304,25 @@ export class DeviceTrustHttpClient {
     ));
   }
 
-  async startRotation(publicKeyJwk: JsonWebKey): Promise<DeviceTrustChallenge> {
-    return challengeResult(await this.#trustedFetch(
+  async startRotation(
+    publicKeyJwk: JsonWebKey,
+    encryptionPublicKeyJwk: JsonWebKey,
+  ): Promise<DeviceTrustChallenge> {
+    const signingKey = normalizeEd25519PublicJwk(publicKeyJwk);
+    const encryptionKey = normalizeX25519PublicJwk(encryptionPublicKeyJwk);
+    const challenge = await challengeResult(await this.#trustedFetch(
       endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.startRotation),
-      jsonInit({ publicKeyJwk: normalizeEd25519PublicJwk(publicKeyJwk) }),
+      jsonInit({ publicKeyJwk: signingKey, encryptionPublicKeyJwk: encryptionKey }),
     ));
+    if (
+      canonicalJson(challenge.publicKeyJwk) !== canonicalJson(signingKey)
+      || canonicalJson(challenge.encryptionPublicKeyJwk) !== canonicalJson(encryptionKey)
+    ) {
+      throw new InvalidDeviceTrustHttpResponseError(
+        "Rotation challenge does not match the requested signing/encryption keys",
+      );
+    }
+    return challenge;
   }
 
   async completeRotation(input: {
@@ -324,13 +339,23 @@ export class DeviceTrustHttpClient {
   async prepareRecoveryCredential(
     eventId: string,
     publicKeyJwk: JsonWebKey,
+    encryptionPublicKeyJwk: JsonWebKey,
   ): Promise<RecoveryProvisioningProof> {
     const normalizedKey = normalizeEd25519PublicJwk(publicKeyJwk);
+    const normalizedEncryptionKey = normalizeX25519PublicJwk(encryptionPublicKeyJwk);
     const proof = await recoveryProvisioningResult(await this.#trustedFetch(
       endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential),
-      jsonInit({ eventId, publicKeyJwk: normalizedKey }),
+      jsonInit({
+        eventId,
+        publicKeyJwk: normalizedKey,
+        encryptionPublicKeyJwk: normalizedEncryptionKey,
+      }),
     ));
-    if (proof.eventId !== eventId || canonicalJson(proof.recoveryPublicKeyJwk) !== canonicalJson(normalizedKey)) {
+    if (
+      proof.eventId !== eventId
+      || canonicalJson(proof.recoveryPublicKeyJwk) !== canonicalJson(normalizedKey)
+      || canonicalJson(proof.recoveryEncryptionPublicKeyJwk) !== canonicalJson(normalizedEncryptionKey)
+    ) {
       throw new InvalidDeviceTrustHttpResponseError(
         "Recovery provisioning response does not match the requested event/key",
       );
@@ -341,14 +366,17 @@ export class DeviceTrustHttpClient {
   async commitRecoveryCredential(input: {
     readonly eventId: string;
     readonly publicKeyJwk: JsonWebKey;
+    readonly encryptionPublicKeyJwk: JsonWebKey;
     readonly signature: Uint8Array;
   }): Promise<RecoveryCredentialMutationResult> {
     const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const encryptionPublicKeyJwk = normalizeX25519PublicJwk(input.encryptionPublicKeyJwk);
     const result = await recoveryCredentialMutationResult(await this.#trustedFetch(
       endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.commitRecoveryCredential),
       jsonInit({
         eventId: input.eventId,
         publicKeyJwk,
+        encryptionPublicKeyJwk,
         signature: bytesToBase64Url(input.signature),
       }),
     ));
@@ -368,20 +396,40 @@ export class DeviceTrustHttpClient {
     readonly deviceId: string;
     readonly displayName: string;
     readonly publicKeyJwk: JsonWebKey;
+    readonly deviceEncryptionPublicKeyJwk: JsonWebKey;
     readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+    readonly nextRecoveryEncryptionPublicKeyJwk: JsonWebKey;
   }): Promise<DeviceRecoveryChallenge> {
     const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const deviceEncryptionPublicKeyJwk = normalizeX25519PublicJwk(
+      input.deviceEncryptionPublicKeyJwk,
+    );
     const nextRecoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.nextRecoveryPublicKeyJwk);
+    const nextRecoveryEncryptionPublicKeyJwk = normalizeX25519PublicJwk(
+      input.nextRecoveryEncryptionPublicKeyJwk,
+    );
     const challenge = await recoveryChallengeResult(await this.#candidateFetch(
       endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.startRecovery),
-      jsonInit({ ...input, publicKeyJwk, nextRecoveryPublicKeyJwk }),
+      jsonInit({
+        ...input,
+        publicKeyJwk,
+        deviceEncryptionPublicKeyJwk,
+        nextRecoveryPublicKeyJwk,
+        nextRecoveryEncryptionPublicKeyJwk,
+      }),
     ));
     if (
       challenge.recoveryKeyId !== input.recoveryKeyId
       || challenge.deviceId !== input.deviceId
       || challenge.displayName !== input.displayName
       || canonicalJson(challenge.publicKeyJwk) !== canonicalJson(publicKeyJwk)
+      || canonicalJson(challenge.deviceEncryptionPublicKeyJwk) !== canonicalJson(
+        deviceEncryptionPublicKeyJwk,
+      )
       || canonicalJson(challenge.nextRecoveryPublicKeyJwk) !== canonicalJson(nextRecoveryPublicKeyJwk)
+      || canonicalJson(challenge.nextRecoveryEncryptionPublicKeyJwk) !== canonicalJson(
+        nextRecoveryEncryptionPublicKeyJwk,
+      )
     ) {
       throw new InvalidDeviceTrustHttpResponseError(
         "Recovery challenge does not match the requested recovery/device keys",

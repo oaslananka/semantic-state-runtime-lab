@@ -5,7 +5,8 @@
   "type": "module",
   "dependencies": {
     "@ssrl/access": "workspace:*",
-    "@ssrl/core": "workspace:*"
+    "@ssrl/core": "workspace:*",
+    "@ssrl/e2e": "workspace:*"
   },
   "exports": {
     ".": {
