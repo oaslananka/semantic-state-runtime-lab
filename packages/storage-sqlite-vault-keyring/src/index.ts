@@ -8,7 +8,6 @@ import {
   type VaultEpochId,
 } from "@ssrl/e2e";
 import {
-  CorruptVaultKeyringError,
   VaultKeyringConflictError,
   authorizedVaultKeyringEventJson,
   deriveActiveVaultEpoch,

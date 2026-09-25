@@ -206,7 +206,7 @@ function recipientOrder(
 export async function normalizeVaultRecipientSnapshot(
   values: readonly TrustedEncryptionKeyBinding[],
 ): Promise<TrustedEncryptionKeyBinding[]> {
-  const normalized = await Promise.all(values.map(normalizeTrustedEncryptionKeyBinding));
+  const normalized = await Promise.all(values.map((value) => normalizeTrustedEncryptionKeyBinding(value)));
   const ids = new Set<string>();
   for (const binding of normalized) {
     if (ids.has(binding.encryptionKeyId)) {
@@ -276,7 +276,7 @@ export function vaultGrantsForRecipientInventory(
   grants: readonly HpkeEpochKeyGrant[],
   recipientKeyIds: readonly string[],
 ): HpkeEpochKeyGrant[] {
-  const normalized = grants.map(normalizeEpochKeyGrant);
+  const normalized = grants.map((grant) => normalizeEpochKeyGrant(grant));
   const byRecipient = new Map<string, HpkeEpochKeyGrant>();
   for (const grant of normalized) {
     if (byRecipient.has(grant.recipientKeyId)) {
@@ -301,7 +301,7 @@ function normalizeGrantSet(
   values: readonly HpkeEpochKeyGrant[],
   epochId: VaultEpochId,
 ): HpkeEpochKeyGrant[] {
-  const normalized = values.map(normalizeEpochKeyGrant).toSorted(grantsOrder);
+  const normalized = values.map((value) => normalizeEpochKeyGrant(value)).toSorted(grantsOrder);
   const ids = new Set<string>();
   for (const grant of normalized) {
     if (grant.epochId !== epochId) throw new TypeError("vault grant epochId disagrees with transition epoch");
@@ -311,6 +311,87 @@ function normalizeGrantSet(
     ids.add(grant.recipientKeyId);
   }
   return normalized;
+}
+
+function validateEpochOperation(
+  operationValue: VaultKeyringOperation,
+  epoch: VaultEpochRecord,
+): void {
+  if (operationValue === "bootstrap-epoch") {
+    if (epoch.predecessorEpochId !== undefined || epoch.reason !== "bootstrap") {
+      throw new TypeError("bootstrap epoch must have no predecessor and reason=bootstrap");
+    }
+    return;
+  }
+  if (
+    operationValue === "rotate-epoch"
+    && (epoch.predecessorEpochId === undefined || epoch.reason === "bootstrap")
+  ) {
+    throw new TypeError("rotated epoch requires predecessor and non-bootstrap reason");
+  }
+}
+
+async function normalizedIssuer(value: VaultKeyringTransition): Promise<{
+  readonly issuerPublicKeyJwk: Ed25519PublicJwk;
+  readonly issuerSigningKeyId: string;
+  readonly issuerDeviceId: string;
+}> {
+  const issuerPublicKeyJwk = normalizeEd25519PublicJwk(value.issuerPublicKeyJwk);
+  const issuerSigningKeyId = requiredString(value.issuerSigningKeyId, "vault issuer signingKeyId");
+  if (await ed25519JwkThumbprintUri(issuerPublicKeyJwk) !== issuerSigningKeyId) {
+    throw new TypeError("vault issuer signingKeyId does not match public JWK thumbprint");
+  }
+  return {
+    issuerPublicKeyJwk,
+    issuerSigningKeyId,
+    issuerDeviceId: requiredString(value.issuerDeviceId, "vault issuer deviceId"),
+  };
+}
+
+function validateRecipientPrincipals(
+  recipients: readonly TrustedEncryptionKeyBinding[],
+  principal: AccessPrincipal,
+): void {
+  if (recipients.some((recipient) => !samePrincipal(recipient.principal, principal))) {
+    throw new TypeError("vault recipient principal disagrees with transition principal");
+  }
+}
+
+function validateTransitionGrantInventory(input: {
+  readonly operation: VaultKeyringOperation;
+  readonly activeRecipientIds: readonly string[];
+  readonly addedIds: readonly string[];
+  readonly resultingIds: readonly string[];
+}): void {
+  const { operation: operationValue, activeRecipientIds, addedIds, resultingIds } = input;
+  if (addedIds.some((id) => !activeRecipientIds.includes(id))) {
+    throw new TypeError("vault grant recipient is not present in the signed active recipient snapshot");
+  }
+  const newEpoch = operationValue === "bootstrap-epoch" || operationValue === "rotate-epoch";
+  if (newEpoch && !idsEqual(addedIds, activeRecipientIds)) {
+    throw new TypeError("new vault epoch must grant exactly the signed active recipient snapshot");
+  }
+  if (addedIds.some((id) => !resultingIds.includes(id))) {
+    throw new TypeError("vault resulting recipient inventory omits a newly added grant");
+  }
+  if (activeRecipientIds.some((id) => !resultingIds.includes(id))) {
+    throw new TypeError("vault resulting recipient inventory omits an active trusted recipient");
+  }
+}
+
+function validateEpochCreator(
+  operationValue: VaultKeyringOperation,
+  epoch: VaultEpochRecord,
+  issuerDeviceId: string,
+  issuerSigningKeyId: string,
+): void {
+  if (operationValue === "extend-historical-grants") return;
+  if (
+    epoch.createdBySigningKeyId !== issuerSigningKeyId
+    || epoch.createdByDeviceId !== issuerDeviceId
+  ) {
+    throw new TypeError("new vault epoch creator must match transition issuer");
+  }
 }
 
 export async function normalizeVaultKeyringTransition(
@@ -325,57 +406,27 @@ export async function normalizeVaultKeyringTransition(
   if (!samePrincipal(principal, epoch.principal)) {
     throw new TypeError("vault keyring transition principal disagrees with epoch principal");
   }
-  if (normalizedOperation === "bootstrap-epoch") {
-    if (epoch.predecessorEpochId !== undefined || epoch.reason !== "bootstrap") {
-      throw new TypeError("bootstrap epoch must have no predecessor and reason=bootstrap");
-    }
-  } else if (normalizedOperation === "rotate-epoch") {
-    if (epoch.predecessorEpochId === undefined || epoch.reason === "bootstrap") {
-      throw new TypeError("rotated epoch requires predecessor and non-bootstrap reason");
-    }
-  }
-  const issuerPublicKeyJwk = normalizeEd25519PublicJwk(value.issuerPublicKeyJwk);
-  const issuerSigningKeyId = requiredString(value.issuerSigningKeyId, "vault issuer signingKeyId");
-  if (await ed25519JwkThumbprintUri(issuerPublicKeyJwk) !== issuerSigningKeyId) {
-    throw new TypeError("vault issuer signingKeyId does not match public JWK thumbprint");
-  }
+  validateEpochOperation(normalizedOperation, epoch);
+  const { issuerPublicKeyJwk, issuerSigningKeyId, issuerDeviceId } = await normalizedIssuer(value);
   const activeRecipients = await normalizeVaultRecipientSnapshot(value.activeRecipients);
-  for (const recipient of activeRecipients) {
-    if (!samePrincipal(recipient.principal, principal)) {
-      throw new TypeError("vault recipient principal disagrees with transition principal");
-    }
-  }
+  validateRecipientPrincipals(activeRecipients, principal);
   const grantsAdded = normalizeGrantSet(value.grantsAdded, epoch.epochId);
-  const activeRecipientIds = activeRecipients.map((recipient) => recipient.encryptionKeyId);
-  const addedIds = grantsAdded.map((grant) => grant.recipientKeyId);
-  if (addedIds.some((id) => !activeRecipientIds.includes(id))) {
-    throw new TypeError("vault grant recipient is not present in the signed active recipient snapshot");
-  }
-  if (
-    (normalizedOperation === "bootstrap-epoch" || normalizedOperation === "rotate-epoch")
-    && !idsEqual(addedIds, activeRecipientIds)
-  ) {
-    throw new TypeError("new vault epoch must grant exactly the signed active recipient snapshot");
-  }
   const resultingRecipientKeyIds = sortedUniqueIds(
     value.resultingRecipientKeyIds,
     "vault resulting recipient key id",
   );
-  if (addedIds.some((id) => !resultingRecipientKeyIds.includes(id))) {
-    throw new TypeError("vault resulting recipient inventory omits a newly added grant");
-  }
-  if (activeRecipientIds.some((id) => !resultingRecipientKeyIds.includes(id))) {
-    throw new TypeError("vault resulting recipient inventory omits an active trusted recipient");
-  }
-  const issuerDeviceId = requiredString(value.issuerDeviceId, "vault issuer deviceId");
-  if (
-    epoch.createdBySigningKeyId !== issuerSigningKeyId
-    || epoch.createdByDeviceId !== issuerDeviceId
-  ) {
-    if (normalizedOperation !== "extend-historical-grants") {
-      throw new TypeError("new vault epoch creator must match transition issuer");
-    }
-  }
+  validateTransitionGrantInventory({
+    operation: normalizedOperation,
+    activeRecipientIds: activeRecipients.map((recipient) => recipient.encryptionKeyId),
+    addedIds: grantsAdded.map((grant) => grant.recipientKeyId),
+    resultingIds: resultingRecipientKeyIds,
+  });
+  validateEpochCreator(
+    normalizedOperation,
+    epoch,
+    issuerDeviceId,
+    issuerSigningKeyId,
+  );
   return {
     schema: VAULT_KEYRING_TRANSITION_SCHEMA,
     eventId: requiredString(value.eventId, "vault keyring eventId"),
@@ -506,59 +557,116 @@ export function deriveVaultKeyringCommitState(input: {
   };
 }
 
+async function validateReplay(
+  event: AuthorizedVaultKeyringEvent,
+  existingEvent: AuthorizedVaultKeyringEvent | undefined,
+): Promise<boolean> {
+  if (existingEvent === undefined) return false;
+  if (
+    await authorizedVaultKeyringEventJson(existingEvent)
+    !== await authorizedVaultKeyringEventJson(event)
+  ) {
+    throw new VaultKeyringConflictError(
+      `vault keyring event ${event.transition.eventId} collides with different content`,
+    );
+  }
+  return true;
+}
+
+function validateStoredGrantInventory(
+  transition: VaultKeyringTransition,
+  existingGrants: readonly HpkeEpochKeyGrant[],
+): void {
+  const addedIds = transition.grantsAdded.map((grant) => grant.recipientKeyId);
+  const existingIds = existingGrants.map((grant) => grant.recipientKeyId);
+  if (new Set([...existingIds, ...addedIds]).size !== existingIds.length + addedIds.length) {
+    throw new VaultKeyringConflictError(
+      "vault keyring transition would replace an existing immutable grant",
+    );
+  }
+  const resultingIds = [...existingIds, ...addedIds]
+    .toSorted((left, right) => left.localeCompare(right));
+  if (!idsEqual(resultingIds, transition.resultingRecipientKeyIds)) {
+    throw new VaultKeyringConflictError(
+      "vault keyring resulting recipient inventory disagrees with stored grants",
+    );
+  }
+}
+
+function validateBootstrapCommit(
+  state: VaultKeyringCommitState,
+  existingGrants: readonly HpkeEpochKeyGrant[],
+): void {
+  if (
+    state.activeEpoch !== undefined
+    || state.existingEpoch !== undefined
+    || existingGrants.length > 0
+  ) {
+    throw new VaultKeyringConflictError("vault principal already has epoch state");
+  }
+}
+
+function validateRotationCommit(
+  transition: VaultKeyringTransition,
+  state: VaultKeyringCommitState,
+): void {
+  if (state.existingEpoch !== undefined) {
+    throw new VaultKeyringConflictError("vault epoch id already exists");
+  }
+  if (
+    state.activeEpoch === undefined
+    || transition.epoch.predecessorEpochId !== state.activeEpoch.epochId
+    || !samePrincipal(state.activeEpoch.principal, transition.principal)
+  ) {
+    throw new VaultKeyringConflictError("vault rotation predecessor is not the current active epoch");
+  }
+}
+
+function validateHistoricalExtensionCommit(
+  transition: VaultKeyringTransition,
+  state: VaultKeyringCommitState,
+): void {
+  if (
+    state.existingEpoch === undefined
+    || canonicalJson(normalizeVaultEpochRecord(state.existingEpoch)) !== canonicalJson(transition.epoch)
+  ) {
+    throw new VaultKeyringConflictError(
+      "historical grant extension epoch metadata disagrees with stored epoch",
+    );
+  }
+  if (transition.grantsAdded.length === 0) {
+    throw new VaultKeyringConflictError("historical grant extension adds no missing recipient grants");
+  }
+}
+
+function validateLifecycleCommit(
+  transition: VaultKeyringTransition,
+  state: VaultKeyringCommitState,
+  existingGrants: readonly HpkeEpochKeyGrant[],
+): void {
+  if (transition.operation === "bootstrap-epoch") {
+    validateBootstrapCommit(state, existingGrants);
+    return;
+  }
+  if (transition.operation === "rotate-epoch") {
+    validateRotationCommit(transition, state);
+    return;
+  }
+  validateHistoricalExtensionCommit(transition, state);
+}
+
 export async function validateVaultKeyringCommit(
   eventInput: AuthorizedVaultKeyringEvent,
   state: VaultKeyringCommitState,
 ): Promise<"inserted" | "replayed"> {
   const event = await normalizeAuthorizedVaultKeyringEvent(eventInput);
-  if (state.existingEvent !== undefined) {
-    if (
-      await authorizedVaultKeyringEventJson(state.existingEvent)
-      !== await authorizedVaultKeyringEventJson(event)
-    ) {
-      throw new VaultKeyringConflictError(
-        `vault keyring event ${event.transition.eventId} collides with different content`,
-      );
-    }
-    return "replayed";
-  }
+  if (await validateReplay(event, state.existingEvent)) return "replayed";
   const transition = event.transition;
-  const existingGrants = state.existingGrants.map(normalizeEpochKeyGrant).toSorted(grantsOrder);
-  const addedIds = transition.grantsAdded.map((grant) => grant.recipientKeyId);
-  const existingIds = existingGrants.map((grant) => grant.recipientKeyId);
-  if (new Set([...existingIds, ...addedIds]).size !== existingIds.length + addedIds.length) {
-    throw new VaultKeyringConflictError("vault keyring transition would replace an existing immutable grant");
-  }
-  const resultingIds = [...existingIds, ...addedIds].toSorted((left, right) => left.localeCompare(right));
-  if (!idsEqual(resultingIds, transition.resultingRecipientKeyIds)) {
-    throw new VaultKeyringConflictError("vault keyring resulting recipient inventory disagrees with stored grants");
-  }
-
-  if (transition.operation === "bootstrap-epoch") {
-    if (state.activeEpoch !== undefined || state.existingEpoch !== undefined || existingGrants.length > 0) {
-      throw new VaultKeyringConflictError("vault principal already has epoch state");
-    }
-  } else if (transition.operation === "rotate-epoch") {
-    if (state.existingEpoch !== undefined) throw new VaultKeyringConflictError("vault epoch id already exists");
-    if (
-      state.activeEpoch === undefined
-      || transition.epoch.predecessorEpochId !== state.activeEpoch.epochId
-      || !samePrincipal(state.activeEpoch.principal, transition.principal)
-    ) {
-      throw new VaultKeyringConflictError("vault rotation predecessor is not the current active epoch");
-    }
-  } else {
-    if (
-      state.existingEpoch === undefined
-      || canonicalJson(normalizeVaultEpochRecord(state.existingEpoch))
-        !== canonicalJson(transition.epoch)
-    ) {
-      throw new VaultKeyringConflictError("historical grant extension epoch metadata disagrees with stored epoch");
-    }
-    if (transition.grantsAdded.length === 0) {
-      throw new VaultKeyringConflictError("historical grant extension adds no missing recipient grants");
-    }
-  }
+  const existingGrants = state.existingGrants
+    .map((grant) => normalizeEpochKeyGrant(grant))
+    .toSorted(grantsOrder);
+  validateStoredGrantInventory(transition, existingGrants);
+  validateLifecycleCommit(transition, state, existingGrants);
   return "inserted";
 }
 

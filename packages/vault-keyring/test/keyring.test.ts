@@ -52,20 +52,29 @@ async function ed25519Identity(deviceId = "device-laptop") {
   return { device, key, privateKey: pair.privateKey };
 }
 
+async function recipientBase(
+  subjectKeyId: string,
+  keyPair: Awaited<ReturnType<typeof generateX25519KeyPair>>,
+) {
+  const encryption = await encryptionKeyIdentity(keyPair.publicKeyJwk);
+  return {
+    subjectKeyId,
+    principal,
+    encryptionKeyId: encryption.encryptionKeyId,
+    publicKeyJwk: encryption.publicKeyJwk,
+    boundAt: "2026-09-01T00:00:00Z",
+  } as const;
+}
+
 async function deviceRecipient(
   subjectKeyId: string,
   deviceId: string,
   keyPair: Awaited<ReturnType<typeof generateX25519KeyPair>>,
 ): Promise<TrustedEncryptionKeyBinding> {
-  const encryption = await encryptionKeyIdentity(keyPair.publicKeyJwk);
   return normalizeTrustedEncryptionKeyBinding({
+    ...(await recipientBase(subjectKeyId, keyPair)),
     subjectKind: "device-signing-key",
-    subjectKeyId,
     deviceId,
-    principal,
-    encryptionKeyId: encryption.encryptionKeyId,
-    publicKeyJwk: encryption.publicKeyJwk,
-    boundAt: "2026-09-01T00:00:00Z",
   });
 }
 
@@ -74,15 +83,10 @@ async function recoveryRecipient(
   generation: number,
   keyPair: Awaited<ReturnType<typeof generateX25519KeyPair>>,
 ): Promise<TrustedEncryptionKeyBinding> {
-  const encryption = await encryptionKeyIdentity(keyPair.publicKeyJwk);
   return normalizeTrustedEncryptionKeyBinding({
+    ...(await recipientBase(subjectKeyId, keyPair)),
     subjectKind: "recovery-credential",
-    subjectKeyId,
     recoveryGeneration: generation,
-    principal,
-    encryptionKeyId: encryption.encryptionKeyId,
-    publicKeyJwk: encryption.publicKeyJwk,
-    boundAt: "2026-09-01T00:00:00Z",
   });
 }
 
@@ -140,15 +144,59 @@ async function fixture() {
   return { authorizer, deviceX, recoveryX, trust, repository, manager };
 }
 
+type KeyringFixture = Awaited<ReturnType<typeof fixture>>;
+
+function mutationInput(f: KeyringFixture, eventId: string) {
+  return {
+    eventId,
+    authorizingKeyId: f.authorizer.key.keyId,
+    authorizingPrivateKey: f.authorizer.privateKey,
+    audience,
+  } as const;
+}
+
+async function bootstrapFixture(f: KeyringFixture, eventId: string) {
+  return f.manager.bootstrapEpoch(mutationInput(f, eventId));
+}
+
+async function addTrustedDeviceRecipient(f: KeyringFixture, deviceId: string) {
+  const signing = await ed25519Identity(deviceId);
+  const x25519 = await generateX25519KeyPair();
+  const binding = await deviceRecipient(signing.key.keyId, signing.device.deviceId, x25519);
+  f.trust.recipients = [...f.trust.recipients, binding];
+  f.trust.reads = 0;
+  return { signing, x25519, binding };
+}
+
+async function extendToNewDevice(
+  f: KeyringFixture,
+  epochId: Parameters<VaultKeyringManager["extendHistoricalGrants"]>[0]["epochId"],
+  eventId: string,
+  deviceId: string,
+) {
+  const added = await addTrustedDeviceRecipient(f, deviceId);
+  const result = await f.manager.extendHistoricalGrants({
+    ...mutationInput(f, eventId),
+    epochId,
+    sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
+  });
+  return { ...added, result };
+}
+
+async function expectBootstrapRecipientMutationRejected(
+  f: KeyringFixture,
+  eventId: string,
+): Promise<void> {
+  await expect(f.manager.bootstrapEpoch(mutationInput(f, eventId)))
+    .rejects.toBeInstanceOf(VaultKeyringConflictError);
+  expect(await f.repository.event(eventId)).toBeUndefined();
+  expect(await f.repository.activeEpoch(principal)).toBeUndefined();
+}
+
 describe("authenticated vault keyring", () => {
   it("bootstraps an epoch only to the exact active trusted recipient set", async () => {
     const f = await fixture();
-    const result = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-1",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const result = await bootstrapFixture(f, "vault-bootstrap-1");
 
     expect(result.outcome).toBe("inserted");
     expect(result.epochSecret).toBeDefined();
@@ -161,12 +209,7 @@ describe("authenticated vault keyring", () => {
 
   it("signs the exact randomized grants so grant substitution fails", async () => {
     const f = await fixture();
-    const result = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-tamper",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const result = await bootstrapFixture(f, "vault-bootstrap-tamper");
     const first = result.event.transition.grantsAdded[0]!;
     const tampered = {
       ...result.event,
@@ -184,12 +227,7 @@ describe("authenticated vault keyring", () => {
 
   it("replays the persisted grant bytes without regenerating HPKE ciphertext", async () => {
     const f = await fixture();
-    const input = {
-      eventId: "vault-bootstrap-replay",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    };
+    const input = mutationInput(f, "vault-bootstrap-replay");
     const first = await f.manager.bootstrapEpoch(input);
     const grantJson = await Promise.all(first.grants.map(epochKeyGrantJson));
     const replay = await f.manager.bootstrapEpoch(input);
@@ -206,14 +244,7 @@ describe("authenticated vault keyring", () => {
       f.trust.recipients = f.trust.recipients.slice(0, 1);
     };
 
-    await expect(f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-toctou",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    })).rejects.toBeInstanceOf(VaultKeyringConflictError);
-    expect(await f.repository.event("vault-bootstrap-toctou")).toBeUndefined();
-    expect(await f.repository.activeEpoch(principal)).toBeUndefined();
+    await expectBootstrapRecipientMutationRejected(f, "vault-bootstrap-toctou");
   });
 
   it("re-checks trusted recipients after signing and immediately before commit", async () => {
@@ -222,15 +253,8 @@ describe("authenticated vault keyring", () => {
       f.trust.recipients = f.trust.recipients.slice(0, 1);
     };
 
-    await expect(f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-post-sign-toctou",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    })).rejects.toBeInstanceOf(VaultKeyringConflictError);
+    await expectBootstrapRecipientMutationRejected(f, "vault-bootstrap-post-sign-toctou");
     expect(f.trust.reads).toBe(3);
-    expect(await f.repository.event("vault-bootstrap-post-sign-toctou")).toBeUndefined();
-    expect(await f.repository.activeEpoch(principal)).toBeUndefined();
   });
 
   it("rejects a signing private key that does not match the active trusted authorizer", async () => {
@@ -247,12 +271,7 @@ describe("authenticated vault keyring", () => {
 
   it("rotates for forward revocation while preserving historical grants", async () => {
     const f = await fixture();
-    const first = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-forward",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const first = await bootstrapFixture(f, "vault-bootstrap-forward");
     const oldRecoveryGrant = await f.repository.grant(
       first.epoch.epochId,
       f.trust.recipients[1]!.encryptionKeyId,
@@ -261,13 +280,7 @@ describe("authenticated vault keyring", () => {
 
     f.trust.recipients = [f.trust.recipients[0]!];
     f.trust.reads = 0;
-    const rotated = await f.manager.rotateEpoch({
-      eventId: "vault-rotate-forward",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      reason: "recipient-set-change",
-    });
+    const rotated = await f.manager.rotateEpoch({ ...mutationInput(f, "vault-rotate-forward"), reason: "recipient-set-change" });
 
     expect(rotated.epoch.predecessorEpochId).toBe(first.epoch.epochId);
     expect(rotated.grants.map((grant) => grant.recipientKeyId)).toEqual([
@@ -282,12 +295,7 @@ describe("authenticated vault keyring", () => {
   it("re-wraps a historical epoch to a newly trusted device without changing its payload envelope", async () => {
     const f = await fixture();
     f.trust.recipients = [f.trust.recipients[0]!];
-    const first = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-rewrap",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const first = await bootstrapFixture(f, "vault-bootstrap-rewrap");
     const plaintext = new TextEncoder().encode("historical personal state");
     const envelope = await encryptPayload({
       epochId: first.epoch.epochId,
@@ -298,23 +306,8 @@ describe("authenticated vault keyring", () => {
     });
     const envelopeBefore = JSON.stringify(envelope);
 
-    const replacementSigning = await ed25519Identity("device-phone");
-    const replacementX = await generateX25519KeyPair();
-    const replacementBinding = await deviceRecipient(
-      replacementSigning.key.keyId,
-      replacementSigning.device.deviceId,
-      replacementX,
-    );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementBinding];
-    f.trust.reads = 0;
-    const extended = await f.manager.extendHistoricalGrants({
-      eventId: "vault-extend-rewrap",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: first.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
+    const { x25519: replacementX, binding: replacementBinding, result: extended }
+      = await extendToNewDevice(f, first.epoch.epochId, "vault-extend-rewrap", "device-phone");
     const newGrant = extended.grants.find(
       (grant) => grant.recipientKeyId === replacementBinding.encryptionKeyId,
     );
@@ -328,32 +321,16 @@ describe("authenticated vault keyring", () => {
   it("replays the exact signed event inventory even after later grants were added", async () => {
     const f = await fixture();
     f.trust.recipients = [f.trust.recipients[0]!];
-    const input = {
-      eventId: "vault-bootstrap-inventory-replay",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    };
+    const input = mutationInput(f, "vault-bootstrap-inventory-replay");
     const first = await f.manager.bootstrapEpoch(input);
     const firstGrantJson = await Promise.all(first.grants.map(epochKeyGrantJson));
 
-    const replacementSigning = await ed25519Identity("device-inventory-replay");
-    const replacementX = await generateX25519KeyPair();
-    const replacementBinding = await deviceRecipient(
-      replacementSigning.key.keyId,
-      replacementSigning.device.deviceId,
-      replacementX,
+    await extendToNewDevice(
+      f,
+      first.epoch.epochId,
+      "vault-extend-inventory-replay",
+      "device-inventory-replay",
     );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementBinding];
-    f.trust.reads = 0;
-    await f.manager.extendHistoricalGrants({
-      eventId: "vault-extend-inventory-replay",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: first.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
     expect(await f.repository.grantsForEpoch(first.epoch.epochId)).toHaveLength(2);
 
     const replay = await f.manager.bootstrapEpoch(input);
@@ -365,29 +342,13 @@ describe("authenticated vault keyring", () => {
   it("rejects an extension transition whose resulting inventory omits an active recipient", async () => {
     const f = await fixture();
     f.trust.recipients = [f.trust.recipients[0]!];
-    const first = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-resulting-inventory",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
-    const replacementSigning = await ed25519Identity("device-resulting-inventory");
-    const replacementX = await generateX25519KeyPair();
-    const replacementBinding = await deviceRecipient(
-      replacementSigning.key.keyId,
-      replacementSigning.device.deviceId,
-      replacementX,
+    const first = await bootstrapFixture(f, "vault-bootstrap-resulting-inventory");
+    const { result: extended } = await extendToNewDevice(
+      f,
+      first.epoch.epochId,
+      "vault-extend-resulting-inventory",
+      "device-resulting-inventory",
     );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementBinding];
-    f.trust.reads = 0;
-    const extended = await f.manager.extendHistoricalGrants({
-      eventId: "vault-extend-resulting-inventory",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: first.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
     const originalRecipientId = f.trust.recipients[0]!.encryptionKeyId;
     const tampered = {
       ...extended.event.transition,
@@ -401,12 +362,7 @@ describe("authenticated vault keyring", () => {
 
   it("rejects historical re-wrap with a private key that has no existing grant", async () => {
     const f = await fixture();
-    const first = await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-wrong-rewrap",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const first = await bootstrapFixture(f, "vault-bootstrap-wrong-rewrap");
     const unknownX = await generateX25519KeyPair();
     const newX = await generateX25519KeyPair();
     const newSigning = await ed25519Identity("device-new");
@@ -429,25 +385,8 @@ describe("authenticated vault keyring", () => {
 
   it("rejects same event id with different rotation request content", async () => {
     const f = await fixture();
-    await f.manager.bootstrapEpoch({
-      eventId: "vault-bootstrap-collision",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
-    await f.manager.rotateEpoch({
-      eventId: "vault-rotate-collision",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      reason: "manual",
-    });
-    await expect(f.manager.rotateEpoch({
-      eventId: "vault-rotate-collision",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      reason: "recipient-set-change",
-    })).rejects.toBeInstanceOf(VaultKeyringConflictError);
+    await bootstrapFixture(f, "vault-bootstrap-collision");
+    await f.manager.rotateEpoch({ ...mutationInput(f, "vault-rotate-collision"), reason: "manual" });
+    await expect(f.manager.rotateEpoch({ ...mutationInput(f, "vault-rotate-collision"), reason: "recipient-set-change" })).rejects.toBeInstanceOf(VaultKeyringConflictError);
   });
 });

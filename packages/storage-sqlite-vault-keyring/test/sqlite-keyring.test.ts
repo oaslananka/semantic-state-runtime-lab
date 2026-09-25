@@ -54,26 +54,46 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function signingIdentity(deviceId = "device-laptop") {
-  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
-  const publicJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", pair.publicKey));
-  const privateJwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
-  const keyId = await ed25519JwkThumbprintUri(publicJwk);
-  const device: TrustedDevice = {
+function activeDevice(deviceId: string): TrustedDevice {
+  return {
     deviceId,
-    displayName: deviceId,
     principal,
+    displayName: `SQLite ${deviceId}`,
     enrolledAt: "2026-09-01T00:00:00.000Z",
     status: "active",
   };
-  const key: TrustedDeviceKey = {
-    keyId,
+}
+
+function activeSigningKey(
+  deviceId: string,
+  keyId: string,
+  publicKeyJwk: TrustedDeviceKey["publicKeyJwk"],
+): TrustedDeviceKey {
+  return {
     deviceId,
-    publicKeyJwk: publicJwk,
-    activatedAt: "2026-09-01T00:00:00.000Z",
+    keyId,
+    publicKeyJwk,
     status: "active",
+    activatedAt: "2026-09-01T00:00:00.000Z",
   };
-  return { device, key, privateKey: pair.privateKey, privateJwk };
+}
+
+async function signingIdentity(deviceId = "device-laptop") {
+  const pair = await crypto.subtle.generateKey(
+    { name: "Ed25519" },
+    true,
+    ["sign", "verify"],
+  ) as CryptoKeyPair;
+  const publicKeyJwk = normalizeEd25519PublicJwk(
+    await crypto.subtle.exportKey("jwk", pair.publicKey),
+  );
+  const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+  return {
+    device: activeDevice(deviceId),
+    key: activeSigningKey(deviceId, keyId, publicKeyJwk),
+    privateKey: pair.privateKey,
+    privateJwk: await crypto.subtle.exportKey("jwk", pair.privateKey),
+  };
 }
 
 async function recipient(
@@ -93,28 +113,40 @@ async function recipient(
   });
 }
 
-class MutableTrust {
-  recipients: TrustedEncryptionKeyBinding[];
-  readonly authorization: ActiveDeviceAuthorization;
-
-  constructor(
-    authorization: ActiveDeviceAuthorization,
-    recipients: TrustedEncryptionKeyBinding[],
-  ) {
-    this.authorization = authorization;
-    this.recipients = recipients;
-  }
-
-  readonly manager = {
-    activeAuthorization: async (keyId: string) => {
-      if (keyId !== this.authorization.key.keyId) throw new Error("inactive authorizer");
-      return this.authorization;
+function mutableTrust(
+  authorization: ActiveDeviceAuthorization,
+  initialRecipients: TrustedEncryptionKeyBinding[],
+) {
+  const state = { recipients: initialRecipients };
+  return {
+    get recipients() {
+      return state.recipients;
+    },
+    set recipients(value: TrustedEncryptionKeyBinding[]) {
+      state.recipients = value;
+    },
+    manager: {
+      activeAuthorization: async (keyId: string) => {
+        if (keyId !== authorization.key.keyId) throw new Error("inactive authorizer");
+        return authorization;
+      },
+    },
+    repository: {
+      activeEncryptionRecipients: async (_principal: AccessPrincipal) => state.recipients,
     },
   };
+}
 
-  readonly repository = {
-    activeEncryptionRecipients: async (_principal: AccessPrincipal) => this.recipients,
-  };
+function keyringManager(
+  repository: VaultKeyringRepository,
+  trust: ReturnType<typeof mutableTrust>,
+): VaultKeyringManager {
+  return new VaultKeyringManager({
+    repository,
+    deviceTrustManager: trust.manager,
+    deviceTrustRepository: trust.repository,
+    now: () => nowMs,
+  });
 }
 
 async function fixture(repository: VaultKeyringRepository) {
@@ -125,16 +157,11 @@ async function fixture(repository: VaultKeyringRepository) {
     authorizer.device.deviceId,
     deviceX,
   );
-  const trust = new MutableTrust(
+  const trust = mutableTrust(
     { device: authorizer.device, key: authorizer.key },
     [trustedRecipient],
   );
-  const manager = new VaultKeyringManager({
-    repository,
-    deviceTrustManager: trust.manager,
-    deviceTrustRepository: trust.repository,
-    now: () => nowMs,
-  });
+  const manager = keyringManager(repository, trust);
   return { authorizer, deviceX, trust, manager };
 }
 
@@ -150,6 +177,48 @@ async function bootstrap(
     audience,
   });
   return { ...f, result };
+}
+
+type SQLiteKeyringFixture = Awaited<ReturnType<typeof bootstrap>>;
+
+function authorizedMutation(f: SQLiteKeyringFixture, eventId: string) {
+  const { authorizer } = f;
+  return Object.freeze({
+    audience,
+    eventId,
+    authorizingPrivateKey: authorizer.privateKey,
+    authorizingKeyId: authorizer.key.keyId,
+  });
+}
+
+async function extendWithReplacement(
+  f: SQLiteKeyringFixture,
+  eventId: string,
+  deviceId: string,
+) {
+  const replacement = await generateX25519KeyPair();
+  const replacementRecipient = await recipient(
+    f.authorizer.key.keyId,
+    deviceId,
+    replacement,
+  );
+  f.trust.recipients = [f.trust.recipients[0]!, replacementRecipient];
+  const result = await f.manager.extendHistoricalGrants({
+    ...authorizedMutation(f, eventId),
+    epochId: f.result.epoch.epochId,
+    sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
+  });
+  return { replacement, replacementRecipient, result };
+}
+
+async function forkedRotation(
+  f: SQLiteKeyringFixture,
+  eventId: string,
+) {
+  const memory = new InMemoryVaultKeyringRepository();
+  await memory.commit(f.result.event);
+  const manager = keyringManager(memory, f.trust);
+  return manager.rotateEpoch({ ...authorizedMutation(f, eventId), reason: "manual" });
 }
 
 async function signEvent(
@@ -209,21 +278,11 @@ describe("SQLiteVaultKeyringRepository", () => {
     const path = await databasePath();
     const repository = new SQLiteVaultKeyringRepository({ path });
     const f = await bootstrap(repository, "secret-at-rest");
-    const replacement = await generateX25519KeyPair();
-    const replacementRecipient = await recipient(
-      f.authorizer.key.keyId,
+    const { replacement } = await extendWithReplacement(
+      f,
+      "secret-at-rest-extend",
       "device-replacement",
-      replacement,
     );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementRecipient];
-    await f.manager.extendHistoricalGrants({
-      eventId: "secret-at-rest-extend",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: f.result.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
     repository.close();
 
     const bytes = await readFile(path);
@@ -241,21 +300,11 @@ describe("SQLiteVaultKeyringRepository", () => {
     const f = await bootstrap(repository, "sqlite-exact-replay-bootstrap");
     const initialGrantJson = await Promise.all(f.result.grants.map(epochKeyGrantJson));
 
-    const replacement = await generateX25519KeyPair();
-    const replacementRecipient = await recipient(
-      f.authorizer.key.keyId,
+    await extendWithReplacement(
+      f,
+      "sqlite-exact-replay-extend",
       "device-replay-replacement",
-      replacement,
     );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementRecipient];
-    await f.manager.extendHistoricalGrants({
-      eventId: "sqlite-exact-replay-extend",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: f.result.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
     expect(await repository.grantsForEpoch(f.result.epoch.epochId)).toHaveLength(2);
 
     const directReplay = await repository.commit(f.result.event);
@@ -263,18 +312,10 @@ describe("SQLiteVaultKeyringRepository", () => {
     expect(await Promise.all(directReplay.grants.map(epochKeyGrantJson))).toEqual(initialGrantJson);
     expect(directReplay.grants).toHaveLength(1);
 
-    const replayManager = new VaultKeyringManager({
-      repository,
-      deviceTrustManager: f.trust.manager,
-      deviceTrustRepository: f.trust.repository,
-      now: () => nowMs,
-    });
-    const managerReplay = await replayManager.bootstrapEpoch({
-      eventId: "sqlite-exact-replay-bootstrap",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-    });
+    const replayManager = keyringManager(repository, f.trust);
+    const managerReplay = await replayManager.bootstrapEpoch(
+      authorizedMutation(f, "sqlite-exact-replay-bootstrap"),
+    );
     expect(await Promise.all(managerReplay.grants.map(epochKeyGrantJson))).toEqual(initialGrantJson);
     repository.close();
   });
@@ -319,21 +360,8 @@ describe("SQLiteVaultKeyringRepository", () => {
     });
     const envelopeBefore = JSON.stringify(envelope);
 
-    const replacement = await generateX25519KeyPair();
-    const replacementRecipient = await recipient(
-      f.authorizer.key.keyId,
-      "device-replacement",
-      replacement,
-    );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementRecipient];
-    const extended = await f.manager.extendHistoricalGrants({
-      eventId: "rewrap-extend",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: f.result.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
+    const { replacement, replacementRecipient, result: extended }
+      = await extendWithReplacement(f, "rewrap-extend", "device-replacement");
     expect(JSON.stringify(envelope)).toBe(envelopeBefore);
     repository.close();
 
@@ -353,26 +381,8 @@ describe("SQLiteVaultKeyringRepository", () => {
     const sqlite = new SQLiteVaultKeyringRepository({ path });
     const f = await bootstrap(sqlite, "fork-bootstrap");
 
-    async function forkEvent(eventId: string) {
-      const memory = new InMemoryVaultKeyringRepository();
-      await memory.commit(f.result.event);
-      const manager = new VaultKeyringManager({
-        repository: memory,
-        deviceTrustManager: f.trust.manager,
-        deviceTrustRepository: f.trust.repository,
-        now: () => nowMs,
-      });
-      return manager.rotateEpoch({
-        eventId,
-        authorizingKeyId: f.authorizer.key.keyId,
-        authorizingPrivateKey: f.authorizer.privateKey,
-        audience,
-        reason: "manual",
-      });
-    }
-
-    const firstFork = await forkEvent("fork-one");
-    const secondFork = await forkEvent("fork-two");
+    const firstFork = await forkedRotation(f, "fork-one");
+    const secondFork = await forkedRotation(f, "fork-two");
     expect(firstFork.epoch.predecessorEpochId).toBe(f.result.epoch.epochId);
     expect(secondFork.epoch.predecessorEpochId).toBe(f.result.epoch.epochId);
     await sqlite.commit(firstFork.event);
@@ -387,26 +397,8 @@ describe("SQLiteVaultKeyringRepository", () => {
     const sqlite = new SQLiteVaultKeyringRepository({ path });
     const f = await bootstrap(sqlite, "event-collision-bootstrap");
 
-    async function competingEvent() {
-      const memory = new InMemoryVaultKeyringRepository();
-      await memory.commit(f.result.event);
-      const manager = new VaultKeyringManager({
-        repository: memory,
-        deviceTrustManager: f.trust.manager,
-        deviceTrustRepository: f.trust.repository,
-        now: () => nowMs,
-      });
-      return manager.rotateEpoch({
-        eventId: "same-rotation-event",
-        authorizingKeyId: f.authorizer.key.keyId,
-        authorizingPrivateKey: f.authorizer.privateKey,
-        audience,
-        reason: "manual",
-      });
-    }
-
-    const first = await competingEvent();
-    const second = await competingEvent();
+    const first = await forkedRotation(f, "same-rotation-event");
+    const second = await forkedRotation(f, "same-rotation-event");
     expect(second.epoch.epochId).not.toBe(first.epoch.epochId);
     await sqlite.commit(first.event);
     await expect(sqlite.commit(second.event)).rejects.toBeInstanceOf(VaultKeyringConflictError);
@@ -420,21 +412,11 @@ describe("SQLiteVaultKeyringRepository", () => {
     const path = await databasePath();
     const repository = new SQLiteVaultKeyringRepository({ path });
     const f = await bootstrap(repository, "grant-collision-bootstrap");
-    const replacement = await generateX25519KeyPair();
-    const replacementRecipient = await recipient(
-      f.authorizer.key.keyId,
+    const { result: extended } = await extendWithReplacement(
+      f,
+      "grant-collision-extend",
       "device-replacement",
-      replacement,
     );
-    f.trust.recipients = [f.trust.recipients[0]!, replacementRecipient];
-    const extended = await f.manager.extendHistoricalGrants({
-      eventId: "grant-collision-extend",
-      authorizingKeyId: f.authorizer.key.keyId,
-      authorizingPrivateKey: f.authorizer.privateKey,
-      audience,
-      epochId: f.result.epoch.epochId,
-      sourceRecipientPrivateKeyJwk: f.deviceX.privateKeyJwk,
-    });
     const added = extended.event.transition.grantsAdded[0]!;
     const ciphertext = added.ciphertext.slice(0, -1)
       + (added.ciphertext.endsWith("A") ? "B" : "A");
