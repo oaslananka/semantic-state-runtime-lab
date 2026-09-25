@@ -12,6 +12,8 @@ export default defineConfig({
       "@ssrl/core": source("./packages/core/src/index.ts"),
       "@ssrl/device-trust": source("./packages/device-trust/src/index.ts"),
       "@ssrl/e2e": source("./packages/e2e/src/index.ts"),
+      "@ssrl/vault-keyring": source("./packages/vault-keyring/src/index.ts"),
+      "@ssrl/storage-sqlite-vault-keyring": source("./packages/storage-sqlite-vault-keyring/src/index.ts"),
       "@ssrl/device-trust-http": source("./packages/device-trust-http/src/index.ts"),
       "@ssrl/artifact-store": source("./packages/artifact-store/src/index.ts"),
       "@ssrl/artifact-access": source("./packages/artifact-access/src/index.ts"),

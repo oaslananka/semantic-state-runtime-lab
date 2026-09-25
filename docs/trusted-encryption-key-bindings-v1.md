@@ -279,12 +279,12 @@ This layer does not:
 
 The corresponding Ed25519 trusted subject signs the exact X25519 public JWK, preventing relay/authorizer key substitution. Supplying an unusable X25519 key is therefore a self-denial-of-service by that trusted subject in v1, not authorization of an attacker-controlled recipient key.
 
-## Next step
+## Downstream keyring
 
-The next trust/encryption layer should be a durable authenticated vault-epoch/grant keyring that uses only:
+`@ssrl/vault-keyring` now consumes exactly:
 
 ```text
 DeviceTrustRepository.activeEncryptionRecipients(principal)
 ```
 
-as its recipient source, with explicit rotation/re-wrapping behavior when device or recovery eligibility changes.
+as its recipient source, with signed rotation and historical re-wrapping behavior when device or recovery eligibility changes. See `docs/vault-keyring-v1.md`.

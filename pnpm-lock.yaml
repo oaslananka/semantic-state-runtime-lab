@@ -740,6 +740,47 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/storage-sqlite-vault-keyring:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+      '@ssrl/vault-keyring':
+        specifier: workspace:*
+        version: link:../vault-keyring
+    devDependencies:
+      '@ssrl/device-trust':
+        specifier: workspace:*
+        version: link:../device-trust
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/vault-keyring:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/device-trust':
+        specifier: workspace:*
+        version: link:../device-trust
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+    devDependencies:
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.2':
