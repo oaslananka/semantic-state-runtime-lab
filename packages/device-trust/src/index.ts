@@ -1246,7 +1246,7 @@ export class DeviceTrustManager {
     event: SetRecoveryCredentialEvent,
   ): Promise<RecoveryCredentialMutationResult> {
     const credential = await this.#repository.recoveryCredential(event.recoveryKeyId);
-    if (credential === undefined || credential.generation !== event.recoveryGeneration) {
+    if (credential?.generation !== event.recoveryGeneration) {
       throw new DeviceTrustConflictError("replayed recovery credential event has missing materialized state");
     }
     return { outcome: "replayed", event, credential };
@@ -1261,8 +1261,7 @@ export class DeviceTrustManager {
     if (
       device === undefined
       || key === undefined
-      || recoveryCredential === undefined
-      || recoveryCredential.generation !== event.nextRecoveryGeneration
+      || recoveryCredential?.generation !== event.nextRecoveryGeneration
     ) {
       throw new DeviceTrustConflictError("replayed trust recovery event has missing materialized state");
     }

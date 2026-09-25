@@ -7,7 +7,6 @@ import {
   deviceTrustChallengeJson,
   deviceRecoveryChallengeJson,
   deviceTrustEventJson,
-  normalizeDeviceRecoveryChallenge,
   normalizeDeviceTrustEvent,
   normalizeTrustedDevice,
   normalizeTrustedDeviceKey,
@@ -757,7 +756,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       FROM device_recovery_challenges
       WHERE challenge_id = ?
     `).get(challenge.challengeId) as RecoveryChallengeRow | undefined;
-    if (row === undefined || row.challenge_json !== challengeJson) {
+    if (row?.challenge_json !== challengeJson) {
       throw new DeviceTrustChallengeError("device recovery challenge does not match durable registry state");
     }
     if (row.consumed_at !== null) {
@@ -976,11 +975,10 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     this.#transaction(() => {
       const current = this.#recoveryCredentialRow(challenge.recoveryKeyId);
       if (
-        current === undefined
-        || current.status !== "active"
-        || Number(current.generation) !== challenge.recoveryGeneration
-        || current.principal_json !== JSON.stringify(challenge.principal)
-        || current.public_jwk_json !== JSON.stringify(challenge.recoveryPublicKeyJwk)
+        current?.status !== "active"
+        || Number(current?.generation) !== challenge.recoveryGeneration
+        || current?.principal_json !== JSON.stringify(challenge.principal)
+        || current?.public_jwk_json !== JSON.stringify(challenge.recoveryPublicKeyJwk)
       ) {
         throw new DeviceTrustAuthorizationError("recovery challenge authorizer is not active");
       }
