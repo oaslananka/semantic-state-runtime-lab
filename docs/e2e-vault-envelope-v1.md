@@ -315,3 +315,8 @@ The safe integration order is:
 4. integrate an untrusted relay/cloud transport and explicitly benchmark metadata leakage, payload overhead and recovery behavior.
 
 Skipping directly to encrypted HTTP bodies would create ciphertext without a trustworthy key-lifecycle protocol and would not solve the actual relay trust problem.
+
+
+## Recipient trust boundary
+
+The E2E package treats X25519 keys as cryptographic recipients, not trusted principals. Device/recovery authorization belongs to `@ssrl/device-trust`; durable trust binds exact X25519 public JWKs to active signing/recovery generations and exposes `activeEncryptionRecipients(principal)`. A future grant keyring should source recipients from that trust query rather than accepting arbitrary caller-supplied thumbprints. See `docs/trusted-encryption-key-bindings-v1.md`.

@@ -8,6 +8,7 @@ import {
   ed25519JwkThumbprintUri,
   normalizeEd25519PublicJwk,
 } from "@ssrl/device-trust";
+import { generateX25519KeyPair } from "@ssrl/e2e";
 import { SQLiteDeviceTrustStore } from "@ssrl/storage-sqlite-device-trust";
 import type { ArtifactDigest, ArtifactStore } from "@ssrl/artifact-store";
 import {
@@ -222,6 +223,7 @@ async function durableDeviceSignatureMaterial(
   if (keyIdOverride !== undefined && keyIdOverride !== keyId) {
     throw new Error("durable device key IDs are derived from public JWK material");
   }
+  const encryption = await generateX25519KeyPair();
   const store = new SQLiteDeviceTrustStore({ path: await tempPath("device-trust.sqlite") });
   const trust = new DeviceTrustManager({ repository: store, now: () => signatureNow });
   await trust.bootstrapLocal({
@@ -230,6 +232,7 @@ async function durableDeviceSignatureMaterial(
     displayName: "Durable HTTP Device",
     principal: devicePrincipal,
     publicKeyJwk,
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
   });
   return {
     store,

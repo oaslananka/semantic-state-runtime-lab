@@ -13,6 +13,7 @@ import {
   signEnrollmentChallengeForOffer,
   signRecoveryProvisioningProof,
 } from "@ssrl/device-trust";
+import { generateX25519KeyPair } from "@ssrl/e2e";
 import { startNodeFetchHttpServer } from "@ssrl/http-wire/node";
 import {
   HttpMessageSignatureAuthenticator,
@@ -50,7 +51,15 @@ async function keyPair() {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", pair.publicKey));
   const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
-  return { ...pair, publicKeyJwk, keyId };
+  const encryption = await generateX25519KeyPair();
+  return {
+    ...pair,
+    publicKeyJwk,
+    keyId,
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
+    encryptionPrivateKeyJwk: encryption.privateKeyJwk,
+    encryptionKeyId: encryption.keyId,
+  };
 }
 
 async function bootstrapped() {
@@ -65,6 +74,7 @@ async function bootstrapped() {
     displayName: "Alice Laptop",
     principal,
     publicKeyJwk: laptop.publicKeyJwk,
+    encryptionPublicKeyJwk: laptop.encryptionPublicKeyJwk,
   });
   return { path, store, manager, laptop, clock };
 }
@@ -124,6 +134,7 @@ async function phoneOffer() {
     deviceId: "device:phone",
     displayName: "Alice Phone",
     publicKeyJwk: phone.publicKeyJwk,
+    encryptionPublicKeyJwk: phone.encryptionPublicKeyJwk,
     audience,
   });
   return { phone, offer };
@@ -146,11 +157,16 @@ async function provisionRecoveryHttp(
   recovery: Awaited<ReturnType<typeof keyPair>>,
   eventId: string,
 ) {
-  const proof = await fixture.client.prepareRecoveryCredential(eventId, recovery.publicKeyJwk);
+  const proof = await fixture.client.prepareRecoveryCredential(
+    eventId,
+    recovery.publicKeyJwk,
+    recovery.encryptionPublicKeyJwk,
+  );
   const signature = await signRecoveryProvisioningProof(proof, recovery.privateKey);
   const result = await fixture.client.commitRecoveryCredential({
     eventId,
     publicKeyJwk: recovery.publicKeyJwk,
+    encryptionPublicKeyJwk: recovery.encryptionPublicKeyJwk,
     signature,
   });
   return { proof, signature, result };
@@ -170,7 +186,9 @@ async function recoveryAttemptHttp(
     deviceId,
     displayName,
     publicKeyJwk: replacement.publicKeyJwk,
+    deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
     nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
   });
   const [recoverySignature, deviceSignature, nextRecoverySignature] = await Promise.all([
     signDeviceRecoveryChallenge(challenge, recovery.privateKey),
@@ -244,6 +262,8 @@ describe("device trust management HTTP", () => {
     expect(enrolled.challenge.authorizedByDeviceId).toBe("device:laptop");
     expect(enrolled.challenge.authorizedByKeyId).toBe(fixture.laptop.keyId);
     expect(enrolled.challenge.audience).toBe(audience);
+    expect(enrolled.challenge.encryptionKeyId).toBe(enrolled.phone.encryptionKeyId);
+    expect(enrolled.challenge.encryptionPublicKeyJwk).toEqual(enrolled.phone.encryptionPublicKeyJwk);
     expect(deviceTrustChallengeJson(enrolled.challenge)).not.toContain('"d"');
 
     const resolved = await fixture.store.resolve(enrolled.phone.keyId);
@@ -421,7 +441,7 @@ describe("device trust management HTTP", () => {
     const fixture = await runningFixture();
     const enrolled = await enrollPhone(fixture);
     const next = await keyPair();
-    const rotation = await fixture.client.startRotation(next.publicKeyJwk);
+    const rotation = await fixture.client.startRotation(next.publicKeyJwk, next.encryptionPublicKeyJwk);
     const rotationSignature = await signDeviceTrustChallenge(rotation, next.privateKey);
     const rotated = await fixture.client.completeRotation({
       eventId: "rotate-laptop",
@@ -430,8 +450,14 @@ describe("device trust management HTTP", () => {
     });
     expect(rotated.outcome).toBe("inserted");
     expect(rotated.key?.predecessorKeyId).toBe(fixture.laptop.keyId);
+    expect(rotation.encryptionKeyId).toBe(next.encryptionKeyId);
+    expect(rotation.encryptionPublicKeyJwk).toEqual(next.encryptionPublicKeyJwk);
 
-    await expect(fixture.client.startRotation((await keyPair()).publicKeyJwk))
+    const rejectedRotation = await keyPair();
+    await expect(fixture.client.startRotation(
+      rejectedRotation.publicKeyJwk,
+      rejectedRotation.encryptionPublicKeyJwk,
+    ))
       .rejects.toMatchObject({ status: 401, code: "authentication-failed" });
 
     const currentClient = new DeviceTrustHttpClient({
@@ -487,6 +513,7 @@ describe("device trust management HTTP", () => {
       deviceId: "device:wrong-audience",
       displayName: "Wrong Audience",
       publicKeyJwk: phone.publicKeyJwk,
+      encryptionPublicKeyJwk: phone.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/another-registry",
     });
 
@@ -503,6 +530,7 @@ describe("device trust management HTTP", () => {
     const firstProof = await fixture.client.prepareRecoveryCredential(
       "http-set-recovery-1",
       recoveryOne.publicKeyJwk,
+      recoveryOne.encryptionPublicKeyJwk,
     );
     expect(firstProof).toEqual(expect.objectContaining({
       eventId: "http-set-recovery-1",
@@ -510,6 +538,8 @@ describe("device trust management HTTP", () => {
       authorizingDeviceId: "device:laptop",
       authorizingKeyId: fixture.laptop.keyId,
       recoveryKeyId: recoveryOne.keyId,
+      recoveryEncryptionKeyId: recoveryOne.encryptionKeyId,
+      recoveryEncryptionPublicKeyJwk: recoveryOne.encryptionPublicKeyJwk,
       recoveryGeneration: 1,
       audience,
     }));
@@ -517,6 +547,7 @@ describe("device trust management HTTP", () => {
     await expect(fixture.client.commitRecoveryCredential({
       eventId: "http-set-recovery-1",
       publicKeyJwk: recoveryOne.publicKeyJwk,
+      encryptionPublicKeyJwk: recoveryOne.encryptionPublicKeyJwk,
       signature: new Uint8Array(64),
     })).rejects.toMatchObject({ status: 401, code: "proof-failed" });
     expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
@@ -595,7 +626,9 @@ describe("device trust management HTTP", () => {
       deviceId,
       displayName: "Recovery Device",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     });
     const responses = await Promise.all([
       rawJsonPost(
@@ -638,7 +671,9 @@ describe("device trust management HTTP", () => {
       deviceId: "device:public-recovery",
       displayName: "Public Recovery",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     });
     expect(challenge.principal).toEqual({
       subject: "user:alice",
@@ -646,6 +681,12 @@ describe("device trust management HTTP", () => {
     });
     expect(challenge.audience).toBe(audience);
     expect(challenge.recoveryKeyId).toBe(recovery.keyId);
+    expect(challenge.deviceEncryptionKeyId).toBe(replacement.encryptionKeyId);
+    expect(challenge.deviceEncryptionPublicKeyJwk).toEqual(replacement.encryptionPublicKeyJwk);
+    expect(challenge.nextRecoveryEncryptionKeyId).toBe(nextRecovery.encryptionKeyId);
+    expect(challenge.nextRecoveryEncryptionPublicKeyJwk).toEqual(
+      nextRecovery.encryptionPublicKeyJwk,
+    );
 
     const recoverySignature = await signDeviceRecoveryChallenge(challenge, recovery.privateKey);
     const nextRecoverySignature = await signDeviceRecoveryChallenge(challenge, nextRecovery.privateKey);
@@ -690,6 +731,19 @@ describe("device trust management HTTP", () => {
     expect(await fixture.store.resolve(replacement.keyId)).toEqual(expect.objectContaining({
       deviceId: "device:recovery-replacement",
     }));
+    expect(await fixture.store.activeEncryptionRecipients(principal)).toEqual([
+      expect.objectContaining({
+        subjectKind: "device-signing-key",
+        subjectKeyId: replacement.keyId,
+        encryptionKeyId: replacement.encryptionKeyId,
+      }),
+      expect.objectContaining({
+        subjectKind: "recovery-credential",
+        subjectKeyId: nextRecovery.keyId,
+        encryptionKeyId: nextRecovery.encryptionKeyId,
+        recoveryGeneration: 2,
+      }),
+    ]);
 
     const replicationRequest = await capturedSignedRequest({
       url: new URL("http://replication.test/v1/replication/projection/open"),
@@ -750,7 +804,9 @@ describe("device trust management HTTP", () => {
       deviceId: "device:first-recovery",
       displayName: "First Recovery",
       publicKeyJwk: firstDevice.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: firstDevice.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: firstNextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: firstNextRecovery.encryptionPublicKeyJwk,
     });
 
     const substituted = new DeviceTrustHttpClient({
@@ -768,7 +824,9 @@ describe("device trust management HTTP", () => {
       deviceId: "device:second-recovery",
       displayName: "Second Recovery",
       publicKeyJwk: secondDevice.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: secondDevice.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: secondNextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: secondNextRecovery.encryptionPublicKeyJwk,
     })).rejects.toThrow(/does not match the requested recovery\/device keys/);
     await fixture.server.close();
     fixture.store.close();
@@ -781,17 +839,70 @@ describe("device trust management HTTP", () => {
     await expect(fixture.client.prepareRecoveryCredential(
       "private-recovery-key",
       privateRecovery,
+      recovery.encryptionPublicKeyJwk,
     )).rejects.toThrow();
 
-    const rawPrivate = await signedFetch(fixture.laptop.keyId, fixture.laptop.privateKey)(
+    const signed = signedFetch(fixture.laptop.keyId, fixture.laptop.privateKey);
+    const rawPrivate = await signed(
       new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ eventId: "private-over-wire", publicKeyJwk: privateRecovery }),
+        body: JSON.stringify({
+          eventId: "private-over-wire",
+          publicKeyJwk: privateRecovery,
+          encryptionPublicKeyJwk: recovery.encryptionPublicKeyJwk,
+        }),
       },
     );
     expect(rawPrivate.status).toBe(400);
+
+    const privateEncryption = await signed(
+      new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          eventId: "private-encryption-over-wire",
+          publicKeyJwk: recovery.publicKeyJwk,
+          encryptionPublicKeyJwk: recovery.encryptionPrivateKeyJwk,
+        }),
+      },
+    );
+    expect(privateEncryption.status).toBe(400);
+    expect(await privateEncryption.json()).toEqual(expect.objectContaining({ code: "invalid-request" }));
+
+    const wrongCurve = await signed(
+      new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          eventId: "wrong-encryption-curve",
+          publicKeyJwk: recovery.publicKeyJwk,
+          encryptionPublicKeyJwk: {
+            ...recovery.encryptionPublicKeyJwk,
+            crv: "Ed25519",
+          },
+        }),
+      },
+    );
+    expect(wrongCurve.status).toBe(400);
+    expect(await wrongCurve.json()).toEqual(expect.objectContaining({ code: "invalid-request" }));
+
+    const legacyPayload = await signed(
+      new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          eventId: "legacy-recovery-payload",
+          publicKeyJwk: recovery.publicKeyJwk,
+        }),
+      },
+    );
+    expect(legacyPayload.status).toBe(400);
+    expect(await legacyPayload.json()).toEqual(expect.objectContaining({ code: "invalid-request" }));
 
     const malformed = new DeviceTrustHttpClient({
       baseUrl: new URL("https://trust.test"),
@@ -808,7 +919,9 @@ describe("device trust management HTTP", () => {
       deviceId: "device:malformed-response",
       displayName: "Malformed",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     })).rejects.toBeInstanceOf(InvalidDeviceTrustHttpResponseError);
 
     const oversized = new DeviceTrustHttpClient({
@@ -827,7 +940,9 @@ describe("device trust management HTTP", () => {
       deviceId: "device:oversized-response",
       displayName: "Oversized",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     })).rejects.toBeInstanceOf(InvalidDeviceTrustHttpResponseError);
     await fixture.server.close();
     fixture.store.close();

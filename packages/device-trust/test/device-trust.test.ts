@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { generateX25519KeyPair } from "@ssrl/e2e";
 import {
   DeviceTrustChallengeError,
   DeviceTrustProofError,
@@ -46,16 +47,20 @@ describe("device trust cryptographic identity", () => {
   });
 
   it("creates a canonical key-bound enrollment offer and display-only fingerprint", async () => {
+    const encryption = await generateX25519KeyPair();
     const first = await createDeviceEnrollmentOffer({
       deviceId: "device:phone",
       displayName: "Alice Phone",
       publicKeyJwk: { ...rfc8037PublicJwk, kid: "ignored-metadata" } as unknown as JsonWebKey,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
       audience: "https://home.example/v1/device-trust",
     });
     const reordered = {
       audience: first.audience,
       keyId: first.keyId,
       publicKeyJwk: { x: first.publicKeyJwk.x, kty: "OKP", crv: "Ed25519" },
+      encryptionPublicKeyJwk: first.encryptionPublicKeyJwk,
+      encryptionKeyId: first.encryptionKeyId,
       displayName: first.displayName,
       deviceId: first.deviceId,
       schema: first.schema,
@@ -80,10 +85,12 @@ describe("device trust cryptographic identity", () => {
   it("signs enrollment only when the returned challenge matches the local offer", async () => {
     const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
     const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", keys.publicKey));
+    const encryption = await generateX25519KeyPair();
     const offer = await createDeviceEnrollmentOffer({
       deviceId: "device:phone",
       displayName: "Alice Phone",
       publicKeyJwk,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
       audience: "https://home.example/v1/device-trust",
     });
     const challenge: DeviceTrustChallenge = {
@@ -95,6 +102,8 @@ describe("device trust cryptographic identity", () => {
       displayName: offer.displayName,
       publicKeyJwk: offer.publicKeyJwk,
       keyId: offer.keyId,
+      encryptionPublicKeyJwk: offer.encryptionPublicKeyJwk,
+      encryptionKeyId: offer.encryptionKeyId,
       audience: offer.audience,
       authorizedByDeviceId: "device:laptop",
       authorizedByKeyId: "existing-key",
@@ -114,12 +123,23 @@ describe("device trust cryptographic identity", () => {
       offer,
       keys.privateKey,
     )).rejects.toBeInstanceOf(DeviceTrustChallengeError);
+    const substitutedEncryption = await generateX25519KeyPair();
+    await expect(signEnrollmentChallengeForOffer(
+      {
+        ...challenge,
+        encryptionPublicKeyJwk: substitutedEncryption.publicKeyJwk,
+        encryptionKeyId: substitutedEncryption.keyId,
+      },
+      offer,
+      keys.privateKey,
+    )).rejects.toBeInstanceOf(DeviceTrustChallengeError);
   });
 
   it("binds recovery provisioning PoP to principal, authorizer, generation and audience", async () => {
     const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
     const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", keys.publicKey));
     const recoveryKeyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+    const recoveryEncryption = await generateX25519KeyPair();
     const proof: RecoveryProvisioningProof = {
       schema: "ssrl-recovery-provisioning-proof-v1",
       eventId: "event-recovery-provision",
@@ -128,6 +148,8 @@ describe("device trust cryptographic identity", () => {
       authorizingKeyId: "trusted-key",
       recoveryPublicKeyJwk: publicKeyJwk,
       recoveryKeyId,
+      recoveryEncryptionPublicKeyJwk: recoveryEncryption.publicKeyJwk,
+      recoveryEncryptionKeyId: recoveryEncryption.keyId,
       recoveryGeneration: 1,
       audience: "ssrl://device-trust/recovery",
     };
@@ -140,6 +162,15 @@ describe("device trust cryptographic identity", () => {
     )).resolves.toBe(false);
     await expect(verifyRecoveryProvisioningProof(
       { ...proof, audience: "ssrl://other" },
+      signature,
+    )).resolves.toBe(false);
+    const otherEncryption = await generateX25519KeyPair();
+    await expect(verifyRecoveryProvisioningProof(
+      {
+        ...proof,
+        recoveryEncryptionPublicKeyJwk: otherEncryption.publicKeyJwk,
+        recoveryEncryptionKeyId: otherEncryption.keyId,
+      },
       signature,
     )).resolves.toBe(false);
   });

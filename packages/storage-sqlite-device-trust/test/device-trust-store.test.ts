@@ -13,9 +13,11 @@ import {
   normalizeEd25519PublicJwk,
   signDeviceRecoveryChallenge,
   signDeviceTrustChallenge,
+  signEncryptionBindingProof,
   signRecoveryProvisioningProof,
   type DeviceTrustRepository,
 } from "@ssrl/device-trust";
+import { generateX25519KeyPair } from "@ssrl/e2e";
 import { SQLiteDeviceTrustStore } from "../src/index.js";
 
 const roots: string[] = [];
@@ -34,7 +36,15 @@ afterEach(async () => {
 async function keyPair() {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
   const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", pair.publicKey));
-  return { ...pair, publicKeyJwk, keyId: await ed25519JwkThumbprintUri(publicKeyJwk) };
+  const encryption = await generateX25519KeyPair();
+  return {
+    ...pair,
+    publicKeyJwk,
+    keyId: await ed25519JwkThumbprintUri(publicKeyJwk),
+    encryptionPublicKeyJwk: encryption.publicKeyJwk,
+    encryptionPrivateKeyJwk: encryption.privateKeyJwk,
+    encryptionKeyId: encryption.keyId,
+  };
 }
 
 function manager(repository: DeviceTrustRepository, clock: { now: number }) {
@@ -52,6 +62,7 @@ async function bootstrapped(path: string) {
     displayName: "Alice Laptop",
     principal,
     publicKeyJwk: laptop.publicKeyJwk,
+    encryptionPublicKeyJwk: laptop.encryptionPublicKeyJwk,
   });
   return { clock, store, trust, laptop, result };
 }
@@ -77,6 +88,7 @@ async function enrollmentChallenge(
     deviceId,
     displayName,
     publicKeyJwk: keys.publicKeyJwk,
+    encryptionPublicKeyJwk: keys.encryptionPublicKeyJwk,
     audience: "ssrl://device-trust/local",
   });
 }
@@ -102,6 +114,7 @@ async function rotationChallenge(fixture: BootstrapFixture, keys: TestKeyPair) {
   return fixture.trust.startRotation({
     authorizingKeyId: fixture.laptop.keyId,
     publicKeyJwk: keys.publicKeyJwk,
+    encryptionPublicKeyJwk: keys.encryptionPublicKeyJwk,
     audience: "ssrl://device-trust/local",
   });
 }
@@ -117,6 +130,7 @@ async function provisionRecovery(
     eventId,
     authorizingKeyId,
     publicKeyJwk: recovery.publicKeyJwk,
+    encryptionPublicKeyJwk: recovery.encryptionPublicKeyJwk,
     audience: "ssrl://device-trust/recovery",
   } as const;
   const proof = await fixture.trust.prepareRecoveryCredential(input);
@@ -139,7 +153,9 @@ async function recoveryAttempt(
     deviceId,
     displayName,
     publicKeyJwk: replacement.publicKeyJwk,
+    deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
     nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     audience: "ssrl://device-trust/recovery",
   });
   const recoverySignature = await signDeviceRecoveryChallenge(challenge, recovery.privateKey);
@@ -192,14 +208,50 @@ async function expectRecoveryCredentialRejected(
   recoveryKeyId: string,
   deviceId: string,
 ): Promise<void> {
+  const replacement = await keyPair();
+  const nextRecovery = await keyPair();
   await expect(fixture.trust.startRecovery({
     recoveryKeyId,
     deviceId,
     displayName: "Rejected Recovery",
-    publicKeyJwk: (await keyPair()).publicKeyJwk,
-    nextRecoveryPublicKeyJwk: (await keyPair()).publicKeyJwk,
+    publicKeyJwk: replacement.publicKeyJwk,
+    deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
+    nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
     audience: "ssrl://device-trust/recovery",
   })).rejects.toBeInstanceOf(DeviceTrustAuthorizationError);
+}
+
+function downgradeToV2(path: string): void {
+  const raw = new DatabaseSync(path);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TABLE trusted_encryption_key_bindings;
+    DROP INDEX device_trust_events_device_time;
+    ALTER TABLE device_trust_events RENAME TO device_trust_events_v3;
+    CREATE TABLE device_trust_events (
+      event_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL CHECK(event_type IN (
+        'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device',
+        'set-recovery-credential', 'recover-trust-set'
+      )),
+      device_id TEXT NOT NULL,
+      key_id TEXT,
+      occurred_at TEXT NOT NULL,
+      event_json TEXT NOT NULL CHECK(json_valid(event_json))
+    ) STRICT;
+    INSERT INTO device_trust_events(event_id, event_type, device_id, key_id, occurred_at, event_json)
+    SELECT event_id, event_type, device_id, key_id, occurred_at, event_json
+    FROM device_trust_events_v3;
+    DROP TABLE device_trust_events_v3;
+    CREATE INDEX device_trust_events_device_time
+      ON device_trust_events(device_id, occurred_at, event_id);
+    UPDATE device_trust_meta
+    SET schema_version = 2
+    WHERE component = 'device-trust';
+    PRAGMA foreign_keys = ON;
+  `);
+  raw.close();
 }
 
 function downgradeToV1(path: string): void {
@@ -208,6 +260,7 @@ function downgradeToV1(path: string): void {
     PRAGMA foreign_keys = OFF;
     DROP TABLE device_recovery_challenges;
     DROP TABLE trusted_recovery_credentials;
+    DROP TABLE trusted_encryption_key_bindings;
     DROP INDEX device_trust_events_device_time;
     ALTER TABLE device_trust_events RENAME TO device_trust_events_v2;
     CREATE TABLE device_trust_events (
@@ -255,6 +308,7 @@ describe("SQLiteDeviceTrustStore", () => {
       displayName: "Second",
       principal,
       publicKeyJwk: second.publicKeyJwk,
+      encryptionPublicKeyJwk: second.encryptionPublicKeyJwk,
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     store.close();
   });
@@ -270,6 +324,7 @@ describe("SQLiteDeviceTrustStore", () => {
       displayName: "Alice Laptop",
       principal,
       publicKeyJwk: fixture.laptop.publicKeyJwk,
+      encryptionPublicKeyJwk: fixture.laptop.encryptionPublicKeyJwk,
     });
     expect(replay.outcome).toBe("replayed");
 
@@ -279,6 +334,7 @@ describe("SQLiteDeviceTrustStore", () => {
       displayName: "Renamed Laptop",
       principal,
       publicKeyJwk: fixture.laptop.publicKeyJwk,
+      encryptionPublicKeyJwk: fixture.laptop.encryptionPublicKeyJwk,
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     fixture.store.close();
   });
@@ -355,6 +411,7 @@ describe("SQLiteDeviceTrustStore", () => {
       deviceId: "device:phone",
       displayName: "Alice Phone",
       publicKeyJwk: phone.publicKeyJwk,
+      encryptionPublicKeyJwk: phone.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/local",
       principal: { subject: "user:bob", scopes: ["replication"] },
     };
@@ -491,6 +548,44 @@ describe("SQLiteDeviceTrustStore", () => {
     reopened.close();
   });
 
+  it("keeps historical encryption bindings but changes active recipients across rotation and revocation", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    expect(await fixture.store.activeEncryptionRecipients(principal)).toEqual([
+      expect.objectContaining({
+        subjectKind: "device-signing-key",
+        subjectKeyId: fixture.laptop.keyId,
+        encryptionKeyId: fixture.laptop.encryptionKeyId,
+      }),
+    ]);
+
+    const next = await keyPair();
+    const challenge = await rotationChallenge(fixture, next);
+    await fixture.trust.completeRotation({
+      eventId: "rotate-encryption-recipient",
+      challengeId: challenge.challengeId,
+      signature: await signDeviceTrustChallenge(challenge, next.privateKey),
+    });
+
+    expect(await fixture.store.encryptionBinding(fixture.laptop.encryptionKeyId)).toBeDefined();
+    expect(await fixture.store.encryptionBinding(next.encryptionKeyId)).toBeDefined();
+    expect(await fixture.store.activeEncryptionRecipients(principal)).toEqual([
+      expect.objectContaining({
+        subjectKeyId: next.keyId,
+        encryptionKeyId: next.encryptionKeyId,
+      }),
+    ]);
+
+    await fixture.trust.revokeDevice({
+      eventId: "revoke-encryption-recipient-device",
+      authorizingKeyId: next.keyId,
+      targetDeviceId: "device:laptop",
+    });
+    expect(await fixture.store.activeEncryptionRecipients(principal)).toEqual([]);
+    expect(await fixture.store.encryptionBinding(next.encryptionKeyId)).toBeDefined();
+    fixture.store.close();
+  });
+
   it("revokes a device and every active key remains unusable after restart", async () => {
     const path = await databasePath();
     const fixture = await bootstrapped(path);
@@ -513,6 +608,7 @@ describe("SQLiteDeviceTrustStore", () => {
     await expect(fixture.trust.startRotation({
       authorizingKeyId: next.keyId,
       publicKeyJwk: (await keyPair()).publicKeyJwk,
+      encryptionPublicKeyJwk: (await keyPair()).encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/local",
     })).rejects.toThrow(/not active/);
     fixture.store.close();
@@ -540,6 +636,7 @@ describe("SQLiteDeviceTrustStore", () => {
       deviceId: "device:replacement-phone",
       displayName: "Replacement Phone",
       publicKeyJwk: phone.publicKeyJwk,
+      encryptionPublicKeyJwk: phone.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/local",
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     fixture.store.close();
@@ -626,6 +723,7 @@ describe("SQLiteDeviceTrustStore", () => {
       eventId: "set-recovery-invalid",
       authorizingKeyId: fixture.laptop.keyId,
       publicKeyJwk: recovery.publicKeyJwk,
+      encryptionPublicKeyJwk: recovery.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/recovery",
     } as const;
     const proof = await fixture.trust.prepareRecoveryCredential(input);
@@ -640,6 +738,7 @@ describe("SQLiteDeviceTrustStore", () => {
       eventId: "set-recovery-reused-device-key",
       authorizingKeyId: fixture.laptop.keyId,
       publicKeyJwk: fixture.laptop.publicKeyJwk,
+      encryptionPublicKeyJwk: fixture.laptop.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/recovery",
     } as const;
     const reusedProof = await fixture.trust.prepareRecoveryCredential(reusedInput);
@@ -648,6 +747,29 @@ describe("SQLiteDeviceTrustStore", () => {
       signature: await signRecoveryProvisioningProof(reusedProof, fixture.laptop.privateKey),
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
+    fixture.store.close();
+  });
+
+  it("rejects reuse of one X25519 encryption key across device and recovery subjects", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recovery = await keyPair();
+    const input = {
+      eventId: "set-recovery-reused-encryption-key",
+      authorizingKeyId: fixture.laptop.keyId,
+      publicKeyJwk: recovery.publicKeyJwk,
+      encryptionPublicKeyJwk: fixture.laptop.encryptionPublicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+    } as const;
+    const proof = await fixture.trust.prepareRecoveryCredential(input);
+    const signature = await signRecoveryProvisioningProof(proof, recovery.privateKey);
+
+    await expect(fixture.trust.setRecoveryCredential({ ...input, signature }))
+      .rejects.toBeInstanceOf(DeviceTrustConflictError);
+    expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
+    expect(await fixture.store.encryptionBinding(fixture.laptop.encryptionKeyId)).toEqual(
+      expect.objectContaining({ subjectKeyId: fixture.laptop.keyId }),
+    );
     fixture.store.close();
   });
 
@@ -663,7 +785,9 @@ describe("SQLiteDeviceTrustStore", () => {
       deviceId: "device:derived-principal",
       displayName: "Derived Principal Device",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: nextRecovery.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/recovery",
       principal: { subject: "user:mallory", scopes: ["replication"] },
     };
@@ -678,7 +802,9 @@ describe("SQLiteDeviceTrustStore", () => {
       deviceId: "device:reused-recovery-key",
       displayName: "Reused Key Device",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: recovery.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: recovery.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/recovery",
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     await expect(fixture.trust.startRecovery({
@@ -686,7 +812,9 @@ describe("SQLiteDeviceTrustStore", () => {
       deviceId: "device:same-device-next-key",
       displayName: "Same Role Key Device",
       publicKeyJwk: replacement.publicKeyJwk,
+      deviceEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       nextRecoveryPublicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryEncryptionPublicKeyJwk: replacement.encryptionPublicKeyJwk,
       audience: "ssrl://device-trust/recovery",
     })).rejects.toBeInstanceOf(DeviceTrustConflictError);
     fixture.store.close();
@@ -817,6 +945,126 @@ describe("SQLiteDeviceTrustStore", () => {
     reopened.close();
   });
 
+  it("fails closed when encryption binding indexed columns disagree with canonical record JSON", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const encryptionKeyId = fixture.laptop.encryptionKeyId;
+    fixture.store.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare(`
+      UPDATE trusted_encryption_key_bindings
+      SET subject_key_id = ?
+      WHERE encryption_key_id = ?
+    `).run("corrupt-subject-key", encryptionKeyId);
+    raw.close();
+
+    const reopened = new SQLiteDeviceTrustStore({ path });
+    await expect(reopened.encryptionBinding(encryptionKeyId)).rejects
+      .toThrow(/encryption binding/i);
+    reopened.close();
+  });
+
+  it("migrates v2 with zero synthetic bindings and lets a legacy active device bind exactly one X25519 key", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    fixture.store.close();
+    downgradeToV2(path);
+
+    const migrated = new SQLiteDeviceTrustStore({ path });
+    const trust = manager(migrated, fixture.clock);
+    expect(await migrated.activeEncryptionRecipients(principal)).toEqual([]);
+    expect(await migrated.encryptionBindingForSubject(
+      "device-signing-key",
+      fixture.laptop.keyId,
+    )).toBeUndefined();
+
+    const encryption = await generateX25519KeyPair();
+    const input = {
+      eventId: "bind-legacy-laptop-encryption",
+      authorizingKeyId: fixture.laptop.keyId,
+      subjectKind: "device-signing-key",
+      subjectKeyId: fixture.laptop.keyId,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
+      audience: "ssrl://device-trust/encryption-binding",
+    } as const;
+    const proof = await trust.prepareEncryptionBinding(input);
+    const subjectSignature = await signEncryptionBindingProof(proof, fixture.laptop.privateKey);
+    const inserted = await trust.bindEncryptionKey({ ...input, subjectSignature });
+
+    expect(inserted.outcome).toBe("inserted");
+    expect(inserted.binding).toEqual(expect.objectContaining({
+      subjectKind: "device-signing-key",
+      subjectKeyId: fixture.laptop.keyId,
+      encryptionKeyId: encryption.keyId,
+      deviceId: "device:laptop",
+    }));
+    expect(await migrated.activeEncryptionRecipients(principal)).toEqual([
+      expect.objectContaining({ encryptionKeyId: encryption.keyId }),
+    ]);
+
+    const replay = await trust.bindEncryptionKey({ ...input, subjectSignature });
+    expect(replay.outcome).toBe("replayed");
+    const otherEncryption = await generateX25519KeyPair();
+    await expect(trust.prepareEncryptionBinding({
+      ...input,
+      eventId: "bind-legacy-laptop-encryption-2",
+      encryptionPublicKeyJwk: otherEncryption.publicKeyJwk,
+    })).rejects.toBeInstanceOf(DeviceTrustConflictError);
+    migrated.close();
+
+    const reopened = new SQLiteDeviceTrustStore({ path });
+    expect(await reopened.encryptionBinding(encryption.keyId)).toEqual(inserted.binding);
+    expect(await reopened.activeEncryptionRecipients(principal)).toHaveLength(1);
+    const raw = await readFile(path);
+    expect(raw.toString("utf8")).not.toContain(encryption.privateKeyJwk.d!);
+    reopened.close();
+  });
+
+  it("binds a migrated recovery credential by recovery-key proof and drops eligibility when retired", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recovery = await keyPair();
+    await provisionRecovery(fixture, recovery, "set-recovery-before-v2-migration");
+    fixture.store.close();
+    downgradeToV2(path);
+
+    const migrated = new SQLiteDeviceTrustStore({ path });
+    const trust = manager(migrated, fixture.clock);
+    expect(await migrated.activeEncryptionRecipients(principal)).toEqual([]);
+    const encryption = await generateX25519KeyPair();
+    const input = {
+      eventId: "bind-legacy-recovery-encryption",
+      authorizingKeyId: fixture.laptop.keyId,
+      subjectKind: "recovery-credential",
+      subjectKeyId: recovery.keyId,
+      encryptionPublicKeyJwk: encryption.publicKeyJwk,
+      audience: "ssrl://device-trust/encryption-binding",
+    } as const;
+    const proof = await trust.prepareEncryptionBinding(input);
+    const subjectSignature = await signEncryptionBindingProof(proof, recovery.privateKey);
+    await trust.bindEncryptionKey({ ...input, subjectSignature });
+    expect(await migrated.activeEncryptionRecipients(principal)).toEqual([
+      expect.objectContaining({
+        subjectKind: "recovery-credential",
+        subjectKeyId: recovery.keyId,
+        recoveryGeneration: 1,
+      }),
+    ]);
+
+    const nextRecovery = await keyPair();
+    await provisionRecovery(
+      { ...fixture, store: migrated, trust },
+      nextRecovery,
+      "set-recovery-after-legacy-binding",
+    );
+    const active = await migrated.activeEncryptionRecipients(principal);
+    expect(active.some((recipient) => recipient.subjectKeyId === recovery.keyId)).toBe(false);
+    expect(active.some((recipient) => recipient.subjectKeyId === nextRecovery.keyId)).toBe(true);
+    expect(await migrated.encryptionBinding(encryption.keyId)).toBeDefined();
+    migrated.close();
+  });
+
   it("migrates a v1 registry without losing device, challenge or replay state", async () => {
     const path = await databasePath();
     const fixture = await bootstrapped(path);
@@ -843,7 +1091,7 @@ describe("SQLiteDeviceTrustStore", () => {
     const raw = new DatabaseSync(path);
     expect(raw.prepare(`
       SELECT schema_version FROM device_trust_meta WHERE component = 'device-trust'
-    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    `).get()).toEqual(expect.objectContaining({ schema_version: 3 }));
     raw.close();
   });
 

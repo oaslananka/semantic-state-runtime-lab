@@ -341,3 +341,8 @@ The signed management transport and key-bound enrollment offer are documented in
 Owner-controlled destructive recovery is documented in `docs/owner-trust-recovery-v1.md`.
 
 Its anti-enumeration HTTP transport is documented in `docs/device-trust-recovery-http-v1.md`.
+
+
+## X25519 recipient bindings
+
+Trusted Ed25519 signing/recovery generations may now carry immutable X25519 recipient bindings. Binding eligibility inherits the device/signing-key or recovery-generation lifecycle; a thumbprint alone is never authorization. See `docs/trusted-encryption-key-bindings-v1.md` for canonical proof, migration, persistence, and active-recipient semantics.

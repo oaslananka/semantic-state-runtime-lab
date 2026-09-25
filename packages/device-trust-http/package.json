@@ -7,7 +7,8 @@
     "@ssrl/access": "workspace:*",
     "@ssrl/core": "workspace:*",
     "@ssrl/device-trust": "workspace:*",
-    "@ssrl/http-wire": "workspace:*"
+    "@ssrl/http-wire": "workspace:*",
+    "@ssrl/e2e": "workspace:*"
   },
   "devDependencies": {
     "@ssrl/replication-http": "workspace:*",

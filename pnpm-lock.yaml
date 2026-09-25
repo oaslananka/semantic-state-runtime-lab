@@ -304,6 +304,9 @@ importers:
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
 
   packages/device-trust-http:
     dependencies:
@@ -316,6 +319,9 @@ importers:
       '@ssrl/device-trust':
         specifier: workspace:*
         version: link:../device-trust
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
       '@ssrl/http-wire':
         specifier: workspace:*
         version: link:../http-wire
@@ -611,6 +617,9 @@ importers:
         specifier: workspace:*
         version: link:../state-store
     devDependencies:
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
       '@ssrl/storage-local-artifacts':
         specifier: workspace:*
         version: link:../storage-local-artifacts
@@ -724,6 +733,9 @@ importers:
         specifier: workspace:*
         version: link:../device-trust
     devDependencies:
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2

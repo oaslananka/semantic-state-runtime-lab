@@ -10,18 +10,23 @@ import {
   normalizeDeviceTrustEvent,
   normalizeTrustedDevice,
   normalizeTrustedDeviceKey,
+  normalizeTrustedEncryptionKeyBinding,
   normalizeTrustedRecoveryCredential,
   trustedDeviceJson,
   trustedDeviceKeyJson,
+  trustedEncryptionKeyBindingJson,
   trustedRecoveryCredentialJson,
   validateDeviceRecoveryChallengeKeyIds,
   validateDeviceTrustChallengeKeyId,
+  type BindEncryptionKeyTransition,
   type BootstrapDeviceTransition,
   type DeviceRecoveryChallenge,
   type DeviceTrustChallenge,
   type DeviceTrustEvent,
   type DeviceTrustMutationResult,
   type DeviceTrustRepository,
+  type EncryptionBindingMutationResult,
+  type EncryptionBindingSubjectKind,
   type EnrollDeviceTransition,
   type ReplicationDeviceCredential,
   type ReplicationSignatureReplayInput,
@@ -36,11 +41,12 @@ import {
   type StoredDeviceTrustChallenge,
   type TrustedDevice,
   type TrustedDeviceKey,
+  type TrustedEncryptionKeyBinding,
   type TrustedRecoveryCredential,
 } from "@ssrl/device-trust";
 
 const COMPONENT = "device-trust";
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export interface SQLiteDeviceTrustStoreOptions {
   readonly path: string;
@@ -70,6 +76,18 @@ interface KeyRow {
   readonly status: string;
   readonly revoked_at: string | null;
   readonly predecessor_key_id: string | null;
+  readonly record_json: string;
+}
+
+interface EncryptionBindingRow {
+  readonly encryption_key_id: string;
+  readonly subject_kind: string;
+  readonly subject_key_id: string;
+  readonly principal_json: string;
+  readonly device_id: string | null;
+  readonly recovery_generation: number | bigint | null;
+  readonly public_jwk_json: string;
+  readonly bound_at: string;
   readonly record_json: string;
 }
 
@@ -163,7 +181,8 @@ function parsedObject(value: string, label: string): Record<string, unknown> {
 }
 
 function eventKeyId(event: DeviceTrustEvent): string | null {
-  return "keyId" in event ? event.keyId : null;
+  if ("keyId" in event) return event.keyId;
+  return event.type === "bind-encryption-key" ? event.subjectKeyId : null;
 }
 
 function changes(value: number | bigint): number {
@@ -262,6 +281,11 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     if (version === SCHEMA_VERSION) return;
     if (version === 1) {
       this.#migrateV1ToV2();
+      this.#migrateV2ToV3();
+      return;
+    }
+    if (version === 2) {
+      this.#migrateV2ToV3();
       return;
     }
     throw new CorruptDeviceTrustDatabaseError(`Unsupported device trust schema version ${version}`);
@@ -313,7 +337,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
           event_id TEXT PRIMARY KEY,
           event_type TEXT NOT NULL CHECK(event_type IN (
             'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device',
-            'set-recovery-credential', 'recover-trust-set'
+            'set-recovery-credential', 'recover-trust-set', 'bind-encryption-key'
           )),
           device_id TEXT NOT NULL,
           key_id TEXT,
@@ -324,6 +348,62 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         SELECT event_id, event_type, device_id, key_id, occurred_at, event_json
         FROM device_trust_events_v1;
         DROP TABLE device_trust_events_v1;
+        CREATE INDEX device_trust_events_device_time
+          ON device_trust_events(device_id, occurred_at, event_id);
+      `);
+      this.#db.prepare(`
+        UPDATE device_trust_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(2, COMPONENT);
+    });
+  }
+
+  #createEncryptionBindingTable(): void {
+    this.#db.exec(`
+      CREATE TABLE trusted_encryption_key_bindings (
+        encryption_key_id TEXT PRIMARY KEY,
+        subject_kind TEXT NOT NULL CHECK(subject_kind IN ('device-signing-key', 'recovery-credential')),
+        subject_key_id TEXT NOT NULL,
+        principal_json TEXT NOT NULL CHECK(json_valid(principal_json)),
+        device_id TEXT,
+        recovery_generation INTEGER,
+        public_jwk_json TEXT NOT NULL UNIQUE CHECK(json_valid(public_jwk_json)),
+        bound_at TEXT NOT NULL,
+        record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+        UNIQUE(subject_kind, subject_key_id),
+        CHECK(
+          (subject_kind = 'device-signing-key' AND device_id IS NOT NULL AND recovery_generation IS NULL)
+          OR
+          (subject_kind = 'recovery-credential' AND device_id IS NULL AND recovery_generation >= 1)
+        )
+      ) STRICT;
+
+      CREATE INDEX trusted_encryption_key_bindings_principal_subject
+        ON trusted_encryption_key_bindings(principal_json, subject_kind, subject_key_id);
+    `);
+  }
+
+  #migrateV2ToV3(): void {
+    this.#transaction(() => {
+      this.#createEncryptionBindingTable();
+      this.#db.exec(`
+        ALTER TABLE device_trust_events RENAME TO device_trust_events_v2;
+        CREATE TABLE device_trust_events (
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT NOT NULL CHECK(event_type IN (
+            'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device',
+            'set-recovery-credential', 'recover-trust-set', 'bind-encryption-key'
+          )),
+          device_id TEXT NOT NULL,
+          key_id TEXT,
+          occurred_at TEXT NOT NULL,
+          event_json TEXT NOT NULL CHECK(json_valid(event_json))
+        ) STRICT;
+        INSERT INTO device_trust_events(event_id, event_type, device_id, key_id, occurred_at, event_json)
+        SELECT event_id, event_type, device_id, key_id, occurred_at, event_json
+        FROM device_trust_events_v2;
+        DROP TABLE device_trust_events_v2;
         CREATE INDEX device_trust_events_device_time
           ON device_trust_events(device_id, occurred_at, event_id);
       `);
@@ -443,6 +523,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         CREATE INDEX device_recovery_challenges_expiry
           ON device_recovery_challenges(expires_at, consumed_at, challenge_id);
       `);
+      this.#createEncryptionBindingTable();
       this.#db.prepare(`
         INSERT INTO device_trust_meta(component, schema_version)
         VALUES (?, ?)
@@ -474,6 +555,28 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       FROM trusted_recovery_credentials
       WHERE key_id = ?
     `).get(keyId) as RecoveryCredentialRow | undefined;
+  }
+
+
+  #encryptionBindingRow(encryptionKeyId: string): EncryptionBindingRow | undefined {
+    return this.#db.prepare(`
+      SELECT encryption_key_id, subject_kind, subject_key_id, principal_json,
+             device_id, recovery_generation, public_jwk_json, bound_at, record_json
+      FROM trusted_encryption_key_bindings
+      WHERE encryption_key_id = ?
+    `).get(encryptionKeyId) as EncryptionBindingRow | undefined;
+  }
+
+  #encryptionBindingRowForSubject(
+    subjectKind: EncryptionBindingSubjectKind,
+    subjectKeyId: string,
+  ): EncryptionBindingRow | undefined {
+    return this.#db.prepare(`
+      SELECT encryption_key_id, subject_kind, subject_key_id, principal_json,
+             device_id, recovery_generation, public_jwk_json, bound_at, record_json
+      FROM trusted_encryption_key_bindings
+      WHERE subject_kind = ? AND subject_key_id = ?
+    `).get(subjectKind, subjectKeyId) as EncryptionBindingRow | undefined;
   }
 
   #eventRow(eventId: string): EventRow | undefined {
@@ -549,6 +652,70 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       );
     }
     return credential;
+  }
+
+  async #validatedEncryptionBindingRow(
+    row: EncryptionBindingRow,
+  ): Promise<TrustedEncryptionKeyBinding> {
+    const binding = await corruptAsync(
+      `Encryption binding ${row.encryption_key_id}`,
+      () => normalizeTrustedEncryptionKeyBinding(
+        parsedObject(
+          row.record_json,
+          `encryption binding ${row.encryption_key_id}`,
+        ) as unknown as TrustedEncryptionKeyBinding,
+      ),
+    );
+    if (
+      binding.encryptionKeyId !== row.encryption_key_id
+      || binding.subjectKind !== row.subject_kind
+      || binding.subjectKeyId !== row.subject_key_id
+      || JSON.stringify(binding.principal) !== row.principal_json
+      || JSON.stringify(binding.publicKeyJwk) !== row.public_jwk_json
+      || binding.boundAt !== row.bound_at
+      || await trustedEncryptionKeyBindingJson(binding) !== row.record_json
+    ) {
+      throw new CorruptDeviceTrustDatabaseError(
+        `Encryption binding row ${row.encryption_key_id} disagrees with record_json`,
+      );
+    }
+    if (binding.subjectKind === "device-signing-key") {
+      if (row.device_id !== binding.deviceId || row.recovery_generation !== null) {
+        throw new CorruptDeviceTrustDatabaseError(
+          `Device encryption binding ${binding.encryptionKeyId} typed columns disagree`,
+        );
+      }
+      const key = this.#keyRow(binding.subjectKeyId);
+      const device = this.#deviceRow(binding.deviceId);
+      if (
+        key?.device_id !== binding.deviceId
+        || device?.principal_json !== row.principal_json
+      ) {
+        throw new CorruptDeviceTrustDatabaseError(
+          `Device encryption binding ${binding.encryptionKeyId} subject provenance is invalid`,
+        );
+      }
+      return binding;
+    }
+    if (
+      row.device_id !== null
+      || Number(row.recovery_generation) !== binding.recoveryGeneration
+    ) {
+      throw new CorruptDeviceTrustDatabaseError(
+        `Recovery encryption binding ${binding.encryptionKeyId} typed columns disagree`,
+      );
+    }
+    const recovery = this.#recoveryCredentialRow(binding.subjectKeyId);
+    if (
+      recovery === undefined
+      || Number(recovery.generation) !== binding.recoveryGeneration
+      || recovery.principal_json !== row.principal_json
+    ) {
+      throw new CorruptDeviceTrustDatabaseError(
+        `Recovery encryption binding ${binding.encryptionKeyId} subject provenance is invalid`,
+      );
+    }
+    return binding;
   }
 
   #validatedEventRow(row: EventRow): DeviceTrustEvent {
@@ -669,6 +836,84 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     );
   }
 
+
+
+  #insertEncryptionBinding(
+    binding: TrustedEncryptionKeyBinding,
+    recordJson: string,
+  ): void {
+    const existingByKey = this.#encryptionBindingRow(binding.encryptionKeyId);
+    if (existingByKey !== undefined) {
+      if (existingByKey.record_json !== recordJson) {
+        throw new DeviceTrustConflictError(
+          `encryption key ${binding.encryptionKeyId} is already bound to a different subject`,
+        );
+      }
+      return;
+    }
+    const existingBySubject = this.#encryptionBindingRowForSubject(
+      binding.subjectKind,
+      binding.subjectKeyId,
+    );
+    if (existingBySubject !== undefined) {
+      throw new DeviceTrustConflictError(
+        `${binding.subjectKind} ${binding.subjectKeyId} already has an encryption binding`,
+      );
+    }
+
+    if (binding.subjectKind === "device-signing-key") {
+      const key = this.#keyRow(binding.subjectKeyId);
+      const device = this.#deviceRow(binding.deviceId);
+      if (
+        key === undefined
+        || device === undefined
+        || key.device_id !== binding.deviceId
+        || device.principal_json !== JSON.stringify(binding.principal)
+      ) {
+        throw new DeviceTrustConflictError("device encryption binding does not match trusted subject");
+      }
+    } else {
+      const credential = this.#recoveryCredentialRow(binding.subjectKeyId);
+      if (
+        credential === undefined
+        || Number(credential.generation) !== binding.recoveryGeneration
+        || credential.principal_json !== JSON.stringify(binding.principal)
+      ) {
+        throw new DeviceTrustConflictError("recovery encryption binding does not match trusted subject");
+      }
+    }
+
+    this.#db.prepare(`
+      INSERT INTO trusted_encryption_key_bindings(
+        encryption_key_id, subject_kind, subject_key_id, principal_json,
+        device_id, recovery_generation, public_jwk_json, bound_at, record_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      binding.encryptionKeyId,
+      binding.subjectKind,
+      binding.subjectKeyId,
+      JSON.stringify(binding.principal),
+      binding.subjectKind === "device-signing-key" ? binding.deviceId : null,
+      binding.subjectKind === "recovery-credential" ? binding.recoveryGeneration : null,
+      JSON.stringify(binding.publicKeyJwk),
+      binding.boundAt,
+      recordJson,
+    );
+  }
+
+  async #preparedEncryptionBinding(
+    binding: TrustedEncryptionKeyBinding | undefined,
+  ): Promise<{
+    readonly binding: TrustedEncryptionKeyBinding;
+    readonly json: string;
+  } | undefined> {
+    if (binding === undefined) return undefined;
+    const normalized = await normalizeTrustedEncryptionKeyBinding(binding);
+    return {
+      binding: normalized,
+      json: await trustedEncryptionKeyBindingJson(normalized),
+    };
+  }
 
 
   #insertRecoveryCredential(credential: TrustedRecoveryCredential, recordJson: string): void {
@@ -886,6 +1131,52 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     return row === undefined ? undefined : this.#validatedRecoveryCredentialRow(row);
   }
 
+  async encryptionBinding(
+    encryptionKeyId: string,
+  ): Promise<TrustedEncryptionKeyBinding | undefined> {
+    const row = this.#encryptionBindingRow(encryptionKeyId);
+    return row === undefined ? undefined : this.#validatedEncryptionBindingRow(row);
+  }
+
+  async encryptionBindingForSubject(
+    subjectKind: EncryptionBindingSubjectKind,
+    subjectKeyId: string,
+  ): Promise<TrustedEncryptionKeyBinding | undefined> {
+    const row = this.#encryptionBindingRowForSubject(subjectKind, subjectKeyId);
+    return row === undefined ? undefined : this.#validatedEncryptionBindingRow(row);
+  }
+
+  async activeEncryptionRecipients(
+    principal: AccessPrincipal,
+  ): Promise<readonly TrustedEncryptionKeyBinding[]> {
+    const principalJson = JSON.stringify(normalizeAccessPrincipal(principal));
+    const rows = this.#db.prepare(`
+      SELECT encryption_key_id, subject_kind, subject_key_id, principal_json,
+             device_id, recovery_generation, public_jwk_json, bound_at, record_json
+      FROM trusted_encryption_key_bindings
+      WHERE principal_json = ?
+      ORDER BY subject_kind, subject_key_id, encryption_key_id
+    `).all(principalJson) as unknown as EncryptionBindingRow[];
+    const recipients: TrustedEncryptionKeyBinding[] = [];
+    for (const row of rows) {
+      const binding = await this.#validatedEncryptionBindingRow(row);
+      if (binding.subjectKind === "device-signing-key") {
+        const key = this.#keyRow(binding.subjectKeyId);
+        const device = this.#deviceRow(binding.deviceId);
+        if (key?.status === "active" && device?.status === "active") recipients.push(binding);
+        continue;
+      }
+      const recovery = this.#recoveryCredentialRow(binding.subjectKeyId);
+      if (
+        recovery?.status === "active"
+        && Number(recovery.generation) === binding.recoveryGeneration
+      ) {
+        recipients.push(binding);
+      }
+    }
+    return recipients;
+  }
+
   async recoveryChallenge(
     challengeId: string,
   ): Promise<StoredDeviceRecoveryChallenge | undefined> {
@@ -1032,11 +1323,17 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     const device = normalizeTrustedDevice(transition.device);
     const key = await normalizeTrustedDeviceKey(transition.key);
     const keyJson = await trustedDeviceKeyJson(key);
+    const preparedBinding = await this.#preparedEncryptionBinding(transition.encryptionBinding);
     if (
       event.type !== "bootstrap-device"
       || event.deviceId !== device.deviceId
       || event.keyId !== key.keyId
       || key.deviceId !== device.deviceId
+      || event.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || preparedBinding?.binding.subjectKind !== "device-signing-key"
+      || preparedBinding.binding.subjectKeyId !== key.keyId
+      || preparedBinding.binding.deviceId !== device.deviceId
+      || JSON.stringify(preparedBinding.binding.principal) !== JSON.stringify(device.principal)
       || JSON.stringify(event.principal) !== JSON.stringify(device.principal)
     ) {
       throw new DeviceTrustConflictError("bootstrap transition records do not agree");
@@ -1061,6 +1358,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         key.status,
         keyJson,
       );
+      this.#insertEncryptionBinding(preparedBinding.binding, preparedBinding.json);
       this.#insertEvent(event);
       return "inserted";
     });
@@ -1073,6 +1371,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     const challenge = await validateDeviceTrustChallengeKeyId(transition.challenge);
     const device = normalizeTrustedDevice(transition.device);
     const key = await normalizeTrustedDeviceKey(transition.key);
+    const preparedBinding = await this.#preparedEncryptionBinding(transition.encryptionBinding);
     const now = canonicalTimestamp(transition.now, "enrollment now");
     if (
       event.type !== "enroll-device"
@@ -1082,6 +1381,12 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       || key.deviceId !== device.deviceId
       || challenge.deviceId !== device.deviceId
       || challenge.keyId !== key.keyId
+      || event.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || challenge.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || preparedBinding?.binding.subjectKind !== "device-signing-key"
+      || preparedBinding.binding.subjectKeyId !== key.keyId
+      || preparedBinding.binding.deviceId !== device.deviceId
+      || JSON.stringify(preparedBinding.binding.principal) !== JSON.stringify(device.principal)
       || JSON.stringify(event.principal) !== JSON.stringify(device.principal)
       || JSON.stringify(challenge.principal) !== JSON.stringify(device.principal)
     ) {
@@ -1113,6 +1418,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
           revoked_at, predecessor_key_id, record_json
         ) VALUES (?, ?, ?, ?, 'active', NULL, NULL, ?)
       `).run(key.keyId, key.deviceId, JSON.stringify(key.publicKeyJwk), key.activatedAt, keyJson);
+      this.#insertEncryptionBinding(preparedBinding.binding, preparedBinding.json);
       this.#insertEvent(event);
       this.#consumeChallenge(challenge.challengeId, now);
       return "inserted";
@@ -1125,6 +1431,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     const event = normalizeDeviceTrustEvent(transition.event) as RotateKeyTransition["event"];
     const challenge = await validateDeviceTrustChallengeKeyId(transition.challenge);
     const key = await normalizeTrustedDeviceKey(transition.key);
+    const preparedBinding = await this.#preparedEncryptionBinding(transition.encryptionBinding);
     const now = canonicalTimestamp(transition.now, "rotation now");
     const predecessor = await this.key(transition.predecessorKeyId);
     if (predecessor === undefined) throw new DeviceTrustConflictError("rotation predecessor key does not exist");
@@ -1138,6 +1445,11 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       || event.predecessorKeyId !== transition.predecessorKeyId
       || challenge.deviceId !== transition.deviceId
       || challenge.keyId !== key.keyId
+      || event.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || challenge.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || preparedBinding?.binding.subjectKind !== "device-signing-key"
+      || preparedBinding.binding.subjectKeyId !== key.keyId
+      || preparedBinding.binding.deviceId !== transition.deviceId
       || key.deviceId !== transition.deviceId
       || key.predecessorKeyId !== transition.predecessorKeyId
     ) {
@@ -1188,6 +1500,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         now,
         "predecessor key",
       );
+      this.#insertEncryptionBinding(preparedBinding.binding, preparedBinding.json);
       this.#insertEvent(event);
       this.#consumeChallenge(challenge.challengeId, now);
       return "inserted";
@@ -1296,6 +1609,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
   ): Promise<RecoveryCredentialMutationResult> {
     const event = normalizeDeviceTrustEvent(transition.event) as SetRecoveryCredentialTransition["event"];
     const credential = await normalizeTrustedRecoveryCredential(transition.credential);
+    const preparedBinding = await this.#preparedEncryptionBinding(transition.encryptionBinding);
     const now = canonicalTimestamp(transition.now, "recovery credential now");
     const credentialJson = await trustedRecoveryCredentialJson(credential);
     const previous = transition.previousRecoveryKeyId === undefined
@@ -1312,6 +1626,10 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       || event.actor.mode !== "trusted-device"
       || event.recoveryKeyId !== credential.keyId
       || event.recoveryGeneration !== credential.generation
+      || event.encryptionKeyId !== preparedBinding?.binding.encryptionKeyId
+      || preparedBinding?.binding.subjectKind !== "recovery-credential"
+      || preparedBinding.binding.subjectKeyId !== credential.keyId
+      || preparedBinding.binding.recoveryGeneration !== credential.generation
       || event.deviceId !== event.actor.deviceId
       || credential.status !== "active"
       || JSON.stringify(event.principal) !== JSON.stringify(credential.principal)
@@ -1361,6 +1679,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         );
       }
       this.#insertRecoveryCredential(credential, credentialJson);
+      this.#insertEncryptionBinding(preparedBinding.binding, preparedBinding.json);
       this.#insertEvent(event);
       return "inserted";
     });
@@ -1385,6 +1704,12 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
     const now = canonicalTimestamp(transition.now, "trust recovery now");
     const keyJson = await trustedDeviceKeyJson(key);
     const recoveryJson = await trustedRecoveryCredentialJson(recoveryCredential);
+    const preparedDeviceBinding = await this.#preparedEncryptionBinding(
+      transition.deviceEncryptionBinding,
+    );
+    const preparedRecoveryBinding = await this.#preparedEncryptionBinding(
+      transition.recoveryEncryptionBinding,
+    );
 
     if (
       event.type !== "recover-trust-set"
@@ -1404,6 +1729,14 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       || event.nextRecoveryGeneration !== challenge.nextRecoveryGeneration
       || recoveryCredential.predecessorKeyId !== transition.previousRecoveryKeyId
       || recoveryCredential.status !== "active"
+      || event.deviceEncryptionKeyId !== preparedDeviceBinding?.binding.encryptionKeyId
+      || event.nextRecoveryEncryptionKeyId !== preparedRecoveryBinding?.binding.encryptionKeyId
+      || preparedDeviceBinding?.binding.subjectKind !== "device-signing-key"
+      || preparedDeviceBinding.binding.subjectKeyId !== key.keyId
+      || preparedDeviceBinding.binding.deviceId !== device.deviceId
+      || preparedRecoveryBinding?.binding.subjectKind !== "recovery-credential"
+      || preparedRecoveryBinding.binding.subjectKeyId !== recoveryCredential.keyId
+      || preparedRecoveryBinding.binding.recoveryGeneration !== recoveryCredential.generation
       || JSON.stringify(event.principal) !== JSON.stringify(device.principal)
       || JSON.stringify(challenge.principal) !== JSON.stringify(device.principal)
       || JSON.stringify(recoveryCredential.principal) !== JSON.stringify(device.principal)
@@ -1578,6 +1911,8 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
         keyJson,
       );
       this.#insertRecoveryCredential(recoveryCredential, recoveryJson);
+      this.#insertEncryptionBinding(preparedDeviceBinding.binding, preparedDeviceBinding.json);
+      this.#insertEncryptionBinding(preparedRecoveryBinding.binding, preparedRecoveryBinding.json);
       this.#insertEvent(event);
       this.#consumeRecoveryChallenge(challenge.challengeId, now);
       return "inserted";
@@ -1602,6 +1937,65 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       key: materializedKey,
       recoveryCredential: materializedRecovery,
     };
+  }
+
+  async bindEncryptionKey(
+    transition: BindEncryptionKeyTransition,
+  ): Promise<EncryptionBindingMutationResult> {
+    const event = normalizeDeviceTrustEvent(transition.event) as BindEncryptionKeyTransition["event"];
+    const prepared = await this.#preparedEncryptionBinding(transition.binding);
+    if (prepared === undefined) throw new DeviceTrustConflictError("encryption binding is required");
+    const binding = prepared.binding;
+    if (
+      event.type !== "bind-encryption-key"
+      || event.actor.mode !== "trusted-device"
+      || event.subjectKind !== binding.subjectKind
+      || event.subjectKeyId !== binding.subjectKeyId
+      || event.encryptionKeyId !== binding.encryptionKeyId
+      || JSON.stringify(event.principal) !== JSON.stringify(binding.principal)
+    ) {
+      throw new DeviceTrustConflictError("encryption binding transition records do not agree");
+    }
+
+    const outcome = this.#transaction((): "inserted" | "replayed" => {
+      if (this.#eventReplay(event)) return "replayed";
+      const actor = this.#activeActor(event);
+      if (actor.device.principal_json !== JSON.stringify(binding.principal)) {
+        throw new DeviceTrustAuthorizationError("encryption binding actor principal does not match subject");
+      }
+      if (binding.subjectKind === "device-signing-key") {
+        const key = this.#keyRow(binding.subjectKeyId);
+        const device = this.#deviceRow(binding.deviceId);
+        if (
+          key?.status !== "active"
+          || device?.status !== "active"
+          || key.device_id !== binding.deviceId
+          || device.principal_json !== JSON.stringify(binding.principal)
+        ) {
+          throw new DeviceTrustAuthorizationError("device encryption binding subject is not active");
+        }
+      } else {
+        const credential = this.#recoveryCredentialRow(binding.subjectKeyId);
+        if (
+          credential?.status !== "active"
+          || Number(credential.generation) !== binding.recoveryGeneration
+          || credential.principal_json !== JSON.stringify(binding.principal)
+        ) {
+          throw new DeviceTrustAuthorizationError("recovery encryption binding subject is not active");
+        }
+      }
+      this.#insertEncryptionBinding(binding, prepared.json);
+      this.#insertEvent(event);
+      return "inserted";
+    });
+    const materialized = await this.encryptionBinding(binding.encryptionKeyId);
+    if (
+      materialized === undefined
+      || await trustedEncryptionKeyBindingJson(materialized) !== prepared.json
+    ) {
+      throw new CorruptDeviceTrustDatabaseError("materialized encryption binding is missing or mismatched");
+    }
+    return { outcome, event, binding: materialized };
   }
 
   consume(input: ReplicationSignatureReplayInput): boolean {
