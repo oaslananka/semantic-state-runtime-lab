@@ -10,7 +10,8 @@
     "@ssrl/replication-access": "workspace:*",
     "@ssrl/state-store": "workspace:*",
     "@ssrl/core": "workspace:*",
-    "@ssrl/device-trust": "workspace:*"
+    "@ssrl/device-trust": "workspace:*",
+    "@ssrl/http-wire": "workspace:*"
   },
   "devDependencies": {
     "@ssrl/storage-local-artifacts": "workspace:*",

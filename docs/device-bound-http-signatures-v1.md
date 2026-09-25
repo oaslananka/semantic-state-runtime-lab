@@ -38,6 +38,8 @@ One signature label is accepted:
 ssrl
 ```
 
+The implementation now supports a configured **application tag** while preserving the fixed components/algorithm/profile shape. Replication defaults to `ssrl-replication-v1`; the separate device-trust management control plane uses `ssrl-device-trust-v1`. A verifier accepts only its configured tag, so a valid management proof cannot be replayed as a replication proof or vice versa.
+
 Covered components are fixed and ordered:
 
 ```text
@@ -222,11 +224,9 @@ The transport tests prove:
 
 v1 deliberately does not provide:
 
-- first-device bootstrap;
-- durable trusted-device registry;
-- device enrollment ceremony;
-- device key rotation/recovery ceremony;
-- durable/shared replay store;
+- first-device remote bootstrap;
+- account recovery ceremony;
+- WebAuthn/passkey management stack;
 - OAuth Authorization Server;
 - DPoP token issuance/verification;
 - mTLS client certificates;
@@ -237,14 +237,6 @@ v1 deliberately does not provide:
 
 ## Next layer
 
-The next security work should establish a durable device trust lifecycle:
+The durable device trust lifecycle and signed management transport now exist. The next security risk is **recovery after loss of all active trusted devices**. Recovery must not introduce a remote unauthenticated path that bypasses the device trust model. Hardware-backed key adapters, shared/cloud trust state, and E2E relay encryption should remain downstream of a deliberate recovery policy.
 
-```text
-first-device/root bootstrap
-  -> enrollment approval
-  -> durable public credential registry
-  -> revocation/rotation/recovery
-  -> shared/durable nonce/replay state where needed
-```
-
-Only then should an untrusted-relay E2E encryption design bind HPKE recipient keys to trusted devices. Otherwise encryption simply moves the unresolved trust problem into key distribution.
+Device enrollment/rotation/revocation management over the distinct HTTP-signature tag is documented in `docs/device-trust-management-http-v1.md`.

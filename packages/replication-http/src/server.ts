@@ -52,7 +52,10 @@ import {
   objectRecord,
   parseUtf8Json,
   positiveInteger,
-} from "./wire.js";
+  uniqueHostnames,
+  validateRequestHost,
+  validateRequestOrigin,
+} from "@ssrl/http-wire";
 
 const DEFAULT_MAX_JSON_REQUEST_BYTES = 1024 * 1024;
 const HARD_MAX_JSON_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -86,14 +89,6 @@ export class ReplicationHttpProtocolError extends Error {
   }
 }
 
-function uniqueHostnames(values: readonly string[], label: string): ReadonlySet<string> {
-  const normalized = values.map((value) => value.trim().toLowerCase());
-  if (normalized.length === 0 || normalized.some((value) => value.length === 0)) {
-    throw new TypeError(`${label} must contain non-empty hostnames`);
-  }
-  return new Set(normalized);
-}
-
 function configuredJsonLimit(value: number | undefined): number {
   const resolved = value ?? DEFAULT_MAX_JSON_REQUEST_BYTES;
   if (!Number.isSafeInteger(resolved) || resolved < 1 || resolved > HARD_MAX_JSON_REQUEST_BYTES) {
@@ -116,62 +111,6 @@ function configuredBlobInstallLimit(value: number | undefined): number {
     );
   }
   return resolved;
-}
-
-function hostnameFromHostHeader(value: string): string {
-  try {
-    const authority = value.trim();
-    if (authority.length === 0 || authority !== value) throw new Error("invalid host whitespace");
-    const parsed = new URL(`http://${authority}`);
-    if (
-      parsed.username.length > 0
-      || parsed.password.length > 0
-      || parsed.pathname !== "/"
-      || parsed.search.length > 0
-      || parsed.hash.length > 0
-    ) {
-      throw new Error("invalid host authority");
-    }
-    return parsed.hostname.toLowerCase();
-  } catch {
-    throw new ReplicationHttpProtocolError(400, "invalid-host", "Invalid request host");
-  }
-}
-
-function validateHost(request: Request, allowed: ReadonlySet<string>): void {
-  const urlHostname = new URL(request.url).hostname.toLowerCase();
-  if (!allowed.has(urlHostname)) {
-    throw new ReplicationHttpProtocolError(421, "host-not-allowed", "Request host is not allowed");
-  }
-  const host = request.headers.get("host");
-  if (host !== null && !allowed.has(hostnameFromHostHeader(host))) {
-    throw new ReplicationHttpProtocolError(421, "host-not-allowed", "Request host is not allowed");
-  }
-}
-
-function validateOrigin(request: Request, allowed: ReadonlySet<string>): void {
-  const origin = request.headers.get("origin");
-  if (origin === null) return;
-  let hostname: string;
-  try {
-    const parsed = new URL(origin);
-    if (
-      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
-      || parsed.username.length > 0
-      || parsed.password.length > 0
-      || parsed.pathname !== "/"
-      || parsed.search.length > 0
-      || parsed.hash.length > 0
-    ) {
-      throw new Error("invalid origin");
-    }
-    hostname = parsed.hostname.toLowerCase();
-  } catch {
-    throw new ReplicationHttpProtocolError(403, "origin-not-allowed", "Request origin is not allowed");
-  }
-  if (!allowed.has(hostname)) {
-    throw new ReplicationHttpProtocolError(403, "origin-not-allowed", "Request origin is not allowed");
-  }
 }
 
 function exactContentType(request: Request, expected: string): void {
@@ -625,8 +564,17 @@ export function createReplicationHttpHandler(options: ReplicationHttpServerOptio
   return {
     async fetch(request) {
       try {
-        validateHost(request, allowedHosts);
-        validateOrigin(request, allowedOrigins);
+        validateRequestHost({
+          request,
+          allowed: allowedHosts,
+          invalidHost: (message) => new ReplicationHttpProtocolError(400, "invalid-host", message),
+          notAllowed: (message) => new ReplicationHttpProtocolError(421, "host-not-allowed", message),
+        });
+        validateRequestOrigin({
+          request,
+          allowed: allowedOrigins,
+          notAllowed: (message) => new ReplicationHttpProtocolError(403, "origin-not-allowed", message),
+        });
         const authenticated = await options.authenticator.authenticate(request);
         if (authenticated instanceof Response) return authenticated;
         const authentication = authenticationContext(authenticated);

@@ -36,6 +36,7 @@ import {
   nonEmptyString,
   normalizedMediaType,
   objectRecord,
+  secureHttpBaseUrl,
   parseUtf8Json,
 } from "./wire.js";
 
@@ -72,15 +73,7 @@ export class InvalidReplicationHttpResponseError extends Error {
 }
 
 function secureBaseUrl(value: URL): URL {
-  const url = new URL(value.toString());
-  const loopback = url.hostname === "localhost"
-    || url.hostname === "127.0.0.1"
-    || url.hostname === "[::1]"
-    || url.hostname === "::1";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
-    throw new TypeError("Replication HTTP client requires HTTPS outside loopback");
-  }
-  return url;
+  return secureHttpBaseUrl(value, "Replication HTTP client");
 }
 
 function responseLimit(value: number | undefined, fallback: number, label: string): number {
