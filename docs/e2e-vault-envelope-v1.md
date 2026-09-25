@@ -229,9 +229,9 @@ this epoch/grant was authorized by the user's trusted-device/recovery state mach
 
 That distinction is security-critical. An untrusted relay must not be allowed to create an attacker-chosen epoch secret, encrypt attacker-controlled payloads under it, create a syntactically valid HPKE grant to a real device, and thereby manufacture trusted personal state.
 
-Before relay integration, epoch creation and grant issuance must be bound to authenticated SSRL trust state—most likely through a durable signed/authorized keyring transition using the existing device/recovery lifecycle.
+Epoch creation and grant issuance are now bound to authenticated SSRL trust state by `@ssrl/vault-keyring`; see `docs/vault-keyring-v1.md`.
 
-Until that layer exists, `@ssrl/e2e` is a **cryptographic primitive**, not a complete encrypted sync authorization protocol.
+`@ssrl/e2e` remains a **cryptographic primitive** rather than a complete encrypted sync authorization protocol. The keyring consumes these primitives and adds trusted recipient selection, signed epoch/grant lifecycle, durability and historical re-wrap semantics.
 
 ## Recovery
 
@@ -294,9 +294,7 @@ v1 does not provide:
 
 - encrypted replication HTTP integration;
 - encrypted Merkle/descriptor format;
-- durable epoch/key-grant persistence;
-- binding X25519 keys to trusted devices/recovery credentials;
-- authenticated epoch/grant issuance;
+- encrypted replication integration that consumes the durable keyring;
 - automatic epoch rotation;
 - metadata privacy;
 - padding/traffic-analysis resistance;
@@ -309,14 +307,14 @@ v1 does not provide:
 
 The safe integration order is:
 
-1. bind X25519 encryption keys and epoch/grant issuance to the existing device/recovery trust lifecycle;
-2. persist an authenticated epoch/grant keyring and define recovery re-wrapping;
-3. define encrypted replication records/blobs whose public reconciliation identity does not expose plaintext digests;
-4. integrate an untrusted relay/cloud transport and explicitly benchmark metadata leakage, payload overhead and recovery behavior.
+1. **Completed:** bind X25519 encryption recipients to device/recovery trust.
+2. **Completed:** persist an authenticated epoch/grant keyring with historical re-wrapping.
+3. Define encrypted replication records/blobs whose public reconciliation identity does not expose plaintext digests.
+4. Integrate an untrusted relay/cloud transport and explicitly benchmark metadata leakage, payload overhead and recovery behavior.
 
 Skipping directly to encrypted HTTP bodies would create ciphertext without a trustworthy key-lifecycle protocol and would not solve the actual relay trust problem.
 
 
 ## Recipient trust boundary
 
-The E2E package treats X25519 keys as cryptographic recipients, not trusted principals. Device/recovery authorization belongs to `@ssrl/device-trust`; durable trust binds exact X25519 public JWKs to active signing/recovery generations and exposes `activeEncryptionRecipients(principal)`. A future grant keyring should source recipients from that trust query rather than accepting arbitrary caller-supplied thumbprints. See `docs/trusted-encryption-key-bindings-v1.md`.
+The E2E package treats X25519 keys as cryptographic recipients, not trusted principals. Device/recovery authorization belongs to `@ssrl/device-trust`; durable trust binds exact X25519 public JWKs to active signing/recovery generations and exposes `activeEncryptionRecipients(principal)`. The authenticated vault keyring now sources recipients from that trust query rather than accepting arbitrary caller-supplied thumbprints. See `docs/trusted-encryption-key-bindings-v1.md` and `docs/vault-keyring-v1.md`.
