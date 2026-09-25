@@ -8,8 +8,10 @@ import {
   deviceTrustChallengeJson,
   ed25519JwkThumbprintUri,
   normalizeEd25519PublicJwk,
+  signDeviceRecoveryChallenge,
   signDeviceTrustChallenge,
   signEnrollmentChallengeForOffer,
+  signRecoveryProvisioningProof,
 } from "@ssrl/device-trust";
 import { startNodeFetchHttpServer } from "@ssrl/http-wire/node";
 import {
@@ -19,6 +21,7 @@ import {
 import { SQLiteDeviceTrustStore } from "@ssrl/storage-sqlite-device-trust";
 import {
   DEVICE_TRUST_HTTP_ERROR_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA,
   DEVICE_TRUST_HTTP_ROUTES,
   DEVICE_TRUST_HTTP_SIGNATURE_TAG,
   DeviceTrustHttpClient,
@@ -53,7 +56,8 @@ async function keyPair() {
 async function bootstrapped() {
   const path = await databasePath();
   const store = new SQLiteDeviceTrustStore({ path });
-  const manager = new DeviceTrustManager({ repository: store, now: () => now });
+  const clock = { now };
+  const manager = new DeviceTrustManager({ repository: store, now: () => clock.now });
   const laptop = await keyPair();
   await manager.bootstrapLocal({
     eventId: "bootstrap-laptop",
@@ -62,7 +66,7 @@ async function bootstrapped() {
     principal,
     publicKeyJwk: laptop.publicKeyJwk,
   });
-  return { path, store, manager, laptop };
+  return { path, store, manager, laptop, clock };
 }
 
 class CountingDeviceTrustManager extends DeviceTrustManager {
@@ -135,6 +139,66 @@ async function enrollPhone(fixture: Awaited<ReturnType<typeof runningFixture>>) 
     signature,
   });
   return { phone, offer, challenge, result };
+}
+
+async function provisionRecoveryHttp(
+  fixture: Awaited<ReturnType<typeof runningFixture>>,
+  recovery: Awaited<ReturnType<typeof keyPair>>,
+  eventId: string,
+) {
+  const proof = await fixture.client.prepareRecoveryCredential(eventId, recovery.publicKeyJwk);
+  const signature = await signRecoveryProvisioningProof(proof, recovery.privateKey);
+  const result = await fixture.client.commitRecoveryCredential({
+    eventId,
+    publicKeyJwk: recovery.publicKeyJwk,
+    signature,
+  });
+  return { proof, signature, result };
+}
+
+async function recoveryAttemptHttp(
+  fixture: Awaited<ReturnType<typeof runningFixture>>,
+  recovery: Awaited<ReturnType<typeof keyPair>>,
+  replacement: Awaited<ReturnType<typeof keyPair>>,
+  nextRecovery: Awaited<ReturnType<typeof keyPair>>,
+  eventId: string,
+  deviceId = "device:recovery-replacement",
+  displayName = "Alice Recovery Replacement",
+) {
+  const challenge = await fixture.client.startRecovery({
+    recoveryKeyId: recovery.keyId,
+    deviceId,
+    displayName,
+    publicKeyJwk: replacement.publicKeyJwk,
+    nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+  });
+  const [recoverySignature, deviceSignature, nextRecoverySignature] = await Promise.all([
+    signDeviceRecoveryChallenge(challenge, recovery.privateKey),
+    signDeviceRecoveryChallenge(challenge, replacement.privateKey),
+    signDeviceRecoveryChallenge(challenge, nextRecovery.privateKey),
+  ]);
+  const complete = () => fixture.client.completeRecovery({
+    eventId,
+    challengeId: challenge.challengeId,
+    recoverySignature,
+    deviceSignature,
+    nextRecoverySignature,
+  });
+  return {
+    challenge,
+    recoverySignature,
+    deviceSignature,
+    nextRecoverySignature,
+    complete,
+  };
+}
+
+async function rawJsonPost(baseUrl: URL, route: string, body: unknown): Promise<Response> {
+  return fetch(new URL(route, baseUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 async function capturedSignedRequest(input: {
@@ -429,6 +493,342 @@ describe("device trust management HTTP", () => {
     await expect(fixture.client.startEnrollment(wrongAudience))
       .rejects.toMatchObject({ status: 400, code: "invalid-request" });
     expect(await fixture.store.device("device:wrong-audience")).toBeUndefined();
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("provisions and rotates recovery credentials over signed HTTP with recovery-key PoP", async () => {
+    const fixture = await runningFixture();
+    const recoveryOne = await keyPair();
+    const firstProof = await fixture.client.prepareRecoveryCredential(
+      "http-set-recovery-1",
+      recoveryOne.publicKeyJwk,
+    );
+    expect(firstProof).toEqual(expect.objectContaining({
+      eventId: "http-set-recovery-1",
+      principal: { subject: "user:alice", scopes: ["device-trust", "replication"] },
+      authorizingDeviceId: "device:laptop",
+      authorizingKeyId: fixture.laptop.keyId,
+      recoveryKeyId: recoveryOne.keyId,
+      recoveryGeneration: 1,
+      audience,
+    }));
+
+    await expect(fixture.client.commitRecoveryCredential({
+      eventId: "http-set-recovery-1",
+      publicKeyJwk: recoveryOne.publicKeyJwk,
+      signature: new Uint8Array(64),
+    })).rejects.toMatchObject({ status: 401, code: "proof-failed" });
+    expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
+
+    const first = await provisionRecoveryHttp(fixture, recoveryOne, "http-set-recovery-1");
+    expect(first.result).toEqual(expect.objectContaining({ outcome: "inserted" }));
+    expect(first.result.credential).toEqual(expect.objectContaining({
+      keyId: recoveryOne.keyId,
+      generation: 1,
+      status: "active",
+    }));
+
+    const recoveryTwo = await keyPair();
+    const second = await provisionRecoveryHttp(fixture, recoveryTwo, "http-set-recovery-2");
+    expect(second.result.credential).toEqual(expect.objectContaining({
+      keyId: recoveryTwo.keyId,
+      generation: 2,
+      predecessorKeyId: recoveryOne.keyId,
+      status: "active",
+    }));
+    expect((await fixture.store.recoveryCredential(recoveryOne.keyId))?.status).toBe("retired");
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("rejects body-supplied recovery principal, audience and authorizer instead of honoring them", async () => {
+    const fixture = await runningFixture();
+    const recovery = await keyPair();
+    const signed = signedFetch(fixture.laptop.keyId, fixture.laptop.privateKey);
+    const prepare = await signed(
+      new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          eventId: "override-recovery",
+          publicKeyJwk: recovery.publicKeyJwk,
+          principal: { subject: "user:mallory", scopes: ["device-trust"] },
+          audience: "ssrl://evil",
+          authorizingKeyId: "attacker-key",
+        }),
+      },
+    );
+    expect(prepare.status).toBe(400);
+    expect(await prepare.json()).toEqual(expect.objectContaining({ code: "invalid-request" }));
+
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+    const start = await rawJsonPost(fixture.server.baseUrl, DEVICE_TRUST_HTTP_ROUTES.startRecovery, {
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:override",
+      displayName: "Override",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      principal: { subject: "user:mallory", scopes: ["device-trust"] },
+      audience: "ssrl://evil",
+    });
+    expect(start.status).toBe(400);
+    expect(await start.json()).toEqual(expect.objectContaining({ code: "invalid-request" }));
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("uses the same generic recovery failure for unknown, retired and conflicting recovery starts", async () => {
+    const fixture = await runningFixture();
+    const recoveryOne = await keyPair();
+    await provisionRecoveryHttp(fixture, recoveryOne, "enum-recovery-1");
+    const recoveryTwo = await keyPair();
+    await provisionRecoveryHttp(fixture, recoveryTwo, "enum-recovery-2");
+    const unknown = await keyPair();
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+
+    const startBody = (recoveryKeyId: string, deviceId: string) => ({
+      recoveryKeyId,
+      deviceId,
+      displayName: "Recovery Device",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    });
+    const responses = await Promise.all([
+      rawJsonPost(
+        fixture.server.baseUrl,
+        DEVICE_TRUST_HTTP_ROUTES.startRecovery,
+        startBody(unknown.keyId, "device:unknown-recovery"),
+      ),
+      rawJsonPost(
+        fixture.server.baseUrl,
+        DEVICE_TRUST_HTTP_ROUTES.startRecovery,
+        startBody(recoveryOne.keyId, "device:retired-recovery"),
+      ),
+      rawJsonPost(
+        fixture.server.baseUrl,
+        DEVICE_TRUST_HTTP_ROUTES.startRecovery,
+        startBody(recoveryTwo.keyId, "device:laptop"),
+      ),
+    ]);
+    const bodies = await Promise.all(responses.map((response) => response.json()));
+    expect(responses.map((response) => response.status)).toEqual([401, 401, 401]);
+    expect(bodies[1]).toEqual(bodies[0]);
+    expect(bodies[2]).toEqual(bodies[0]);
+    expect(bodies[0]).toEqual({
+      schema: DEVICE_TRUST_HTTP_ERROR_SCHEMA,
+      code: "recovery-failed",
+      message: "Device trust recovery failed",
+    });
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("starts recovery without a trusted-device signature and invalid proof does not consume it", async () => {
+    const fixture = await runningFixture();
+    const recovery = await keyPair();
+    await provisionRecoveryHttp(fixture, recovery, "public-recovery-provision");
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+    const challenge = await fixture.client.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:public-recovery",
+      displayName: "Public Recovery",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    });
+    expect(challenge.principal).toEqual({
+      subject: "user:alice",
+      scopes: ["device-trust", "replication"],
+    });
+    expect(challenge.audience).toBe(audience);
+    expect(challenge.recoveryKeyId).toBe(recovery.keyId);
+
+    const recoverySignature = await signDeviceRecoveryChallenge(challenge, recovery.privateKey);
+    const nextRecoverySignature = await signDeviceRecoveryChallenge(challenge, nextRecovery.privateKey);
+    await expect(fixture.client.completeRecovery({
+      eventId: "public-recovery-complete",
+      challengeId: challenge.challengeId,
+      recoverySignature,
+      deviceSignature: new Uint8Array(64),
+      nextRecoverySignature,
+    })).rejects.toMatchObject({ status: 401, code: "recovery-failed" });
+    expect((await fixture.store.recoveryChallenge(challenge.challengeId))?.consumedAt).toBeUndefined();
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("recovers destructively over HTTP, authenticates the replacement, replays after expiry and hides conflicts", async () => {
+    const fixture = await runningFixture();
+    const enrolled = await enrollPhone(fixture);
+    const recovery = await keyPair();
+    await provisionRecoveryHttp(fixture, recovery, "recover-http-provision");
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+    const attempt = await recoveryAttemptHttp(
+      fixture,
+      recovery,
+      replacement,
+      nextRecovery,
+      "recover-http-event",
+    );
+
+    const recovered = await attempt.complete();
+    expect(recovered.outcome).toBe("inserted");
+    expect(recovered.key.keyId).toBe(replacement.keyId);
+    expect(recovered.recoveryCredential).toEqual(expect.objectContaining({
+      keyId: nextRecovery.keyId,
+      generation: 2,
+      predecessorKeyId: recovery.keyId,
+      status: "active",
+    }));
+    expect(await fixture.store.resolve(fixture.laptop.keyId)).toBeUndefined();
+    expect(await fixture.store.resolve(enrolled.phone.keyId)).toBeUndefined();
+    expect(await fixture.store.resolve(replacement.keyId)).toEqual(expect.objectContaining({
+      deviceId: "device:recovery-replacement",
+    }));
+
+    const replicationRequest = await capturedSignedRequest({
+      url: new URL("http://replication.test/v1/replication/projection/open"),
+      keyId: replacement.keyId,
+      privateKey: replacement.privateKey,
+      tag: "ssrl-replication-v1",
+      body: { projectionId: "personal" },
+    });
+    const replicationAuth = new HttpMessageSignatureAuthenticator({
+      keys: fixture.store,
+      replayStore: fixture.store,
+      now: () => now,
+    });
+    const accepted = await replicationAuth.authenticate(replicationRequest.clone());
+    if (accepted instanceof Response) throw new Error(`expected replacement auth, got ${accepted.status}`);
+    await expect(accepted.verifyBody!(new TextEncoder().encode(JSON.stringify({ projectionId: "personal" }))))
+      .resolves.toBe(true);
+    expect(accepted.device).toEqual({
+      keyId: replacement.keyId,
+      deviceId: "device:recovery-replacement",
+    });
+
+    fixture.clock.now = now + 60 * 60 * 1_000;
+    const replay = await attempt.complete();
+    expect(replay.outcome).toBe("replayed");
+    expect(replay.key.keyId).toBe(replacement.keyId);
+
+    const replacementTwo = await keyPair();
+    const recoveryThree = await keyPair();
+    const conflict = await recoveryAttemptHttp(
+      fixture,
+      nextRecovery,
+      replacementTwo,
+      recoveryThree,
+      "recover-http-event",
+      "device:recovery-replacement-two",
+      "Alice Recovery Replacement Two",
+    );
+    await expect(conflict.complete()).rejects.toMatchObject({
+      status: 401,
+      code: "recovery-failed",
+    });
+    expect((await fixture.store.recoveryChallenge(conflict.challenge.challengeId))?.consumedAt)
+      .toBeUndefined();
+    expect(await fixture.store.resolve(replacement.keyId)).toBeDefined();
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("rejects a valid recovery challenge response that belongs to another request", async () => {
+    const fixture = await runningFixture();
+    const recovery = await keyPair();
+    await provisionRecoveryHttp(fixture, recovery, "response-substitution-provision");
+    const firstDevice = await keyPair();
+    const firstNextRecovery = await keyPair();
+    const first = await fixture.client.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:first-recovery",
+      displayName: "First Recovery",
+      publicKeyJwk: firstDevice.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: firstNextRecovery.publicKeyJwk,
+    });
+
+    const substituted = new DeviceTrustHttpClient({
+      baseUrl: new URL("https://trust.test"),
+      trustedFetch: async () => new Response(null, { status: 500 }),
+      candidateFetch: async () => new Response(JSON.stringify({
+        schema: DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA,
+        challenge: first,
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    const secondDevice = await keyPair();
+    const secondNextRecovery = await keyPair();
+    await expect(substituted.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:second-recovery",
+      displayName: "Second Recovery",
+      publicKeyJwk: secondDevice.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: secondNextRecovery.publicKeyJwk,
+    })).rejects.toThrow(/does not match the requested recovery\/device keys/);
+    await fixture.server.close();
+    fixture.store.close();
+  });
+
+  it("rejects private JWK fields and malformed or oversized recovery responses", async () => {
+    const fixture = await runningFixture();
+    const recovery = await keyPair();
+    const privateRecovery = await crypto.subtle.exportKey("jwk", recovery.privateKey);
+    await expect(fixture.client.prepareRecoveryCredential(
+      "private-recovery-key",
+      privateRecovery,
+    )).rejects.toThrow();
+
+    const rawPrivate = await signedFetch(fixture.laptop.keyId, fixture.laptop.privateKey)(
+      new URL(DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential, fixture.server.baseUrl),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ eventId: "private-over-wire", publicKeyJwk: privateRecovery }),
+      },
+    );
+    expect(rawPrivate.status).toBe(400);
+
+    const malformed = new DeviceTrustHttpClient({
+      baseUrl: new URL("https://trust.test"),
+      trustedFetch: async () => new Response(null, { status: 500 }),
+      candidateFetch: async () => new Response(JSON.stringify({
+        schema: "wrong-recovery-schema",
+        challenge: {},
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+    await expect(malformed.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:malformed-response",
+      displayName: "Malformed",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    })).rejects.toBeInstanceOf(InvalidDeviceTrustHttpResponseError);
+
+    const oversized = new DeviceTrustHttpClient({
+      baseUrl: new URL("https://trust.test"),
+      trustedFetch: async () => new Response(null, { status: 500 }),
+      candidateFetch: async () => new Response("x", {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(1024 * 1024 + 1),
+        },
+      }),
+    });
+    await expect(oversized.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:oversized-response",
+      displayName: "Oversized",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    })).rejects.toBeInstanceOf(InvalidDeviceTrustHttpResponseError);
     await fixture.server.close();
     fixture.store.close();
   });
