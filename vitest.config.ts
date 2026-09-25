@@ -10,6 +10,7 @@ export default defineConfig({
     alias: {
       "@ssrl/access": source("./packages/access/src/index.ts"),
       "@ssrl/core": source("./packages/core/src/index.ts"),
+      "@ssrl/device-trust": source("./packages/device-trust/src/index.ts"),
       "@ssrl/artifact-store": source("./packages/artifact-store/src/index.ts"),
       "@ssrl/artifact-access": source("./packages/artifact-access/src/index.ts"),
       "@ssrl/storage-local-artifacts": source("./packages/storage-local-artifacts/src/index.ts"),
@@ -30,6 +31,7 @@ export default defineConfig({
       "@ssrl/connector-google-calendar": source("./packages/connector-google-calendar/src/index.ts"),
       "@ssrl/connector-markdown-fs": source("./packages/connector-markdown-fs/src/index.ts"),
       "@ssrl/storage-sqlite": source("./packages/storage-sqlite/src/index.ts"),
+      "@ssrl/storage-sqlite-device-trust": source("./packages/storage-sqlite-device-trust/src/index.ts"),
       "@ssrl/storage-sqlite-capsules": source("./packages/storage-sqlite-capsules/src/index.ts"),
       "@ssrl/mcp-server": source("./packages/mcp-server/src/index.ts"),
       "@ssrl/mcp-http": source("./packages/mcp-http/src/index.ts"),

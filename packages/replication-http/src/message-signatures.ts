@@ -1,7 +1,16 @@
-import {
-  normalizeAccessPrincipal,
-  type AccessPrincipal,
-} from "@ssrl/access";
+import { normalizeAccessPrincipal } from "@ssrl/access";
+import type {
+  ReplicationDeviceCredential,
+  ReplicationDeviceKeyResolver,
+  ReplicationSignatureReplayInput,
+  ReplicationSignatureReplayStore,
+} from "@ssrl/device-trust";
+export type {
+  ReplicationDeviceCredential,
+  ReplicationDeviceKeyResolver,
+  ReplicationSignatureReplayInput,
+  ReplicationSignatureReplayStore,
+} from "@ssrl/device-trust";
 import type {
   ReplicationHttpAuthentication,
   ReplicationHttpAuthenticator,
@@ -29,31 +38,6 @@ const SAFE_NONCE = /^[A-Za-z0-9_-]{16,128}$/;
 const SIGNATURE_INPUT = new RegExp(String.raw`^${SIGNATURE_LABEL}=\("@method" "@target-uri" "content-digest" "content-type"\);created=(\d+);expires=(\d+);nonce="([A-Za-z0-9_-]{16,128})";keyid="([A-Za-z0-9._:-]{1,128})";alg="${SIGNATURE_ALGORITHM}";tag="${SIGNATURE_TAG}"$`);
 const SIGNATURE_VALUE = new RegExp(`^${SIGNATURE_LABEL}=:([A-Za-z0-9+/]+={0,2}):$`);
 const CONTENT_DIGEST_VALUE = new RegExp(`^${CONTENT_DIGEST_ALGORITHM}=:([A-Za-z0-9+/]+={0,2}):$`);
-
-export interface ReplicationDeviceCredential {
-  readonly keyId: string;
-  readonly publicKeyJwk: JsonWebKey;
-  readonly principal: AccessPrincipal;
-  readonly status?: "active" | "revoked";
-}
-
-export interface ReplicationDeviceKeyResolver {
-  resolve(
-    keyId: string,
-  ): ReplicationDeviceCredential | undefined | Promise<ReplicationDeviceCredential | undefined>;
-}
-
-export interface ReplicationSignatureReplayInput {
-  readonly keyId: string;
-  readonly nonce: string;
-  readonly expiresAt: number;
-  readonly now: number;
-}
-
-export interface ReplicationSignatureReplayStore {
-  /** Returns true only when this key/nonce pair was accepted for the first time. */
-  consume(input: ReplicationSignatureReplayInput): boolean | Promise<boolean>;
-}
 
 export interface HttpMessageSignatureAuthenticatorOptions {
   readonly keys: ReplicationDeviceKeyResolver;

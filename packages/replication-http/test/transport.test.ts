@@ -3,6 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AccessPrincipal } from "@ssrl/access";
+import {
+  DeviceTrustManager,
+  ed25519JwkThumbprintUri,
+  normalizeEd25519PublicJwk,
+} from "@ssrl/device-trust";
+import { SQLiteDeviceTrustStore } from "@ssrl/storage-sqlite-device-trust";
 import type { ArtifactDigest, ArtifactStore } from "@ssrl/artifact-store";
 import {
   exportArtifactReplicationRecords,
@@ -203,6 +209,39 @@ async function deviceSignatureMaterial(
   return {
     privateKey: keys.privateKey,
     credential: { keyId, publicKeyJwk, principal: devicePrincipal, status },
+  };
+}
+
+async function durableDeviceSignatureMaterial(
+  keyIdOverride?: string,
+  devicePrincipal: AccessPrincipal = principal,
+) {
+  const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const publicKeyJwk = normalizeEd25519PublicJwk(await crypto.subtle.exportKey("jwk", keys.publicKey));
+  const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+  if (keyIdOverride !== undefined && keyIdOverride !== keyId) {
+    throw new Error("durable device key IDs are derived from public JWK material");
+  }
+  const store = new SQLiteDeviceTrustStore({ path: await tempPath("device-trust.sqlite") });
+  const trust = new DeviceTrustManager({ repository: store, now: () => signatureNow });
+  await trust.bootstrapLocal({
+    eventId: "bootstrap-durable-http",
+    deviceId: "device:durable-http",
+    displayName: "Durable HTTP Device",
+    principal: devicePrincipal,
+    publicKeyJwk,
+  });
+  return {
+    store,
+    material: {
+      privateKey: keys.privateKey,
+      credential: {
+        keyId,
+        publicKeyJwk,
+        principal: devicePrincipal,
+        status: "active" as const,
+      },
+    },
   };
 }
 
@@ -1136,6 +1175,31 @@ describe("device-bound replication HTTP message signatures", () => {
     expect(opened.view.recordCount).toBe(0);
     expect(opened.accounting.allowedDescriptors).toBe(0);
     expect(opened.accounting.policyEvaluations).toBeGreaterThan(0);
+    runtime.semantic.close();
+  });
+
+  it("keeps replication access policy authoritative after durable SQLite device authentication", async () => {
+    const bob: AccessPrincipal = { subject: "user:bob", scopes: ["replication"] };
+    const runtime = await semanticRuntime("durable-policy", "DP");
+    const { store, material } = await durableDeviceSignatureMaterial(undefined, bob);
+    const captured: string[] = [];
+    const http = handler({
+      ...runtime,
+      access: gateway(runtime.source, allowAlicePolicy(captured)),
+      authenticator: new HttpMessageSignatureAuthenticator({
+        keys: store,
+        replayStore: store,
+        now: () => signatureNow,
+      }),
+    });
+    const client = signedClient(http, material);
+
+    const opened = await client.openProjection({ projectionId: "personal" });
+    expect(opened.view.recordCount).toBe(0);
+    expect(opened.accounting.allowedDescriptors).toBe(0);
+    expect(opened.accounting.policyEvaluations).toBeGreaterThan(0);
+    expect(captured.some((value) => value.includes('"subject":"user:bob"'))).toBe(true);
+    store.close();
     runtime.semantic.close();
   });
 
