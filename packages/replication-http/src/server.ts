@@ -482,6 +482,100 @@ function requirePost(request: Request): void {
 
 const knownRoutes = new Set<string>(Object.values(REPLICATION_HTTP_ROUTES));
 
+async function handleBlobInstall(
+  options: ReplicationHttpServerOptions,
+  principal: AccessPrincipal,
+  request: Request,
+  maxBlobInstallRequestBytes: number,
+): Promise<Response> {
+  const frame = await blobInstallFrame(request, maxBlobInstallRequestBytes);
+  const result = await options.gateway.installArtifactBlob(options.artifactStore, {
+    principal,
+    projectionId: frame.metadata.projectionId,
+    record: frame.metadata.record,
+    bytes: frame.bytes,
+    ...(frame.metadata.maxBytes === undefined ? {} : { maxBytes: frame.metadata.maxBytes }),
+  });
+  return jsonResponse(result);
+}
+
+async function handleJsonRoute(
+  options: ReplicationHttpServerOptions,
+  principal: AccessPrincipal,
+  path: string,
+  value: unknown,
+): Promise<Response> {
+  switch (path) {
+    case REPLICATION_HTTP_ROUTES.openProjection: {
+      const body = openProjectionBody(value);
+      return jsonResponse(await options.gateway.openProjection({ principal, ...body }));
+    }
+    case REPLICATION_HTTP_ROUTES.viewInfo: {
+      const body = viewBody(value);
+      const result = await options.gateway.endpoint(principal, body.projectionId).viewInfo(body.viewId);
+      return jsonResponse(result);
+    }
+    case REPLICATION_HTTP_ROUTES.nodeHashes: {
+      const body = nodeHashesBody(value);
+      const result = await options.gateway.endpoint(principal, body.projectionId).nodeHashes(
+        body.viewId,
+        body.refs,
+        body.maxNodeRefs === undefined ? {} : { maxNodeRefs: body.maxNodeRefs },
+      );
+      return jsonResponse(result);
+    }
+    case REPLICATION_HTTP_ROUTES.leafPage: {
+      const body = leafPageBody(value);
+      const result = await options.gateway.endpoint(principal, body.projectionId).leafPage(
+        body.viewId,
+        {
+          leafId: body.leafId,
+          ...(body.cursor === undefined ? {} : { cursor: body.cursor }),
+          ...(body.maxDescriptors === undefined ? {} : { maxDescriptors: body.maxDescriptors }),
+          ...(body.maxBytes === undefined ? {} : { maxBytes: body.maxBytes }),
+        },
+      );
+      return jsonResponse(result);
+    }
+    case REPLICATION_HTTP_ROUTES.readRecords: {
+      const body = readRecordsBody(value);
+      return jsonResponse(await options.gateway.readRecords({ principal, ...body }));
+    }
+    case REPLICATION_HTTP_ROUTES.applySemantic: {
+      const body = applyRecordsBody(value);
+      await options.gateway.applySemantic(options.semanticStore, { principal, ...body });
+      return jsonResponse({ applied: true });
+    }
+    case REPLICATION_HTTP_ROUTES.applyArtifacts: {
+      const body = applyRecordsBody(value);
+      const insertedMutations = await options.gateway.applyArtifacts(
+        options.artifactStore,
+        { principal, ...body },
+      );
+      return jsonResponse({ insertedMutations });
+    }
+    case REPLICATION_HTTP_ROUTES.readBlob: {
+      const body = readBlobBody(value);
+      const result = await options.gateway.readArtifactBlob(options.artifactStore, {
+        principal,
+        ...body,
+      });
+      return new Response(Uint8Array.from(result.bytes), {
+        status: 200,
+        headers: {
+          "content-type": result.mediaType,
+          "content-length": String(result.size),
+          [REPLICATION_BLOB_DIGEST_HEADER]: result.digest,
+          [REPLICATION_BLOB_SIZE_HEADER]: String(result.size),
+          "cache-control": "no-store",
+        },
+      });
+    }
+    default:
+      return errorResponse(404, "route-not-found", "Replication route does not exist");
+  }
+}
+
 export function createReplicationHttpHandler(options: ReplicationHttpServerOptions): ReplicationHttpHandler {
   const allowedHosts = uniqueHostnames(options.allowedHostnames, "allowedHostnames");
   const allowedOrigins = options.allowedOriginHostnames === undefined
@@ -504,81 +598,14 @@ export function createReplicationHttpHandler(options: ReplicationHttpServerOptio
           return errorResponse(404, "route-not-found", "Replication route does not exist");
         }
         if (path === REPLICATION_HTTP_ROUTES.installBlob) {
-          const frame = await blobInstallFrame(request, maxBlobInstallRequestBytes);
-          const result = await options.gateway.installArtifactBlob(options.artifactStore, {
-            principal,
-            projectionId: frame.metadata.projectionId,
-            record: frame.metadata.record,
-            bytes: frame.bytes,
-            ...(frame.metadata.maxBytes === undefined ? {} : { maxBytes: frame.metadata.maxBytes }),
-          });
-          return jsonResponse(result);
+          return await handleBlobInstall(options, principal, request, maxBlobInstallRequestBytes);
         }
-        const value = await jsonBody(request, maxJsonRequestBytes);
-
-        if (path === REPLICATION_HTTP_ROUTES.openProjection) {
-          const body = openProjectionBody(value);
-          return jsonResponse(await options.gateway.openProjection({ principal, ...body }));
-        }
-        if (path === REPLICATION_HTTP_ROUTES.viewInfo) {
-          const body = viewBody(value);
-          return jsonResponse(options.gateway.endpoint(principal, body.projectionId).viewInfo(body.viewId));
-        }
-        if (path === REPLICATION_HTTP_ROUTES.nodeHashes) {
-          const body = nodeHashesBody(value);
-          return jsonResponse(options.gateway.endpoint(principal, body.projectionId).nodeHashes(
-            body.viewId,
-            body.refs,
-            body.maxNodeRefs === undefined ? {} : { maxNodeRefs: body.maxNodeRefs },
-          ));
-        }
-        if (path === REPLICATION_HTTP_ROUTES.leafPage) {
-          const body = leafPageBody(value);
-          return jsonResponse(await options.gateway.endpoint(principal, body.projectionId).leafPage(
-            body.viewId,
-            {
-              leafId: body.leafId,
-              ...(body.cursor === undefined ? {} : { cursor: body.cursor }),
-              ...(body.maxDescriptors === undefined ? {} : { maxDescriptors: body.maxDescriptors }),
-              ...(body.maxBytes === undefined ? {} : { maxBytes: body.maxBytes }),
-            },
-          ));
-        }
-        if (path === REPLICATION_HTTP_ROUTES.readRecords) {
-          const body = readRecordsBody(value);
-          return jsonResponse(await options.gateway.readRecords({ principal, ...body }));
-        }
-        if (path === REPLICATION_HTTP_ROUTES.applySemantic) {
-          const body = applyRecordsBody(value);
-          await options.gateway.applySemantic(options.semanticStore, { principal, ...body });
-          return jsonResponse({ applied: true });
-        }
-        if (path === REPLICATION_HTTP_ROUTES.applyArtifacts) {
-          const body = applyRecordsBody(value);
-          const insertedMutations = await options.gateway.applyArtifacts(
-            options.artifactStore,
-            { principal, ...body },
-          );
-          return jsonResponse({ insertedMutations });
-        }
-        if (path === REPLICATION_HTTP_ROUTES.readBlob) {
-          const body = readBlobBody(value);
-          const result = await options.gateway.readArtifactBlob(options.artifactStore, {
-            principal,
-            ...body,
-          });
-          return new Response(Uint8Array.from(result.bytes), {
-            status: 200,
-            headers: {
-              "content-type": result.mediaType,
-              "content-length": String(result.size),
-              [REPLICATION_BLOB_DIGEST_HEADER]: result.digest,
-              [REPLICATION_BLOB_SIZE_HEADER]: String(result.size),
-              "cache-control": "no-store",
-            },
-          });
-        }
-        return errorResponse(404, "route-not-found", "Replication route does not exist");
+        return await handleJsonRoute(
+          options,
+          principal,
+          path,
+          await jsonBody(request, maxJsonRequestBytes),
+        );
       } catch (error) {
         return mappedError(error);
       }

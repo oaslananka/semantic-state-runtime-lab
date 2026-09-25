@@ -5,14 +5,10 @@ import {
   requiredArtifactBlobs,
   verifyReplicationRecord,
   type ReplicationRecord,
-  type ReplicationRecordKey,
 } from "@ssrl/replication";
 import {
   RECONCILIATION_PROTOCOL_SCHEMA,
-  type LeafPageOptions,
   type MerkleNodeHashResponse,
-  type MerkleNodeRef,
-  type NodeQueryOptions,
   type ReconciliationEndpoint,
   type ReconciliationLeafPage,
   type ReconciliationViewInfo,
@@ -24,7 +20,6 @@ import {
   REPLICATION_BLOB_SIZE_HEADER,
   REPLICATION_HTTP_ERROR_SCHEMA,
   REPLICATION_HTTP_ROUTES,
-  type ApplyArtifactsResponseBody,
   type ApplyRecordsRequestBody,
   type InstallBlobFrameMetadata,
   type InstallBlobResponseBody,
@@ -33,7 +28,6 @@ import {
   type OpenProjectionRequestBody,
   type ReadBlobRequestBody,
   type ReadRecordsRequestBody,
-  type ReplicationHttpErrorBody,
   type ViewInfoRequestBody,
 } from "./protocol.js";
 import {
@@ -506,7 +500,7 @@ export class ReplicationHttpClient {
       ...(input.maxBytes === undefined ? {} : { maxBytes: input.maxBytes }),
     };
     const metadataBytes = new TextEncoder().encode(canonicalJson(metadata));
-    if (metadataBytes.byteLength > 0xffff_ffff) {
+    if (metadataBytes.byteLength > 0xffffffff) {
       throw new RangeError("Blob install metadata exceeds uint32 framing limit");
     }
     const total = 4 + metadataBytes.byteLength + input.bytes.byteLength;

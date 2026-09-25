@@ -68,7 +68,7 @@ function isJson(contentType: string | null): boolean {
 
 function measuredFetch(metrics: WireMetrics): ReplicationHttpFetch {
   return async (input, init) => {
-    const request = input instanceof Request ? new Request(input, init) : new Request(input, init);
+    const request = new Request(input, init);
     const requestCopy = request.clone();
     const requestBytes = new Uint8Array(await requestCopy.arrayBuffer()).byteLength;
     metrics.requests += 1;
