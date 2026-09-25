@@ -4,13 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import {
+  DeviceTrustAuthorizationError,
   DeviceTrustChallengeError,
   DeviceTrustConflictError,
   DeviceTrustProofError,
   DeviceTrustManager,
   ed25519JwkThumbprintUri,
   normalizeEd25519PublicJwk,
+  signDeviceRecoveryChallenge,
   signDeviceTrustChallenge,
+  signRecoveryProvisioningProof,
   type DeviceTrustRepository,
 } from "@ssrl/device-trust";
 import { SQLiteDeviceTrustStore } from "../src/index.js";
@@ -57,6 +60,12 @@ async function bootstrapped(path: string) {
 type BootstrapFixture = Awaited<ReturnType<typeof bootstrapped>>;
 type TestKeyPair = Awaited<ReturnType<typeof keyPair>>;
 
+
+function reopen(path: string, clock: { now: number }) {
+  const store = new SQLiteDeviceTrustStore({ path });
+  return { store, trust: manager(store, clock) };
+}
+
 async function enrollmentChallenge(
   fixture: BootstrapFixture,
   keys: TestKeyPair,
@@ -95,6 +104,134 @@ async function rotationChallenge(fixture: BootstrapFixture, keys: TestKeyPair) {
     publicKeyJwk: keys.publicKeyJwk,
     audience: "ssrl://device-trust/local",
   });
+}
+
+
+async function provisionRecovery(
+  fixture: BootstrapFixture,
+  recovery: TestKeyPair,
+  eventId: string,
+  authorizingKeyId = fixture.laptop.keyId,
+) {
+  const input = {
+    eventId,
+    authorizingKeyId,
+    publicKeyJwk: recovery.publicKeyJwk,
+    audience: "ssrl://device-trust/recovery",
+  } as const;
+  const proof = await fixture.trust.prepareRecoveryCredential(input);
+  const signature = await signRecoveryProvisioningProof(proof, recovery.privateKey);
+  const result = await fixture.trust.setRecoveryCredential({ ...input, signature });
+  return { input, proof, signature, result };
+}
+
+async function recoveryAttempt(
+  fixture: BootstrapFixture,
+  recovery: TestKeyPair,
+  replacement: TestKeyPair,
+  nextRecovery: TestKeyPair,
+  eventId: string,
+  deviceId = "device:replacement",
+  displayName = "Alice Replacement",
+) {
+  const challenge = await fixture.trust.startRecovery({
+    recoveryKeyId: recovery.keyId,
+    deviceId,
+    displayName,
+    publicKeyJwk: replacement.publicKeyJwk,
+    nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+    audience: "ssrl://device-trust/recovery",
+  });
+  const recoverySignature = await signDeviceRecoveryChallenge(challenge, recovery.privateKey);
+  const deviceSignature = await signDeviceRecoveryChallenge(challenge, replacement.privateKey);
+  const nextRecoverySignature = await signDeviceRecoveryChallenge(
+    challenge,
+    nextRecovery.privateKey,
+  );
+  const complete = () => fixture.trust.completeRecovery({
+    eventId,
+    challengeId: challenge.challengeId,
+    recoverySignature,
+    deviceSignature,
+    nextRecoverySignature,
+  });
+  return {
+    challenge,
+    recoverySignature,
+    deviceSignature,
+    nextRecoverySignature,
+    complete,
+  };
+}
+
+async function provisionedRecoveryAttempt(
+  fixture: BootstrapFixture,
+  provisionEventId: string,
+  recoveryEventId: string,
+  deviceId = "device:replacement",
+  displayName = "Alice Replacement",
+) {
+  const recovery = await keyPair();
+  await provisionRecovery(fixture, recovery, provisionEventId);
+  const replacement = await keyPair();
+  const nextRecovery = await keyPair();
+  const attempt = await recoveryAttempt(
+    fixture,
+    recovery,
+    replacement,
+    nextRecovery,
+    recoveryEventId,
+    deviceId,
+    displayName,
+  );
+  return { recovery, replacement, nextRecovery, attempt };
+}
+
+async function expectRecoveryCredentialRejected(
+  fixture: BootstrapFixture,
+  recoveryKeyId: string,
+  deviceId: string,
+): Promise<void> {
+  await expect(fixture.trust.startRecovery({
+    recoveryKeyId,
+    deviceId,
+    displayName: "Rejected Recovery",
+    publicKeyJwk: (await keyPair()).publicKeyJwk,
+    nextRecoveryPublicKeyJwk: (await keyPair()).publicKeyJwk,
+    audience: "ssrl://device-trust/recovery",
+  })).rejects.toBeInstanceOf(DeviceTrustAuthorizationError);
+}
+
+function downgradeToV1(path: string): void {
+  const raw = new DatabaseSync(path);
+  raw.exec(`
+    PRAGMA foreign_keys = OFF;
+    DROP TABLE device_recovery_challenges;
+    DROP TABLE trusted_recovery_credentials;
+    DROP INDEX device_trust_events_device_time;
+    ALTER TABLE device_trust_events RENAME TO device_trust_events_v2;
+    CREATE TABLE device_trust_events (
+      event_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL CHECK(event_type IN (
+        'bootstrap-device', 'enroll-device', 'rotate-key', 'revoke-key', 'revoke-device'
+      )),
+      device_id TEXT NOT NULL,
+      key_id TEXT,
+      occurred_at TEXT NOT NULL,
+      event_json TEXT NOT NULL CHECK(json_valid(event_json))
+    ) STRICT;
+    INSERT INTO device_trust_events(event_id, event_type, device_id, key_id, occurred_at, event_json)
+    SELECT event_id, event_type, device_id, key_id, occurred_at, event_json
+    FROM device_trust_events_v2;
+    DROP TABLE device_trust_events_v2;
+    CREATE INDEX device_trust_events_device_time
+      ON device_trust_events(device_id, occurred_at, event_id);
+    UPDATE device_trust_meta
+    SET schema_version = 1
+    WHERE component = 'device-trust';
+    PRAGMA foreign_keys = ON;
+  `);
+  raw.close();
 }
 
 describe("SQLiteDeviceTrustStore", () => {
@@ -189,8 +326,7 @@ describe("SQLiteDeviceTrustStore", () => {
     expect(challenge.principal).toEqual(principal);
     fixture.store.close();
 
-    const reopened = new SQLiteDeviceTrustStore({ path });
-    const reopenedTrust = manager(reopened, fixture.clock);
+    const { store: reopened, trust: reopenedTrust } = reopen(path, fixture.clock);
     expect((await reopened.challenge(challenge.challengeId))?.consumedAt).toBeUndefined();
     const signature = await signDeviceTrustChallenge(challenge, phone.privateKey);
     const enrolled = await reopenedTrust.completeEnrollment({
@@ -315,8 +451,7 @@ describe("SQLiteDeviceTrustStore", () => {
     fixture.store.close();
 
     fixture.clock.now = Date.parse("2026-09-25T00:10:00Z");
-    const reopened = new SQLiteDeviceTrustStore({ path });
-    const reopenedTrust = manager(reopened, fixture.clock);
+    const { store: reopened, trust: reopenedTrust } = reopen(path, fixture.clock);
     await expect(reopenedTrust.completeEnrollment({
       eventId: "expired-enrollment",
       challengeId: challenge.challengeId,
@@ -444,6 +579,292 @@ describe("SQLiteDeviceTrustStore", () => {
     expect(firstDeviceRevoke.outcome).toBe("inserted");
     expect(replayedDeviceRevoke.outcome).toBe("replayed");
     deviceFixture.store.close();
+  });
+
+  it("provisions, replays and rotates recovery credentials with monotonic generations", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recoveryOne = await keyPair();
+    const first = await provisionRecovery(fixture, recoveryOne, "set-recovery-1");
+
+    expect(first.result.outcome).toBe("inserted");
+    expect(first.result.credential).toEqual(expect.objectContaining({
+      keyId: recoveryOne.keyId,
+      generation: 1,
+      status: "active",
+    }));
+    const replay = await fixture.trust.setRecoveryCredential({
+      ...first.input,
+      signature: first.signature,
+    });
+    expect(replay.outcome).toBe("replayed");
+
+    const recoveryTwo = await keyPair();
+    const second = await provisionRecovery(fixture, recoveryTwo, "set-recovery-2");
+    expect(second.result.credential).toEqual(expect.objectContaining({
+      keyId: recoveryTwo.keyId,
+      generation: 2,
+      predecessorKeyId: recoveryOne.keyId,
+      status: "active",
+    }));
+    expect((await fixture.store.recoveryCredential(recoveryOne.keyId))?.status).toBe("retired");
+    expect((await fixture.store.recoveryCredential(recoveryTwo.keyId))?.status).toBe("active");
+    await expectRecoveryCredentialRejected(
+      fixture,
+      recoveryOne.keyId,
+      "device:replacement-old-recovery",
+    );
+    fixture.store.close();
+  });
+
+  it("rejects invalid recovery provisioning PoP and device/recovery key role reuse", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recovery = await keyPair();
+    const attacker = await keyPair();
+    const input = {
+      eventId: "set-recovery-invalid",
+      authorizingKeyId: fixture.laptop.keyId,
+      publicKeyJwk: recovery.publicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+    } as const;
+    const proof = await fixture.trust.prepareRecoveryCredential(input);
+
+    await expect(fixture.trust.setRecoveryCredential({
+      ...input,
+      signature: await signRecoveryProvisioningProof(proof, attacker.privateKey),
+    })).rejects.toBeInstanceOf(DeviceTrustProofError);
+    expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
+
+    const reusedInput = {
+      eventId: "set-recovery-reused-device-key",
+      authorizingKeyId: fixture.laptop.keyId,
+      publicKeyJwk: fixture.laptop.publicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+    } as const;
+    const reusedProof = await fixture.trust.prepareRecoveryCredential(reusedInput);
+    await expect(fixture.trust.setRecoveryCredential({
+      ...reusedInput,
+      signature: await signRecoveryProvisioningProof(reusedProof, fixture.laptop.privateKey),
+    })).rejects.toBeInstanceOf(DeviceTrustConflictError);
+    expect(await fixture.store.activeRecoveryCredential(principal)).toBeUndefined();
+    fixture.store.close();
+  });
+
+  it("derives recovery principal from the active recovery credential and rejects key-role reuse", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recovery = await keyPair();
+    await provisionRecovery(fixture, recovery, "set-recovery-derived-principal");
+    const replacement = await keyPair();
+    const nextRecovery = await keyPair();
+    const request = {
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:derived-principal",
+      displayName: "Derived Principal Device",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: nextRecovery.publicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+      principal: { subject: "user:mallory", scopes: ["replication"] },
+    };
+    const challenge = await fixture.trust.startRecovery(
+      request as unknown as Parameters<DeviceTrustManager["startRecovery"]>[0],
+    );
+    expect(challenge.principal).toEqual(principal);
+    expect(challenge.principal.subject).not.toBe("user:mallory");
+
+    await expect(fixture.trust.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:reused-recovery-key",
+      displayName: "Reused Key Device",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: recovery.publicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+    })).rejects.toBeInstanceOf(DeviceTrustConflictError);
+    await expect(fixture.trust.startRecovery({
+      recoveryKeyId: recovery.keyId,
+      deviceId: "device:same-device-next-key",
+      displayName: "Same Role Key Device",
+      publicKeyJwk: replacement.publicKeyJwk,
+      nextRecoveryPublicKeyJwk: replacement.publicKeyJwk,
+      audience: "ssrl://device-trust/recovery",
+    })).rejects.toBeInstanceOf(DeviceTrustConflictError);
+    fixture.store.close();
+  });
+
+  it("recovers destructively, rotates recovery authority, and safely replays after expiry", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const phone = await keyPair();
+    await enroll(fixture, phone, "enroll-phone-before-recovery");
+    const { recovery, replacement, nextRecovery, attempt } = await provisionedRecoveryAttempt(
+      fixture,
+      "set-recovery-before-loss",
+      "recover-all-devices",
+    );
+
+    const attacker = await keyPair();
+    await expect(fixture.trust.completeRecovery({
+      eventId: "recover-all-devices",
+      challengeId: attempt.challenge.challengeId,
+      recoverySignature: attempt.recoverySignature,
+      deviceSignature: await signDeviceRecoveryChallenge(attempt.challenge, attacker.privateKey),
+      nextRecoverySignature: attempt.nextRecoverySignature,
+    })).rejects.toBeInstanceOf(DeviceTrustProofError);
+    expect((await fixture.store.recoveryChallenge(attempt.challenge.challengeId))?.consumedAt)
+      .toBeUndefined();
+    expect(await fixture.store.resolve(fixture.laptop.keyId)).toBeDefined();
+    expect(await fixture.store.resolve(phone.keyId)).toBeDefined();
+
+    const recovered = await attempt.complete();
+    expect(recovered.outcome).toBe("inserted");
+    expect(recovered.device).toEqual(expect.objectContaining({
+      deviceId: "device:replacement",
+      status: "active",
+    }));
+    expect(recovered.key.keyId).toBe(replacement.keyId);
+    expect(recovered.recoveryCredential).toEqual(expect.objectContaining({
+      keyId: nextRecovery.keyId,
+      generation: 2,
+      predecessorKeyId: recovery.keyId,
+      status: "active",
+    }));
+    expect((await fixture.store.device("device:laptop"))?.status).toBe("revoked");
+    expect((await fixture.store.device("device:phone"))?.status).toBe("revoked");
+    expect(await fixture.store.resolve(fixture.laptop.keyId)).toBeUndefined();
+    expect(await fixture.store.resolve(phone.keyId)).toBeUndefined();
+    expect(await fixture.store.resolve(replacement.keyId)).toEqual(expect.objectContaining({
+      deviceId: "device:replacement",
+    }));
+    expect((await fixture.store.recoveryCredential(recovery.keyId))?.status).toBe("retired");
+    expect((await fixture.store.recoveryCredential(nextRecovery.keyId))?.status).toBe("active");
+    await expectRecoveryCredentialRejected(
+      fixture,
+      recovery.keyId,
+      "device:old-recovery-reuse",
+    );
+
+    fixture.clock.now = Date.parse("2026-09-25T01:00:00Z");
+    const replay = await attempt.complete();
+    expect(replay.outcome).toBe("replayed");
+    expect(replay.key.keyId).toBe(replacement.keyId);
+
+    const replacementTwo = await keyPair();
+    const recoveryThree = await keyPair();
+    const conflict = await recoveryAttempt(
+      fixture,
+      nextRecovery,
+      replacementTwo,
+      recoveryThree,
+      "recover-all-devices",
+      "device:replacement-two",
+      "Alice Replacement Two",
+    );
+    await expect(conflict.complete()).rejects.toBeInstanceOf(DeviceTrustConflictError);
+    expect((await fixture.store.recoveryChallenge(conflict.challenge.challengeId))?.consumedAt)
+      .toBeUndefined();
+    expect(await fixture.store.resolve(replacement.keyId)).toBeDefined();
+    fixture.store.close();
+  });
+
+  it("persists recovery state across restart and never writes private recovery JWK material", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const { recovery, nextRecovery, attempt } = await provisionedRecoveryAttempt(
+      fixture,
+      "set-recovery-persist",
+      "recover-after-restart",
+    );
+    const privateRecoveryJwk = await crypto.subtle.exportKey("jwk", recovery.privateKey);
+    const privateNextRecoveryJwk = await crypto.subtle.exportKey("jwk", nextRecovery.privateKey);
+    fixture.store.close();
+
+    const { store: reopened, trust: reopenedTrust } = reopen(path, fixture.clock);
+    expect((await reopened.recoveryChallenge(attempt.challenge.challengeId))?.consumedAt)
+      .toBeUndefined();
+    const result = await reopenedTrust.completeRecovery({
+      eventId: "recover-after-restart",
+      challengeId: attempt.challenge.challengeId,
+      recoverySignature: attempt.recoverySignature,
+      deviceSignature: attempt.deviceSignature,
+      nextRecoverySignature: attempt.nextRecoverySignature,
+    });
+    expect(result.outcome).toBe("inserted");
+    reopened.close();
+
+    const bytes = await readFile(path);
+    expect(bytes.toString("utf8")).not.toContain(privateRecoveryJwk.d!);
+    expect(bytes.toString("utf8")).not.toContain(privateNextRecoveryJwk.d!);
+  });
+
+  it("fails closed when durable recovery credential JSON disagrees with indexed columns", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const recovery = await keyPair();
+    await provisionRecovery(fixture, recovery, "set-recovery-corrupt");
+    fixture.store.close();
+
+    const raw = new DatabaseSync(path);
+    raw.prepare(`
+      UPDATE trusted_recovery_credentials
+      SET record_json = ?
+      WHERE key_id = ?
+    `).run(JSON.stringify({ keyId: recovery.keyId }), recovery.keyId);
+    raw.close();
+
+    const reopened = new SQLiteDeviceTrustStore({ path });
+    await expect(reopened.recoveryCredential(recovery.keyId)).rejects.toThrow(/recovery credential/i);
+    reopened.close();
+  });
+
+  it("migrates a v1 registry without losing device, challenge or replay state", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const phone = await keyPair();
+    const challenge = await enrollmentChallenge(fixture, phone);
+    const replay = {
+      keyId: fixture.laptop.keyId,
+      nonce: "nonce_migration_1234567890",
+      now: 1_000,
+      expiresAt: 2_000,
+    };
+    expect(fixture.store.consume(replay)).toBe(true);
+    fixture.store.close();
+    downgradeToV1(path);
+
+    const migrated = new SQLiteDeviceTrustStore({ path });
+    expect(await migrated.resolve(fixture.laptop.keyId)).toBeDefined();
+    expect((await migrated.challenge(challenge.challengeId))?.challenge.challengeId)
+      .toBe(challenge.challengeId);
+    expect(migrated.consume({ ...replay, now: 1_100 })).toBe(false);
+    expect(await migrated.activeRecoveryCredential(principal)).toBeUndefined();
+    migrated.close();
+
+    const raw = new DatabaseSync(path);
+    expect(raw.prepare(`
+      SELECT schema_version FROM device_trust_meta WHERE component = 'device-trust'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    raw.close();
+  });
+
+  it("expires and prunes unused recovery challenges but preserves committed replayability", async () => {
+    const path = await databasePath();
+    const fixture = await bootstrapped(path);
+    const { attempt } = await provisionedRecoveryAttempt(
+      fixture,
+      "set-recovery-expiry",
+      "expired-recovery",
+      "device:expired-replacement",
+      "Expired Replacement",
+    );
+    fixture.clock.now = Date.parse("2026-09-25T00:10:00Z");
+
+    await expect(attempt.complete()).rejects.toBeInstanceOf(DeviceTrustChallengeError);
+    expect((await fixture.store.recoveryChallenge(attempt.challenge.challengeId))?.consumedAt)
+      .toBeUndefined();
+    expect(await fixture.store.pruneExpired("2026-09-25T00:10:00Z")).toBeGreaterThanOrEqual(1);
+    expect(await fixture.store.recoveryChallenge(attempt.challenge.challengeId)).toBeUndefined();
+    fixture.store.close();
   });
 
   it("persists replay nonces across restart and prunes only after their accepted lifetime", async () => {

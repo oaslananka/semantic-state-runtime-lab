@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@ssrl/device-trust": "workspace:*"
+    "@ssrl/device-trust": "workspace:*",
+    "@ssrl/access": "workspace:*"
   },
   "devDependencies": {
-    "@ssrl/access": "workspace:*",
     "@types/node": "26.6.2"
   },
   "exports": {

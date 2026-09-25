@@ -174,6 +174,8 @@ enroll-device
 rotate-key
 revoke-key
 revoke-device
+set-recovery-credential
+recover-trust-set
 ```
 
 The current device/key tables are materialized state derived by the same atomic transaction as each event.
@@ -253,7 +255,7 @@ An expired signature cannot create a fresh replay row.
 
 ## SQLite schema
 
-The v1 backend uses a dedicated SQLite database with `STRICT` tables:
+The durable backend is now device-trust schema v2. v2 preserves the original lifecycle tables and adds owner-controlled recovery. It uses a dedicated SQLite database with `STRICT` tables:
 
 ```text
 device_trust_meta
@@ -261,6 +263,8 @@ trusted_devices
 trusted_device_keys
 device_trust_events
 device_trust_challenges
+trusted_recovery_credentials
+device_recovery_challenges
 replication_signature_replays
 ```
 
@@ -314,8 +318,8 @@ v1 does not implement:
 - unauthenticated remote first-device bootstrap
 - WebAuthn RP/server stack
 - passkey credential storage
-- account recovery UX
-- social recovery
+- password/email/SMS account-reset UX
+- social/quorum recovery
 - hardware attestation verification
 - TPM/Secure Enclave key management adapters
 - distributed/cloud trust-registry consensus
@@ -326,10 +330,12 @@ v1 does not implement:
 
 The next trust work should be chosen from product risk rather than feature count:
 
-1. **Recovery policy**: emergency recovery after loss of all active devices without creating an unauthenticated backdoor.
-2. **Management UX** over the implemented key-bound HTTP protocol: QR/copy/native-device flows that preserve explicit possession confirmation.
-3. **Hardware-backed key adapters**: Secure Enclave/TPM/Android Keystore without changing logical device/key semantics.
+1. **Recovery management HTTP**: expose the implemented recovery state machine without adding enumeration leaks or weaker fallback factors.
+2. **Management UX** over the implemented key-bound protocols: QR/copy/native-device flows that preserve explicit possession confirmation.
+3. **Hardware-backed key adapters**: Secure Enclave/TPM/Android Keystore without changing logical device/key/recovery semantics.
 4. **Shared trust/replay backend** for cloud or multi-process deployments.
-5. **E2E relay encryption** (for example an HPKE-based design) only after trust lifecycle and recovery semantics are stable.
+5. **E2E relay encryption** (for example an HPKE-based design) now that bootstrap, lifecycle, and total-device-loss recovery semantics exist.
 
 The signed management transport and key-bound enrollment offer are documented in `docs/device-trust-management-http-v1.md`.
+
+Owner-controlled destructive recovery is documented in `docs/owner-trust-recovery-v1.md`.

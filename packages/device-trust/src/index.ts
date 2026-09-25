@@ -6,6 +6,9 @@ import { canonicalJson } from "@ssrl/core";
 
 const JWK_THUMBPRINT_URI_PREFIX = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
 const DEVICE_TRUST_PROOF_SCHEMA = "ssrl-device-trust-proof-v1" as const;
+const RECOVERY_PROVISIONING_PROOF_SCHEMA = "ssrl-recovery-provisioning-proof-v1" as const;
+export const DEVICE_RECOVERY_CHALLENGE_SCHEMA = "ssrl-device-recovery-challenge-v1" as const;
+const DEVICE_RECOVERY_PROOF_SCHEMA = "ssrl-device-recovery-proof-v1" as const;
 export const DEVICE_ENROLLMENT_OFFER_SCHEMA = "ssrl-device-enrollment-offer-v1" as const;
 const DEFAULT_CHALLENGE_LIFETIME_SECONDS = 300;
 const MAX_CHALLENGE_LIFETIME_SECONDS = 900;
@@ -13,13 +16,16 @@ const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
 
 export type TrustedDeviceStatus = "active" | "revoked";
 export type TrustedDeviceKeyStatus = "active" | "revoked";
+export type TrustedRecoveryCredentialStatus = "active" | "retired";
 export type DeviceTrustOperation = "enroll-device" | "rotate-key";
 export type DeviceTrustEventType =
   | "bootstrap-device"
   | "enroll-device"
   | "rotate-key"
   | "revoke-key"
-  | "revoke-device";
+  | "revoke-device"
+  | "set-recovery-credential"
+  | "recover-trust-set";
 
 export interface Ed25519PublicJwk {
   readonly kty: "OKP";
@@ -62,12 +68,29 @@ export interface TrustedDeviceKey {
   readonly predecessorKeyId?: string;
 }
 
+
+export interface TrustedRecoveryCredential {
+  readonly keyId: string;
+  readonly principal: AccessPrincipal;
+  readonly publicKeyJwk: Ed25519PublicJwk;
+  readonly generation: number;
+  readonly activatedAt: string;
+  readonly status: TrustedRecoveryCredentialStatus;
+  readonly retiredAt?: string;
+  readonly predecessorKeyId?: string;
+}
+
 export type DeviceTrustActor =
   | { readonly mode: "local-bootstrap" }
   | {
     readonly mode: "trusted-device";
     readonly deviceId: string;
     readonly keyId: string;
+  }
+  | {
+    readonly mode: "recovery-credential";
+    readonly keyId: string;
+    readonly generation: number;
   };
 
 interface DeviceTrustEventBase {
@@ -106,12 +129,32 @@ export interface RevokeDeviceEvent extends DeviceTrustEventBase {
   readonly type: "revoke-device";
 }
 
+export interface SetRecoveryCredentialEvent extends DeviceTrustEventBase {
+  readonly type: "set-recovery-credential";
+  readonly recoveryKeyId: string;
+  readonly recoveryGeneration: number;
+  readonly audience: string;
+}
+
+export interface RecoverTrustSetEvent extends DeviceTrustEventBase {
+  readonly type: "recover-trust-set";
+  readonly keyId: string;
+  readonly challengeId: string;
+  readonly recoveryKeyId: string;
+  readonly recoveryGeneration: number;
+  readonly nextRecoveryKeyId: string;
+  readonly nextRecoveryGeneration: number;
+  readonly audience: string;
+}
+
 export type DeviceTrustEvent =
   | BootstrapDeviceEvent
   | EnrollDeviceEvent
   | RotateKeyEvent
   | RevokeKeyEvent
-  | RevokeDeviceEvent;
+  | RevokeDeviceEvent
+  | SetRecoveryCredentialEvent
+  | RecoverTrustSetEvent;
 
 export interface DeviceTrustChallenge {
   readonly challengeId: string;
@@ -131,6 +174,32 @@ export interface DeviceTrustChallenge {
 
 export interface StoredDeviceTrustChallenge {
   readonly challenge: DeviceTrustChallenge;
+  readonly consumedAt?: string;
+}
+
+
+export interface DeviceRecoveryChallenge {
+  readonly schema: typeof DEVICE_RECOVERY_CHALLENGE_SCHEMA;
+  readonly challengeId: string;
+  readonly challenge: string;
+  readonly principal: AccessPrincipal;
+  readonly recoveryKeyId: string;
+  readonly recoveryGeneration: number;
+  readonly recoveryPublicKeyJwk: Ed25519PublicJwk;
+  readonly deviceId: string;
+  readonly displayName: string;
+  readonly publicKeyJwk: Ed25519PublicJwk;
+  readonly keyId: string;
+  readonly nextRecoveryPublicKeyJwk: Ed25519PublicJwk;
+  readonly nextRecoveryKeyId: string;
+  readonly nextRecoveryGeneration: number;
+  readonly audience: string;
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+export interface StoredDeviceRecoveryChallenge {
+  readonly challenge: DeviceRecoveryChallenge;
   readonly consumedAt?: string;
 }
 
@@ -202,6 +271,38 @@ export interface RevokeDeviceTransition {
   readonly now: string;
 }
 
+
+export interface RecoveryCredentialMutationResult {
+  readonly outcome: "inserted" | "replayed";
+  readonly event: SetRecoveryCredentialEvent;
+  readonly credential: TrustedRecoveryCredential;
+}
+
+export interface RecoveryTrustSetMutationResult {
+  readonly outcome: "inserted" | "replayed";
+  readonly event: RecoverTrustSetEvent;
+  readonly device: TrustedDevice;
+  readonly key: TrustedDeviceKey;
+  readonly recoveryCredential: TrustedRecoveryCredential;
+}
+
+export interface SetRecoveryCredentialTransition {
+  readonly event: SetRecoveryCredentialEvent;
+  readonly credential: TrustedRecoveryCredential;
+  readonly previousRecoveryKeyId?: string;
+  readonly now: string;
+}
+
+export interface RecoverTrustSetTransition {
+  readonly event: RecoverTrustSetEvent;
+  readonly challenge: DeviceRecoveryChallenge;
+  readonly device: TrustedDevice;
+  readonly key: TrustedDeviceKey;
+  readonly recoveryCredential: TrustedRecoveryCredential;
+  readonly previousRecoveryKeyId: string;
+  readonly now: string;
+}
+
 export interface DeviceTrustRepository
   extends ReplicationDeviceKeyResolver, ReplicationSignatureReplayStore {
   isEmpty(): boolean | Promise<boolean>;
@@ -211,12 +312,28 @@ export interface DeviceTrustRepository
   challenge(
     challengeId: string,
   ): StoredDeviceTrustChallenge | undefined | Promise<StoredDeviceTrustChallenge | undefined>;
+  recoveryCredential(
+    keyId: string,
+  ): TrustedRecoveryCredential | undefined | Promise<TrustedRecoveryCredential | undefined>;
+  activeRecoveryCredential(
+    principal: AccessPrincipal,
+  ): TrustedRecoveryCredential | undefined | Promise<TrustedRecoveryCredential | undefined>;
+  recoveryChallenge(
+    challengeId: string,
+  ): StoredDeviceRecoveryChallenge | undefined | Promise<StoredDeviceRecoveryChallenge | undefined>;
   issueChallenge(challenge: DeviceTrustChallenge): void | Promise<void>;
+  issueRecoveryChallenge(challenge: DeviceRecoveryChallenge): void | Promise<void>;
   bootstrapDevice(transition: BootstrapDeviceTransition): DeviceTrustMutationResult | Promise<DeviceTrustMutationResult>;
   enrollDevice(transition: EnrollDeviceTransition): DeviceTrustMutationResult | Promise<DeviceTrustMutationResult>;
   rotateKey(transition: RotateKeyTransition): DeviceTrustMutationResult | Promise<DeviceTrustMutationResult>;
   revokeKey(transition: RevokeKeyTransition): DeviceTrustMutationResult | Promise<DeviceTrustMutationResult>;
   revokeDevice(transition: RevokeDeviceTransition): DeviceTrustMutationResult | Promise<DeviceTrustMutationResult>;
+  setRecoveryCredential(
+    transition: SetRecoveryCredentialTransition,
+  ): RecoveryCredentialMutationResult | Promise<RecoveryCredentialMutationResult>;
+  recoverTrustSet(
+    transition: RecoverTrustSetTransition,
+  ): RecoveryTrustSetMutationResult | Promise<RecoveryTrustSetMutationResult>;
   pruneExpired(now: string): number | Promise<number>;
 }
 
@@ -274,6 +391,47 @@ export interface RevokeDeviceInput {
   readonly targetDeviceId: string;
 }
 
+
+export interface PrepareRecoveryCredentialInput {
+  readonly eventId: string;
+  readonly authorizingKeyId: string;
+  readonly publicKeyJwk: JsonWebKey;
+  readonly audience: string;
+}
+
+export interface SetRecoveryCredentialInput extends PrepareRecoveryCredentialInput {
+  readonly signature: Uint8Array;
+}
+
+export interface StartRecoveryInput {
+  readonly recoveryKeyId: string;
+  readonly deviceId: string;
+  readonly displayName: string;
+  readonly publicKeyJwk: JsonWebKey;
+  readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+  readonly audience: string;
+}
+
+export interface CompleteRecoveryInput {
+  readonly eventId: string;
+  readonly challengeId: string;
+  readonly recoverySignature: Uint8Array;
+  readonly deviceSignature: Uint8Array;
+  readonly nextRecoverySignature: Uint8Array;
+}
+
+export interface RecoveryProvisioningProof {
+  readonly schema: typeof RECOVERY_PROVISIONING_PROOF_SCHEMA;
+  readonly eventId: string;
+  readonly principal: AccessPrincipal;
+  readonly authorizingDeviceId: string;
+  readonly authorizingKeyId: string;
+  readonly recoveryPublicKeyJwk: Ed25519PublicJwk;
+  readonly recoveryKeyId: string;
+  readonly recoveryGeneration: number;
+  readonly audience: string;
+}
+
 export class DeviceTrustError extends Error {
   constructor(message: string) {
     super(message);
@@ -290,6 +448,13 @@ function requiredString(value: string, label: string): string {
   const normalized = value.trim();
   if (normalized.length === 0) throw new TypeError(`${label} must not be empty`);
   return normalized;
+}
+
+function positiveGeneration(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new TypeError(`${label} must be a positive safe integer`);
+  }
+  return value;
 }
 
 function normalizeTimestamp(value: string, label: string): string {
@@ -517,6 +682,51 @@ export async function normalizeTrustedDeviceKey(key: TrustedDeviceKey): Promise<
   };
 }
 
+export async function normalizeTrustedRecoveryCredential(
+  credential: TrustedRecoveryCredential,
+): Promise<TrustedRecoveryCredential> {
+  const status = credential.status;
+  if (status !== "active" && status !== "retired") {
+    throw new TypeError("trusted recovery credential status is invalid");
+  }
+  const publicKeyJwk = normalizeEd25519PublicJwk(credential.publicKeyJwk);
+  const expectedKeyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+  if (credential.keyId !== expectedKeyId) {
+    throw new TypeError(`recovery keyId does not match RFC 9278 JWK Thumbprint URI: ${credential.keyId}`);
+  }
+  const activatedAt = normalizeTimestamp(credential.activatedAt, "recovery credential activatedAt");
+  const retiredAt = credential.retiredAt === undefined
+    ? undefined
+    : normalizeTimestamp(credential.retiredAt, "recovery credential retiredAt");
+  if (status === "active" && retiredAt !== undefined) {
+    throw new TypeError("active recovery credential cannot have retiredAt");
+  }
+  if (status === "retired" && retiredAt === undefined) {
+    throw new TypeError("retired recovery credential requires retiredAt");
+  }
+  if (retiredAt !== undefined && Date.parse(retiredAt) < Date.parse(activatedAt)) {
+    throw new TypeError("recovery credential retiredAt cannot precede activatedAt");
+  }
+  return {
+    keyId: expectedKeyId,
+    principal: normalizeAccessPrincipal(credential.principal),
+    publicKeyJwk,
+    generation: positiveGeneration(credential.generation, "recovery credential generation"),
+    activatedAt,
+    status,
+    ...(retiredAt === undefined ? {} : { retiredAt }),
+    ...(credential.predecessorKeyId === undefined
+      ? {}
+      : { predecessorKeyId: requiredString(credential.predecessorKeyId, "recovery predecessorKeyId") }),
+  };
+}
+
+export async function trustedRecoveryCredentialJson(
+  credential: TrustedRecoveryCredential,
+): Promise<string> {
+  return canonicalJson(await normalizeTrustedRecoveryCredential(credential));
+}
+
 function normalizeDeviceTrustActor(actor: DeviceTrustActor): DeviceTrustActor {
   if (actor.mode === "local-bootstrap") return { mode: "local-bootstrap" };
   if (actor.mode === "trusted-device") {
@@ -524,6 +734,13 @@ function normalizeDeviceTrustActor(actor: DeviceTrustActor): DeviceTrustActor {
       mode: "trusted-device",
       deviceId: requiredString(actor.deviceId, "actor deviceId"),
       keyId: requiredString(actor.keyId, "actor keyId"),
+    };
+  }
+  if (actor.mode === "recovery-credential") {
+    return {
+      mode: "recovery-credential",
+      keyId: requiredString(actor.keyId, "recovery actor keyId"),
+      generation: positiveGeneration(actor.generation, "recovery actor generation"),
     };
   }
   throw new TypeError("device trust actor mode is invalid");
@@ -574,6 +791,35 @@ export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustE
         throw new TypeError("revoke-device event requires trusted-device actor");
       }
       return { ...base, type: event.type };
+    case "set-recovery-credential":
+      if (event.actor.mode !== "trusted-device") {
+        throw new TypeError("set-recovery-credential event requires trusted-device actor");
+      }
+      return {
+        ...base,
+        type: event.type,
+        recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
+        recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
+        audience: requiredString(event.audience, "event audience"),
+      };
+    case "recover-trust-set":
+      if (event.actor.mode !== "recovery-credential") {
+        throw new TypeError("recover-trust-set event requires recovery-credential actor");
+      }
+      return {
+        ...base,
+        type: event.type,
+        keyId: requiredString(event.keyId, "event keyId"),
+        challengeId: requiredString(event.challengeId, "event challengeId"),
+        recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
+        recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
+        nextRecoveryKeyId: requiredString(event.nextRecoveryKeyId, "event nextRecoveryKeyId"),
+        nextRecoveryGeneration: positiveGeneration(
+          event.nextRecoveryGeneration,
+          "event nextRecoveryGeneration",
+        ),
+        audience: requiredString(event.audience, "event audience"),
+      };
     default:
       throw new TypeError("device trust event type is invalid");
   }
@@ -696,8 +942,234 @@ export async function verifyDeviceTrustChallenge(
   );
 }
 
+async function verifyEd25519Proof(
+  publicKeyJwk: Ed25519PublicJwk,
+  signature: Uint8Array,
+  bytes: Uint8Array,
+): Promise<boolean> {
+  if (signature.byteLength !== 64) return false;
+  const publicKey = await globalThis.crypto.subtle.importKey(
+    "jwk",
+    publicKeyJwk,
+    { name: "Ed25519" },
+    false,
+    ["verify"],
+  );
+  return globalThis.crypto.subtle.verify(
+    "Ed25519",
+    publicKey,
+    cloneBytes(signature),
+    cloneBytes(bytes),
+  );
+}
+
+async function signEd25519Proof(privateKey: CryptoKey, bytes: Uint8Array): Promise<Uint8Array> {
+  if (
+    privateKey.type !== "private"
+    || privateKey.algorithm.name !== "Ed25519"
+    || !privateKey.usages.includes("sign")
+  ) {
+    throw new TypeError("recovery proof key must be an Ed25519 private CryptoKey");
+  }
+  return new Uint8Array(await globalThis.crypto.subtle.sign(
+    "Ed25519",
+    privateKey,
+    cloneBytes(bytes),
+  ));
+}
+
+export async function normalizeRecoveryProvisioningProof(
+  proof: RecoveryProvisioningProof,
+): Promise<RecoveryProvisioningProof> {
+  if (proof.schema !== RECOVERY_PROVISIONING_PROOF_SCHEMA) {
+    throw new TypeError("recovery provisioning proof schema is invalid");
+  }
+  const recoveryPublicKeyJwk = normalizeEd25519PublicJwk(proof.recoveryPublicKeyJwk);
+  const recoveryKeyId = await ed25519JwkThumbprintUri(recoveryPublicKeyJwk);
+  if (proof.recoveryKeyId !== recoveryKeyId) {
+    throw new TypeError("recovery provisioning keyId does not match public JWK thumbprint");
+  }
+  return {
+    schema: RECOVERY_PROVISIONING_PROOF_SCHEMA,
+    eventId: requiredString(proof.eventId, "recovery provisioning eventId"),
+    principal: normalizeAccessPrincipal(proof.principal),
+    authorizingDeviceId: requiredString(
+      proof.authorizingDeviceId,
+      "recovery provisioning authorizingDeviceId",
+    ),
+    authorizingKeyId: requiredString(proof.authorizingKeyId, "recovery provisioning authorizingKeyId"),
+    recoveryPublicKeyJwk,
+    recoveryKeyId,
+    recoveryGeneration: positiveGeneration(
+      proof.recoveryGeneration,
+      "recovery provisioning generation",
+    ),
+    audience: requiredString(proof.audience, "recovery provisioning audience"),
+  };
+}
+
+export async function recoveryProvisioningProofJson(
+  proof: RecoveryProvisioningProof,
+): Promise<string> {
+  return canonicalJson(await normalizeRecoveryProvisioningProof(proof));
+}
+
+export async function recoveryProvisioningProofBytes(
+  proof: RecoveryProvisioningProof,
+): Promise<Uint8Array> {
+  return new TextEncoder().encode(await recoveryProvisioningProofJson(proof));
+}
+
+export async function signRecoveryProvisioningProof(
+  proof: RecoveryProvisioningProof,
+  privateKey: CryptoKey,
+): Promise<Uint8Array> {
+  return signEd25519Proof(privateKey, await recoveryProvisioningProofBytes(proof));
+}
+
+export async function verifyRecoveryProvisioningProof(
+  proof: RecoveryProvisioningProof,
+  signature: Uint8Array,
+): Promise<boolean> {
+  let normalized: RecoveryProvisioningProof;
+  try {
+    normalized = await normalizeRecoveryProvisioningProof(proof);
+  } catch {
+    return false;
+  }
+  return verifyEd25519Proof(
+    normalized.recoveryPublicKeyJwk,
+    signature,
+    await recoveryProvisioningProofBytes(normalized),
+  );
+}
+
+export function normalizeDeviceRecoveryChallenge(
+  challenge: DeviceRecoveryChallenge,
+): DeviceRecoveryChallenge {
+  if (challenge.schema !== DEVICE_RECOVERY_CHALLENGE_SCHEMA) {
+    throw new TypeError("device recovery challenge schema is invalid");
+  }
+  const createdAt = normalizeTimestamp(challenge.createdAt, "recovery challenge createdAt");
+  const expiresAt = normalizeTimestamp(challenge.expiresAt, "recovery challenge expiresAt");
+  if (Date.parse(expiresAt) <= Date.parse(createdAt)) {
+    throw new TypeError("recovery challenge expiresAt must be after createdAt");
+  }
+  const recoveryGeneration = positiveGeneration(
+    challenge.recoveryGeneration,
+    "recovery challenge generation",
+  );
+  const nextRecoveryGeneration = positiveGeneration(
+    challenge.nextRecoveryGeneration,
+    "next recovery generation",
+  );
+  if (nextRecoveryGeneration !== recoveryGeneration + 1) {
+    throw new TypeError("next recovery generation must increment current generation by one");
+  }
+  return {
+    schema: DEVICE_RECOVERY_CHALLENGE_SCHEMA,
+    challengeId: requiredString(challenge.challengeId, "recovery challengeId"),
+    challenge: requiredString(challenge.challenge, "recovery challenge"),
+    principal: normalizeAccessPrincipal(challenge.principal),
+    recoveryKeyId: requiredString(challenge.recoveryKeyId, "recovery keyId"),
+    recoveryGeneration,
+    recoveryPublicKeyJwk: normalizeEd25519PublicJwk(challenge.recoveryPublicKeyJwk),
+    deviceId: requiredString(challenge.deviceId, "recovery deviceId"),
+    displayName: requiredString(challenge.displayName, "recovery displayName"),
+    publicKeyJwk: normalizeEd25519PublicJwk(challenge.publicKeyJwk),
+    keyId: requiredString(challenge.keyId, "recovery device keyId"),
+    nextRecoveryPublicKeyJwk: normalizeEd25519PublicJwk(challenge.nextRecoveryPublicKeyJwk),
+    nextRecoveryKeyId: requiredString(challenge.nextRecoveryKeyId, "next recovery keyId"),
+    nextRecoveryGeneration,
+    audience: requiredString(challenge.audience, "recovery audience"),
+    createdAt,
+    expiresAt,
+  };
+}
+
+export async function validateDeviceRecoveryChallengeKeyIds(
+  challenge: DeviceRecoveryChallenge,
+): Promise<DeviceRecoveryChallenge> {
+  const normalized = normalizeDeviceRecoveryChallenge(challenge);
+  const [recoveryKeyId, keyId, nextRecoveryKeyId] = await Promise.all([
+    ed25519JwkThumbprintUri(normalized.recoveryPublicKeyJwk),
+    ed25519JwkThumbprintUri(normalized.publicKeyJwk),
+    ed25519JwkThumbprintUri(normalized.nextRecoveryPublicKeyJwk),
+  ]);
+  if (
+    normalized.recoveryKeyId !== recoveryKeyId
+    || normalized.keyId !== keyId
+    || normalized.nextRecoveryKeyId !== nextRecoveryKeyId
+  ) {
+    throw new TypeError("device recovery challenge keyId does not match public JWK thumbprint");
+  }
+  if (new Set([recoveryKeyId, keyId, nextRecoveryKeyId]).size !== 3) {
+    throw new TypeError("device recovery challenge requires distinct current/device/next recovery keys");
+  }
+  return normalized;
+}
+
+export async function deviceRecoveryChallengeJson(
+  challenge: DeviceRecoveryChallenge,
+): Promise<string> {
+  return canonicalJson(await validateDeviceRecoveryChallengeKeyIds(challenge));
+}
+
+export async function deviceRecoveryProofBytes(
+  challenge: DeviceRecoveryChallenge,
+): Promise<Uint8Array> {
+  const normalized = await validateDeviceRecoveryChallengeKeyIds(challenge);
+  return new TextEncoder().encode(canonicalJson({
+    schema: DEVICE_RECOVERY_PROOF_SCHEMA,
+    challengeId: normalized.challengeId,
+    challenge: normalized.challenge,
+    principal: normalized.principal,
+    recoveryKeyId: normalized.recoveryKeyId,
+    recoveryGeneration: normalized.recoveryGeneration,
+    deviceId: normalized.deviceId,
+    displayName: normalized.displayName,
+    publicKeyJwk: normalized.publicKeyJwk,
+    keyId: normalized.keyId,
+    nextRecoveryPublicKeyJwk: normalized.nextRecoveryPublicKeyJwk,
+    nextRecoveryKeyId: normalized.nextRecoveryKeyId,
+    nextRecoveryGeneration: normalized.nextRecoveryGeneration,
+    audience: normalized.audience,
+  }));
+}
+
+export async function signDeviceRecoveryChallenge(
+  challenge: DeviceRecoveryChallenge,
+  privateKey: CryptoKey,
+): Promise<Uint8Array> {
+  return signEd25519Proof(privateKey, await deviceRecoveryProofBytes(challenge));
+}
+
+export async function verifyDeviceRecoveryChallengeSignature(
+  challenge: DeviceRecoveryChallenge,
+  publicKeyJwk: Ed25519PublicJwk,
+  signature: Uint8Array,
+): Promise<boolean> {
+  try {
+    return await verifyEd25519Proof(
+      publicKeyJwk,
+      signature,
+      await deviceRecoveryProofBytes(challenge),
+    );
+  } catch {
+    return false;
+  }
+}
+
 function trustedActor(device: TrustedDevice, key: TrustedDeviceKey): DeviceTrustActor {
   return { mode: "trusted-device", deviceId: device.deviceId, keyId: key.keyId };
+}
+
+function recoveryActor(credential: TrustedRecoveryCredential): DeviceTrustActor {
+  return {
+    mode: "recovery-credential",
+    keyId: credential.keyId,
+    generation: credential.generation,
+  };
 }
 
 function principalMatches(left: AccessPrincipal, right: AccessPrincipal): boolean {
@@ -768,6 +1240,33 @@ export class DeviceTrustManager {
       throw new DeviceTrustConflictError(`replayed ${label} event has missing materialized state`);
     }
     return { outcome: "replayed", event, device };
+  }
+
+  async #replayedRecoveryCredentialEvent(
+    event: SetRecoveryCredentialEvent,
+  ): Promise<RecoveryCredentialMutationResult> {
+    const credential = await this.#repository.recoveryCredential(event.recoveryKeyId);
+    if (credential === undefined || credential.generation !== event.recoveryGeneration) {
+      throw new DeviceTrustConflictError("replayed recovery credential event has missing materialized state");
+    }
+    return { outcome: "replayed", event, credential };
+  }
+
+  async #replayedRecoveryEvent(event: RecoverTrustSetEvent): Promise<RecoveryTrustSetMutationResult> {
+    const [device, key, recoveryCredential] = await Promise.all([
+      this.#repository.device(event.deviceId),
+      this.#repository.key(event.keyId),
+      this.#repository.recoveryCredential(event.nextRecoveryKeyId),
+    ]);
+    if (
+      device === undefined
+      || key === undefined
+      || recoveryCredential === undefined
+      || recoveryCredential.generation !== event.nextRecoveryGeneration
+    ) {
+      throw new DeviceTrustConflictError("replayed trust recovery event has missing materialized state");
+    }
+    return { outcome: "replayed", event, device, key, recoveryCredential };
   }
 
   async bootstrapLocal(input: LocalBootstrapInput): Promise<DeviceTrustMutationResult> {
@@ -1080,4 +1579,285 @@ export class DeviceTrustManager {
     };
     return this.#repository.revokeDevice({ event, deviceId: target.deviceId, now: occurredAt });
   }
+
+  async prepareRecoveryCredential(
+    input: PrepareRecoveryCredentialInput,
+  ): Promise<RecoveryProvisioningProof> {
+    const eventId = requiredString(input.eventId, "eventId");
+    const authorizingKeyId = requiredString(input.authorizingKeyId, "authorizingKeyId");
+    const audience = requiredString(input.audience, "recovery audience");
+    const recoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const recoveryKeyId = await ed25519JwkThumbprintUri(recoveryPublicKeyJwk);
+    const existing = await this.#repository.event(eventId);
+    if (existing !== undefined) {
+      if (
+        existing.type !== "set-recovery-credential"
+        || existing.actor.mode !== "trusted-device"
+        || existing.actor.keyId !== authorizingKeyId
+        || existing.recoveryKeyId !== recoveryKeyId
+        || existing.audience !== audience
+      ) {
+        throw new DeviceTrustConflictError(
+          `device trust event ${eventId} collides with different content`,
+        );
+      }
+      return normalizeRecoveryProvisioningProof({
+        schema: RECOVERY_PROVISIONING_PROOF_SCHEMA,
+        eventId,
+        principal: existing.principal,
+        authorizingDeviceId: existing.actor.deviceId,
+        authorizingKeyId: existing.actor.keyId,
+        recoveryPublicKeyJwk,
+        recoveryKeyId,
+        recoveryGeneration: existing.recoveryGeneration,
+        audience,
+      });
+    }
+
+    const authorization = await this.#activeAuthorization(authorizingKeyId);
+    const current = await this.#repository.activeRecoveryCredential(authorization.device.principal);
+    return normalizeRecoveryProvisioningProof({
+      schema: RECOVERY_PROVISIONING_PROOF_SCHEMA,
+      eventId,
+      principal: authorization.device.principal,
+      authorizingDeviceId: authorization.device.deviceId,
+      authorizingKeyId: authorization.key.keyId,
+      recoveryPublicKeyJwk,
+      recoveryKeyId,
+      recoveryGeneration: (current?.generation ?? 0) + 1,
+      audience,
+    });
+  }
+
+  async setRecoveryCredential(
+    input: SetRecoveryCredentialInput,
+  ): Promise<RecoveryCredentialMutationResult> {
+    const proof = await this.prepareRecoveryCredential(input);
+    if (!(await verifyRecoveryProvisioningProof(proof, input.signature))) {
+      throw new DeviceTrustProofError("recovery credential proof of possession is invalid");
+    }
+    const existing = await this.#repository.event(proof.eventId);
+    if (existing !== undefined) {
+      if (existing.type !== "set-recovery-credential") {
+        throw new DeviceTrustConflictError(
+          `device trust event ${proof.eventId} collides with different content`,
+        );
+      }
+      return this.#replayedRecoveryCredentialEvent(existing);
+    }
+    if (await this.#repository.key(proof.recoveryKeyId) !== undefined) {
+      throw new DeviceTrustConflictError("recovery key material must not reuse a device key");
+    }
+    if (await this.#repository.recoveryCredential(proof.recoveryKeyId) !== undefined) {
+      throw new DeviceTrustConflictError("recovery key material has already been used");
+    }
+    const authorization = await this.#activeAuthorization(proof.authorizingKeyId);
+    const current = await this.#repository.activeRecoveryCredential(proof.principal);
+    if (proof.recoveryGeneration !== (current?.generation ?? 0) + 1) {
+      throw new DeviceTrustConflictError("recovery credential generation changed during provisioning");
+    }
+    const occurredAt = nowIso(this.#now);
+    const credential = await normalizeTrustedRecoveryCredential({
+      keyId: proof.recoveryKeyId,
+      principal: proof.principal,
+      publicKeyJwk: proof.recoveryPublicKeyJwk,
+      generation: proof.recoveryGeneration,
+      activatedAt: occurredAt,
+      status: "active",
+      ...(current === undefined ? {} : { predecessorKeyId: current.keyId }),
+    });
+    const event: SetRecoveryCredentialEvent = {
+      eventId: proof.eventId,
+      type: "set-recovery-credential",
+      occurredAt,
+      principal: proof.principal,
+      deviceId: authorization.device.deviceId,
+      actor: trustedActor(authorization.device, authorization.key),
+      recoveryKeyId: proof.recoveryKeyId,
+      recoveryGeneration: proof.recoveryGeneration,
+      audience: proof.audience,
+    };
+    return this.#repository.setRecoveryCredential({
+      event,
+      credential,
+      ...(current === undefined ? {} : { previousRecoveryKeyId: current.keyId }),
+      now: occurredAt,
+    });
+  }
+
+  async startRecovery(input: StartRecoveryInput): Promise<DeviceRecoveryChallenge> {
+    const recoveryKeyId = requiredString(input.recoveryKeyId, "recoveryKeyId");
+    const recoveryCredential = await this.#repository.recoveryCredential(recoveryKeyId);
+    if (recoveryCredential?.status !== "active") {
+      throw new DeviceTrustAuthorizationError("recovery credential is not active");
+    }
+    const deviceId = requiredString(input.deviceId, "recovery deviceId");
+    if (await this.#repository.device(deviceId) !== undefined) {
+      throw new DeviceTrustConflictError("recovery replacement deviceId must be fresh");
+    }
+    const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const keyId = await ed25519JwkThumbprintUri(publicKeyJwk);
+    const nextRecoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.nextRecoveryPublicKeyJwk);
+    const nextRecoveryKeyId = await ed25519JwkThumbprintUri(nextRecoveryPublicKeyJwk);
+    if (new Set([recoveryKeyId, keyId, nextRecoveryKeyId]).size !== 3) {
+      throw new DeviceTrustConflictError("recovery requires distinct current, device and next recovery keys");
+    }
+    if (
+      await this.#repository.key(keyId) !== undefined
+      || await this.#repository.recoveryCredential(keyId) !== undefined
+    ) {
+      throw new DeviceTrustConflictError("recovery replacement device key must be fresh");
+    }
+    if (
+      await this.#repository.key(nextRecoveryKeyId) !== undefined
+      || await this.#repository.recoveryCredential(nextRecoveryKeyId) !== undefined
+    ) {
+      throw new DeviceTrustConflictError("next recovery key must be fresh");
+    }
+    const createdAt = nowIso(this.#now);
+    const expiresAt = new Date(
+      Date.parse(createdAt) + this.#challengeLifetimeSeconds * 1_000,
+    ).toISOString();
+    const challenge = await validateDeviceRecoveryChallengeKeyIds({
+      schema: DEVICE_RECOVERY_CHALLENGE_SCHEMA,
+      challengeId: randomToken(this.#randomBytes, 18, "recovery challenge id"),
+      challenge: randomToken(this.#randomBytes, 32, "recovery challenge value"),
+      principal: recoveryCredential.principal,
+      recoveryKeyId: recoveryCredential.keyId,
+      recoveryGeneration: recoveryCredential.generation,
+      recoveryPublicKeyJwk: recoveryCredential.publicKeyJwk,
+      deviceId,
+      displayName: requiredString(input.displayName, "recovery displayName"),
+      publicKeyJwk,
+      keyId,
+      nextRecoveryPublicKeyJwk,
+      nextRecoveryKeyId,
+      nextRecoveryGeneration: recoveryCredential.generation + 1,
+      audience: requiredString(input.audience, "recovery audience"),
+      createdAt,
+      expiresAt,
+    });
+    await this.#repository.issueRecoveryChallenge(challenge);
+    return challenge;
+  }
+
+  async completeRecovery(input: CompleteRecoveryInput): Promise<RecoveryTrustSetMutationResult> {
+    const challengeId = requiredString(input.challengeId, "recovery challengeId");
+    const stored = await this.#repository.recoveryChallenge(challengeId);
+    if (stored === undefined) {
+      throw new DeviceTrustChallengeError("device recovery challenge is unknown");
+    }
+    const challenge = await validateDeviceRecoveryChallengeKeyIds(stored.challenge);
+    const [recoveryValid, deviceValid, nextRecoveryValid] = await Promise.all([
+      verifyDeviceRecoveryChallengeSignature(
+        challenge,
+        challenge.recoveryPublicKeyJwk,
+        input.recoverySignature,
+      ),
+      verifyDeviceRecoveryChallengeSignature(challenge, challenge.publicKeyJwk, input.deviceSignature),
+      verifyDeviceRecoveryChallengeSignature(
+        challenge,
+        challenge.nextRecoveryPublicKeyJwk,
+        input.nextRecoverySignature,
+      ),
+    ]);
+    if (!recoveryValid || !deviceValid || !nextRecoveryValid) {
+      throw new DeviceTrustProofError("device recovery proof is invalid");
+    }
+    const eventId = requiredString(input.eventId, "eventId");
+    const existing = await this.#repository.event(eventId);
+    if (existing !== undefined) {
+      if (
+        existing.type !== "recover-trust-set"
+        || existing.challengeId !== challenge.challengeId
+        || existing.deviceId !== challenge.deviceId
+        || existing.keyId !== challenge.keyId
+        || existing.recoveryKeyId !== challenge.recoveryKeyId
+        || existing.recoveryGeneration !== challenge.recoveryGeneration
+        || existing.nextRecoveryKeyId !== challenge.nextRecoveryKeyId
+        || existing.nextRecoveryGeneration !== challenge.nextRecoveryGeneration
+        || existing.audience !== challenge.audience
+        || !principalMatches(existing.principal, challenge.principal)
+      ) {
+        throw new DeviceTrustConflictError(`device trust event ${eventId} collides with different content`);
+      }
+      return this.#replayedRecoveryEvent(existing);
+    }
+    if (stored.consumedAt !== undefined) {
+      throw new DeviceTrustChallengeError("device recovery challenge has already been consumed");
+    }
+    if (Date.parse(challenge.expiresAt) < this.#now()) {
+      throw new DeviceTrustChallengeError("device recovery challenge has expired");
+    }
+    const current = await this.#repository.recoveryCredential(challenge.recoveryKeyId);
+    if (
+      current?.status !== "active"
+      || current.generation !== challenge.recoveryGeneration
+      || !principalMatches(current.principal, challenge.principal)
+      || await trustedRecoveryCredentialJson(current)
+        !== await trustedRecoveryCredentialJson({
+          ...current,
+          publicKeyJwk: challenge.recoveryPublicKeyJwk,
+        })
+    ) {
+      throw new DeviceTrustAuthorizationError("recovery credential no longer matches challenge state");
+    }
+    if (
+      await this.#repository.device(challenge.deviceId) !== undefined
+      || await this.#repository.key(challenge.keyId) !== undefined
+      || await this.#repository.recoveryCredential(challenge.nextRecoveryKeyId) !== undefined
+      || await this.#repository.key(challenge.nextRecoveryKeyId) !== undefined
+    ) {
+      throw new DeviceTrustConflictError("recovery target identities are no longer fresh");
+    }
+    const occurredAt = nowIso(this.#now);
+    const device = normalizeTrustedDevice({
+      deviceId: challenge.deviceId,
+      principal: challenge.principal,
+      displayName: challenge.displayName,
+      enrolledAt: occurredAt,
+      status: "active",
+    });
+    const key = await normalizeTrustedDeviceKey({
+      keyId: challenge.keyId,
+      deviceId: challenge.deviceId,
+      publicKeyJwk: challenge.publicKeyJwk,
+      activatedAt: occurredAt,
+      status: "active",
+    });
+    const recoveryCredential = await normalizeTrustedRecoveryCredential({
+      keyId: challenge.nextRecoveryKeyId,
+      principal: challenge.principal,
+      publicKeyJwk: challenge.nextRecoveryPublicKeyJwk,
+      generation: challenge.nextRecoveryGeneration,
+      activatedAt: occurredAt,
+      status: "active",
+      predecessorKeyId: challenge.recoveryKeyId,
+    });
+    const event: RecoverTrustSetEvent = {
+      eventId,
+      type: "recover-trust-set",
+      occurredAt,
+      principal: challenge.principal,
+      deviceId: challenge.deviceId,
+      keyId: challenge.keyId,
+      challengeId: challenge.challengeId,
+      recoveryKeyId: challenge.recoveryKeyId,
+      recoveryGeneration: challenge.recoveryGeneration,
+      nextRecoveryKeyId: challenge.nextRecoveryKeyId,
+      nextRecoveryGeneration: challenge.nextRecoveryGeneration,
+      audience: challenge.audience,
+      actor: recoveryActor(current),
+    };
+    return this.#repository.recoverTrustSet({
+      event,
+      challenge,
+      device,
+      key,
+      recoveryCredential,
+      previousRecoveryKeyId: current.keyId,
+      now: occurredAt,
+    });
+  }
+
 }
