@@ -296,6 +296,15 @@ importers:
 
   packages/core: {}
 
+  packages/device-trust:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/ingestion:
     dependencies:
       '@ssrl/artifact-store':
@@ -542,6 +551,9 @@ importers:
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/device-trust':
+        specifier: workspace:*
+        version: link:../device-trust
       '@ssrl/replication':
         specifier: workspace:*
         version: link:../replication
@@ -558,6 +570,9 @@ importers:
       '@ssrl/storage-sqlite':
         specifier: workspace:*
         version: link:../storage-sqlite
+      '@ssrl/storage-sqlite-device-trust':
+        specifier: workspace:*
+        version: link:../storage-sqlite-device-trust
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
@@ -649,6 +664,19 @@ importers:
       '@ssrl/storage-sqlite':
         specifier: workspace:*
         version: link:../storage-sqlite
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/storage-sqlite-device-trust:
+    dependencies:
+      '@ssrl/device-trust':
+        specifier: workspace:*
+        version: link:../device-trust
+    devDependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2
