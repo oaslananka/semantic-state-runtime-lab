@@ -10,7 +10,6 @@ import {
 import {
   encryptionKeyIdentity,
   normalizeTrustedEncryptionKeyBinding,
-  type ActiveEncryptionRecipient,
   type EncryptionBindingSubjectKind,
   type TrustedDeviceEncryptionKeyBinding,
   type TrustedEncryptionKeyBinding,
@@ -383,7 +382,7 @@ export interface DeviceTrustRepository
   ): TrustedEncryptionKeyBinding | undefined | Promise<TrustedEncryptionKeyBinding | undefined>;
   activeEncryptionRecipients(
     principal: AccessPrincipal,
-  ): readonly ActiveEncryptionRecipient[] | Promise<readonly ActiveEncryptionRecipient[]>;
+  ): readonly TrustedEncryptionKeyBinding[] | Promise<readonly TrustedEncryptionKeyBinding[]>;
   recoveryChallenge(
     challengeId: string,
   ): StoredDeviceRecoveryChallenge | undefined | Promise<StoredDeviceRecoveryChallenge | undefined>;
@@ -864,124 +863,170 @@ function normalizeDeviceTrustActor(actor: DeviceTrustActor): DeviceTrustActor {
   throw new TypeError("device trust actor mode is invalid");
 }
 
-export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustEvent {
-  const base = {
+type NormalizedDeviceTrustEventBase = Omit<DeviceTrustEventBase, "type">;
+
+function normalizedDeviceTrustEventBase(event: DeviceTrustEvent): NormalizedDeviceTrustEventBase {
+  return {
     eventId: requiredString(event.eventId, "eventId"),
     occurredAt: normalizeTimestamp(event.occurredAt, "event occurredAt"),
     principal: normalizeAccessPrincipal(event.principal),
     deviceId: requiredString(event.deviceId, "event deviceId"),
     actor: normalizeDeviceTrustActor(event.actor),
   };
-  switch (event.type) {
-    case "bootstrap-device":
-      if (event.actor.mode !== "local-bootstrap") {
-        throw new TypeError("bootstrap-device event requires local-bootstrap actor");
-      }
-      return {
-        ...base,
-        type: event.type,
-        keyId: requiredString(event.keyId, "event keyId"),
-        ...(event.encryptionKeyId === undefined
-          ? {}
-          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
-      };
-    case "enroll-device":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("enroll-device event requires trusted-device actor");
-      }
-      return {
-        ...base,
-        type: event.type,
-        keyId: requiredString(event.keyId, "event keyId"),
-        challengeId: requiredString(event.challengeId, "event challengeId"),
-        ...(event.encryptionKeyId === undefined
-          ? {}
-          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
-      };
-    case "rotate-key":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("rotate-key event requires trusted-device actor");
-      }
-      return {
-        ...base,
-        type: event.type,
-        keyId: requiredString(event.keyId, "event keyId"),
-        predecessorKeyId: requiredString(event.predecessorKeyId, "event predecessorKeyId"),
-        challengeId: requiredString(event.challengeId, "event challengeId"),
-        ...(event.encryptionKeyId === undefined
-          ? {}
-          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
-      };
-    case "revoke-key":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("revoke-key event requires trusted-device actor");
-      }
-      return { ...base, type: event.type, keyId: requiredString(event.keyId, "event keyId") };
-    case "revoke-device":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("revoke-device event requires trusted-device actor");
-      }
-      return { ...base, type: event.type };
-    case "set-recovery-credential":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("set-recovery-credential event requires trusted-device actor");
-      }
-      return {
-        ...base,
-        type: event.type,
-        recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
-        recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
-        ...(event.encryptionKeyId === undefined
-          ? {}
-          : { encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId") }),
-        audience: requiredString(event.audience, "event audience"),
-      };
-    case "recover-trust-set":
-      if (event.actor.mode !== "recovery-credential") {
-        throw new TypeError("recover-trust-set event requires recovery-credential actor");
-      }
-      return {
-        ...base,
-        type: event.type,
-        keyId: requiredString(event.keyId, "event keyId"),
-        challengeId: requiredString(event.challengeId, "event challengeId"),
-        recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
-        recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
-        nextRecoveryKeyId: requiredString(event.nextRecoveryKeyId, "event nextRecoveryKeyId"),
-        nextRecoveryGeneration: positiveGeneration(
-          event.nextRecoveryGeneration,
-          "event nextRecoveryGeneration",
+}
+
+function assertActorMode<M extends DeviceTrustActor["mode"]>(
+  actor: DeviceTrustActor,
+  expected: M,
+  label: string,
+): asserts actor is Extract<DeviceTrustActor, { readonly mode: M }> {
+  if (actor.mode !== expected) throw new TypeError(`${label} event requires ${expected} actor`);
+}
+
+function optionalEncryptionKeyId(value: string | undefined, label: string): { readonly encryptionKeyId?: string } {
+  return value === undefined ? {} : { encryptionKeyId: requiredString(value, label) };
+}
+
+function normalizeBootstrapDeviceEvent(
+  event: BootstrapDeviceEvent,
+  base: NormalizedDeviceTrustEventBase,
+): BootstrapDeviceEvent {
+  assertActorMode(event.actor, "local-bootstrap", "bootstrap-device");
+  return {
+    ...base,
+    type: "bootstrap-device",
+    keyId: requiredString(event.keyId, "event keyId"),
+    ...optionalEncryptionKeyId(event.encryptionKeyId, "event encryptionKeyId"),
+  };
+}
+
+function normalizeEnrollDeviceEvent(
+  event: EnrollDeviceEvent,
+  base: NormalizedDeviceTrustEventBase,
+): EnrollDeviceEvent {
+  assertActorMode(event.actor, "trusted-device", "enroll-device");
+  return {
+    ...base,
+    type: "enroll-device",
+    keyId: requiredString(event.keyId, "event keyId"),
+    challengeId: requiredString(event.challengeId, "event challengeId"),
+    ...optionalEncryptionKeyId(event.encryptionKeyId, "event encryptionKeyId"),
+  };
+}
+
+function normalizeRotateKeyEvent(
+  event: RotateKeyEvent,
+  base: NormalizedDeviceTrustEventBase,
+): RotateKeyEvent {
+  assertActorMode(event.actor, "trusted-device", "rotate-key");
+  return {
+    ...base,
+    type: "rotate-key",
+    keyId: requiredString(event.keyId, "event keyId"),
+    predecessorKeyId: requiredString(event.predecessorKeyId, "event predecessorKeyId"),
+    challengeId: requiredString(event.challengeId, "event challengeId"),
+    ...optionalEncryptionKeyId(event.encryptionKeyId, "event encryptionKeyId"),
+  };
+}
+
+function normalizeRevokeKeyEvent(
+  event: RevokeKeyEvent,
+  base: NormalizedDeviceTrustEventBase,
+): RevokeKeyEvent {
+  assertActorMode(event.actor, "trusted-device", "revoke-key");
+  return { ...base, type: "revoke-key", keyId: requiredString(event.keyId, "event keyId") };
+}
+
+function normalizeRevokeDeviceEvent(
+  event: RevokeDeviceEvent,
+  base: NormalizedDeviceTrustEventBase,
+): RevokeDeviceEvent {
+  assertActorMode(event.actor, "trusted-device", "revoke-device");
+  return { ...base, type: "revoke-device" };
+}
+
+function normalizeSetRecoveryCredentialEvent(
+  event: SetRecoveryCredentialEvent,
+  base: NormalizedDeviceTrustEventBase,
+): SetRecoveryCredentialEvent {
+  assertActorMode(event.actor, "trusted-device", "set-recovery-credential");
+  return {
+    ...base,
+    type: "set-recovery-credential",
+    recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
+    recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
+    ...optionalEncryptionKeyId(event.encryptionKeyId, "event encryptionKeyId"),
+    audience: requiredString(event.audience, "event audience"),
+  };
+}
+
+function normalizeRecoverTrustSetEvent(
+  event: RecoverTrustSetEvent,
+  base: NormalizedDeviceTrustEventBase,
+): RecoverTrustSetEvent {
+  assertActorMode(event.actor, "recovery-credential", "recover-trust-set");
+  return {
+    ...base,
+    type: "recover-trust-set",
+    keyId: requiredString(event.keyId, "event keyId"),
+    challengeId: requiredString(event.challengeId, "event challengeId"),
+    recoveryKeyId: requiredString(event.recoveryKeyId, "event recoveryKeyId"),
+    recoveryGeneration: positiveGeneration(event.recoveryGeneration, "event recoveryGeneration"),
+    nextRecoveryKeyId: requiredString(event.nextRecoveryKeyId, "event nextRecoveryKeyId"),
+    nextRecoveryGeneration: positiveGeneration(
+      event.nextRecoveryGeneration,
+      "event nextRecoveryGeneration",
+    ),
+    ...(event.deviceEncryptionKeyId === undefined
+      ? {}
+      : {
+        deviceEncryptionKeyId: requiredString(
+          event.deviceEncryptionKeyId,
+          "event deviceEncryptionKeyId",
         ),
-        ...(event.deviceEncryptionKeyId === undefined
-          ? {}
-          : { deviceEncryptionKeyId: requiredString(event.deviceEncryptionKeyId, "event deviceEncryptionKeyId") }),
-        ...(event.nextRecoveryEncryptionKeyId === undefined
-          ? {}
-          : {
-            nextRecoveryEncryptionKeyId: requiredString(
-              event.nextRecoveryEncryptionKeyId,
-              "event nextRecoveryEncryptionKeyId",
-            ),
-          }),
-        audience: requiredString(event.audience, "event audience"),
-      };
-    case "bind-encryption-key":
-      if (event.actor.mode !== "trusted-device") {
-        throw new TypeError("bind-encryption-key event requires trusted-device management actor");
-      }
-      if (event.subjectKind !== "device-signing-key" && event.subjectKind !== "recovery-credential") {
-        throw new TypeError("bind-encryption-key subjectKind is invalid");
-      }
-      return {
-        ...base,
-        type: event.type,
-        subjectKind: event.subjectKind,
-        subjectKeyId: requiredString(event.subjectKeyId, "event subjectKeyId"),
-        encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId"),
-        audience: requiredString(event.audience, "event audience"),
-      };
-    default:
-      throw new TypeError("device trust event type is invalid");
+      }),
+    ...(event.nextRecoveryEncryptionKeyId === undefined
+      ? {}
+      : {
+        nextRecoveryEncryptionKeyId: requiredString(
+          event.nextRecoveryEncryptionKeyId,
+          "event nextRecoveryEncryptionKeyId",
+        ),
+      }),
+    audience: requiredString(event.audience, "event audience"),
+  };
+}
+
+function normalizeBindEncryptionKeyEvent(
+  event: BindEncryptionKeyEvent,
+  base: NormalizedDeviceTrustEventBase,
+): BindEncryptionKeyEvent {
+  assertActorMode(event.actor, "trusted-device", "bind-encryption-key");
+  if (event.subjectKind !== "device-signing-key" && event.subjectKind !== "recovery-credential") {
+    throw new TypeError("bind-encryption-key subjectKind is invalid");
+  }
+  return {
+    ...base,
+    type: "bind-encryption-key",
+    subjectKind: event.subjectKind,
+    subjectKeyId: requiredString(event.subjectKeyId, "event subjectKeyId"),
+    encryptionKeyId: requiredString(event.encryptionKeyId, "event encryptionKeyId"),
+    audience: requiredString(event.audience, "event audience"),
+  };
+}
+
+export function normalizeDeviceTrustEvent(event: DeviceTrustEvent): DeviceTrustEvent {
+  const base = normalizedDeviceTrustEventBase(event);
+  switch (event.type) {
+    case "bootstrap-device": return normalizeBootstrapDeviceEvent(event, base);
+    case "enroll-device": return normalizeEnrollDeviceEvent(event, base);
+    case "rotate-key": return normalizeRotateKeyEvent(event, base);
+    case "revoke-key": return normalizeRevokeKeyEvent(event, base);
+    case "revoke-device": return normalizeRevokeDeviceEvent(event, base);
+    case "set-recovery-credential": return normalizeSetRecoveryCredentialEvent(event, base);
+    case "recover-trust-set": return normalizeRecoverTrustSetEvent(event, base);
+    case "bind-encryption-key": return normalizeBindEncryptionKeyEvent(event, base);
+    default: throw new TypeError("device trust event type is invalid");
   }
 }
 
@@ -1440,8 +1485,7 @@ export async function validateDeviceRecoveryChallengeKeyIds(
   }
   if (
     deviceEncryption !== undefined
-    && nextRecoveryEncryption !== undefined
-    && deviceEncryption.encryptionKeyId === nextRecoveryEncryption.encryptionKeyId
+    && deviceEncryption.encryptionKeyId === nextRecoveryEncryption?.encryptionKeyId
   ) {
     throw new TypeError("recovery device and next recovery encryption keys must be distinct");
   }
@@ -2138,8 +2182,7 @@ export class DeviceTrustManager {
       }
       const binding = await this.#repository.encryptionBinding(encryption.encryptionKeyId);
       if (
-        binding === undefined
-        || binding.subjectKind !== input.subjectKind
+        binding?.subjectKind !== input.subjectKind
         || binding.subjectKeyId !== subjectKeyId
         || canonicalJson(binding.publicKeyJwk) !== canonicalJson(encryption.publicKeyJwk)
       ) {

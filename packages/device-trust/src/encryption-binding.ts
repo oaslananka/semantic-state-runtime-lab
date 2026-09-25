@@ -33,7 +33,6 @@ export type TrustedEncryptionKeyBinding =
   | TrustedDeviceEncryptionKeyBinding
   | TrustedRecoveryEncryptionKeyBinding;
 
-export type ActiveEncryptionRecipient = TrustedEncryptionKeyBinding;
 
 function requiredString(value: string, label: string): string {
   const normalized = value.trim();

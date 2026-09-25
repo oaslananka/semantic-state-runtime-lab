@@ -18,7 +18,6 @@ import {
   trustedRecoveryCredentialJson,
   validateDeviceRecoveryChallengeKeyIds,
   validateDeviceTrustChallengeKeyId,
-  type ActiveEncryptionRecipient,
   type BindEncryptionKeyTransition,
   type BootstrapDeviceTransition,
   type DeviceRecoveryChallenge,
@@ -690,8 +689,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       const device = this.#deviceRow(binding.deviceId);
       if (
         key?.device_id !== binding.deviceId
-        || device === undefined
-        || device.principal_json !== row.principal_json
+        || device?.principal_json !== row.principal_json
       ) {
         throw new CorruptDeviceTrustDatabaseError(
           `Device encryption binding ${binding.encryptionKeyId} subject provenance is invalid`,
@@ -1150,7 +1148,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
 
   async activeEncryptionRecipients(
     principal: AccessPrincipal,
-  ): Promise<readonly ActiveEncryptionRecipient[]> {
+  ): Promise<readonly TrustedEncryptionKeyBinding[]> {
     const principalJson = JSON.stringify(normalizeAccessPrincipal(principal));
     const rows = this.#db.prepare(`
       SELECT encryption_key_id, subject_kind, subject_key_id, principal_json,
@@ -1159,7 +1157,7 @@ export class SQLiteDeviceTrustStore implements DeviceTrustRepository {
       WHERE principal_json = ?
       ORDER BY subject_kind, subject_key_id, encryption_key_id
     `).all(principalJson) as unknown as EncryptionBindingRow[];
-    const recipients: ActiveEncryptionRecipient[] = [];
+    const recipients: TrustedEncryptionKeyBinding[] = [];
     for (const row of rows) {
       const binding = await this.#validatedEncryptionBindingRow(row);
       if (binding.subjectKind === "device-signing-key") {
