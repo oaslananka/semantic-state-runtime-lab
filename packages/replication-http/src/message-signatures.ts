@@ -26,12 +26,7 @@ const PROFILE_COMPONENTS = [
 const PROFILE_COMPONENT_LIST = PROFILE_COMPONENTS.map((value) => `"${value}"`).join(" ");
 const SAFE_KEY_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_NONCE = /^[A-Za-z0-9_-]{16,128}$/;
-const SIGNATURE_INPUT = new RegExp(
-  `^${SIGNATURE_LABEL}=\\(\\"@method\\" \\"@target-uri\\" \\"content-digest\\" \\"content-type\\"\\)`
-  + `;created=(\\d+);expires=(\\d+);nonce=\\"([A-Za-z0-9_-]{16,128})\\"`
-  + `;keyid=\\"([A-Za-z0-9._:-]{1,128})\\";alg=\\"${SIGNATURE_ALGORITHM}\\"`
-  + `;tag=\\"${SIGNATURE_TAG}\\"$`,
-);
+const SIGNATURE_INPUT = new RegExp(String.raw`^${SIGNATURE_LABEL}=\("@method" "@target-uri" "content-digest" "content-type"\);created=(\d+);expires=(\d+);nonce="([A-Za-z0-9_-]{16,128})";keyid="([A-Za-z0-9._:-]{1,128})";alg="${SIGNATURE_ALGORITHM}";tag="${SIGNATURE_TAG}"$`);
 const SIGNATURE_VALUE = new RegExp(`^${SIGNATURE_LABEL}=:([A-Za-z0-9+/]+={0,2}):$`);
 const CONTENT_DIGEST_VALUE = new RegExp(`^${CONTENT_DIGEST_ALGORITHM}=:([A-Za-z0-9+/]+={0,2}):$`);
 
@@ -48,14 +43,16 @@ export interface ReplicationDeviceKeyResolver {
   ): ReplicationDeviceCredential | undefined | Promise<ReplicationDeviceCredential | undefined>;
 }
 
+export interface ReplicationSignatureReplayInput {
+  readonly keyId: string;
+  readonly nonce: string;
+  readonly expiresAt: number;
+  readonly now: number;
+}
+
 export interface ReplicationSignatureReplayStore {
   /** Returns true only when this key/nonce pair was accepted for the first time. */
-  consume(input: {
-    readonly keyId: string;
-    readonly nonce: string;
-    readonly expiresAt: number;
-    readonly now: number;
-  }): boolean | Promise<boolean>;
+  consume(input: ReplicationSignatureReplayInput): boolean | Promise<boolean>;
 }
 
 export interface HttpMessageSignatureAuthenticatorOptions {
@@ -77,19 +74,15 @@ export interface HttpMessageSigningFetchOptions {
   readonly lifetimeSeconds?: number;
 }
 
-interface ParsedSignatureInput {
-  readonly serialized: string;
+interface SignatureParametersInput {
   readonly created: number;
   readonly expires: number;
   readonly nonce: string;
   readonly keyId: string;
 }
 
-interface SignatureParametersInput {
-  readonly created: number;
-  readonly expires: number;
-  readonly nonce: string;
-  readonly keyId: string;
+interface ParsedSignatureInput extends SignatureParametersInput {
+  readonly serialized: string;
 }
 
 function safeIntegerSeconds(value: number, label: string): number {
@@ -129,7 +122,7 @@ function assertSafeNonce(value: string): string {
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
+  for (const byte of bytes) binary += String.fromCodePoint(byte);
   return btoa(binary);
 }
 
@@ -137,7 +130,7 @@ function base64ToBytes(value: string, expectedLength: number): Uint8Array | unde
   try {
     const binary = atob(value);
     if (binary.length !== expectedLength) return undefined;
-    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    const bytes = Uint8Array.from(binary, (character) => character.codePointAt(0) ?? 0);
     return bytesToBase64(bytes) === value ? bytes : undefined;
   } catch {
     return undefined;
@@ -145,7 +138,9 @@ function base64ToBytes(value: string, expectedLength: number): Uint8Array | unde
 }
 
 function base64Url(bytes: Uint8Array): string {
-  return bytesToBase64(bytes).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  const value = bytesToBase64(bytes).replaceAll("+", "-").replaceAll("/", "_");
+  if (value.endsWith("==")) return value.slice(0, -2);
+  return value.endsWith("=") ? value.slice(0, -1) : value;
 }
 
 function randomNonce(): string {
@@ -311,12 +306,7 @@ export class InMemoryReplicationSignatureReplayStore implements ReplicationSigna
     this.#maxEntries = maxEntries;
   }
 
-  consume(input: {
-    readonly keyId: string;
-    readonly nonce: string;
-    readonly expiresAt: number;
-    readonly now: number;
-  }): boolean {
+  consume(input: ReplicationSignatureReplayInput): boolean {
     for (const [key, expiresAt] of this.#entries) {
       if (expiresAt < input.now) this.#entries.delete(key);
     }
