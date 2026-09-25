@@ -77,3 +77,6 @@ jobs:
 
       - name: Principal-scoped artifact blob replication benchmark smoke test
         run: pnpm benchmark:replication:blob-access:v1
+
+      - name: Replication HTTP transport benchmark smoke test
+        run: pnpm benchmark:replication:http:v1

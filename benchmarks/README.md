@@ -99,3 +99,11 @@ See `docs/policy-scoped-replication-v1.md` for the security contract.
 The fixture uses 64 visible artifact upsert records referencing one 41-byte CAS blob. Every second record is `record:read`-authorized and only the final readable reference is `artifact-blob:read`-authorized, so the successful read must report exactly 64 referencing records examined, 64 record-policy evaluations, 32 blob-policy evaluations, and 41 transferred bytes. The install side must report exactly one record-policy evaluation, one blob-policy evaluation, and 41 transferred bytes.
 
 Elapsed time is observational only. The fixture is in-memory and makes no network, TLS, credential-verification, RTT, remote-store, or production-throughput claim. See `docs/principal-scoped-artifact-blob-replication-v1.md`.
+
+## Authenticated replication HTTP transport v1
+
+`pnpm benchmark:replication:http:v1` runs the real Fetch transport through two loopback Node HTTP servers. The fixture starts with 64 semantic observations on the source, 32 already present on the target, one artifact mutation, and one 41-byte raw CAS blob. It reconciles with the existing bounded Merkle session, transfers 32 semantic records plus one artifact mutation, reads/installs the raw blob, applies metadata separately, and verifies equal final authorized roots/counts.
+
+The current deterministic wire accounting is 53 requests, 32,837 request-body bytes (32,024 JSON + 813 binary), and 63,133 response-body bytes (63,092 JSON + 41 raw binary). The reconciliation itself reports 44 steps, 12 remote node queries, 221 node hashes, 32 leaf pages, 35 descriptors and 10,459 descriptor bytes.
+
+Elapsed time is observational local-loopback data only. The fixture does not model WAN RTT, TLS handshakes, OAuth/DPoP verification, reverse proxies, relays, congestion, remote disk latency or production throughput. See `docs/replication-http-transport-v1.md`.

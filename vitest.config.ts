@@ -19,6 +19,7 @@ export default defineConfig({
       "@ssrl/replication/sync": source("./packages/replication/src/sync.ts"),
       "@ssrl/replication": source("./packages/replication/src/index.ts"),
       "@ssrl/replication-access": source("./packages/replication-access/src/index.ts"),
+      "@ssrl/replication-http": source("./packages/replication-http/src/index.ts"),
       "@ssrl/ingestion": source("./packages/ingestion/src/index.ts"),
       "@ssrl/journal": source("./packages/journal/src/index.ts"),
       "@ssrl/runtime": source("./packages/runtime/src/index.ts"),
