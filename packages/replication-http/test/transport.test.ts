@@ -31,14 +31,19 @@ import {
   type NodeReplicationHttpServer,
 } from "../src/node.js";
 import {
+  HttpMessageSignatureAuthenticator,
+  InMemoryReplicationSignatureReplayStore,
   InvalidReplicationHttpResponseError,
   REPLICATION_BLOB_INSTALL_MEDIA_TYPE,
   REPLICATION_HTTP_ROUTES,
   ReplicationHttpClient,
   ReplicationHttpRemoteError,
+  StaticReplicationDeviceKeyResolver,
+  createHttpMessageSigningFetch,
   createReplicationHttpHandler,
   type ReplicationHttpAuthenticator,
   type ReplicationHttpFetch,
+  type ReplicationDeviceCredential,
   type ReplicationHttpHandler,
 } from "../src/index.js";
 
@@ -178,6 +183,185 @@ function clientFor(handler: ReplicationHttpHandler, token = "alice-token"): Repl
   });
 }
 
+const signatureNow = Date.parse("2026-09-25T00:00:00Z");
+const signedProjectionUrl = `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`;
+const signedProjectionBody = JSON.stringify({ projectionId: "personal" });
+const signedJsonContentType = "application/json";
+
+interface DeviceSignatureMaterial {
+  readonly privateKey: CryptoKey;
+  readonly credential: ReplicationDeviceCredential;
+}
+
+async function deviceSignatureMaterial(
+  keyId = "device:alice-laptop",
+  devicePrincipal: AccessPrincipal = principal,
+  status: "active" | "revoked" = "active",
+): Promise<DeviceSignatureMaterial> {
+  const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const publicKeyJwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
+  return {
+    privateKey: keys.privateKey,
+    credential: { keyId, publicKeyJwk, principal: devicePrincipal, status },
+  };
+}
+
+function nonceSequence(prefix = "nonce"): () => string {
+  let value = 0;
+  return () => `${prefix}-${String(++value).padStart(20, "0")}`;
+}
+
+function signatureAuthenticator(
+  credentials: readonly ReplicationDeviceCredential[],
+  options: { readonly now?: number; readonly maxLifetime?: number } = {},
+): HttpMessageSignatureAuthenticator {
+  return new HttpMessageSignatureAuthenticator({
+    keys: new StaticReplicationDeviceKeyResolver(credentials),
+    replayStore: new InMemoryReplicationSignatureReplayStore(),
+    now: () => options.now ?? signatureNow,
+    ...(options.maxLifetime === undefined
+      ? {}
+      : { maxSignatureLifetimeSeconds: options.maxLifetime }),
+  });
+}
+
+function directHandlerFetch(http: ReplicationHttpHandler): ReplicationHttpFetch {
+  return (input, init) => http.fetch(new Request(input, init));
+}
+
+function signedClient(
+  http: ReplicationHttpHandler,
+  material: DeviceSignatureMaterial,
+  options: {
+    readonly now?: number;
+    readonly nonce?: () => string;
+    readonly lifetimeSeconds?: number;
+    readonly baseUrl?: URL;
+  } = {},
+): ReplicationHttpClient {
+  return new ReplicationHttpClient({
+    baseUrl: options.baseUrl ?? new URL("http://localhost"),
+    fetch: createHttpMessageSigningFetch({
+      keyId: material.credential.keyId,
+      privateKey: material.privateKey,
+      fetch: directHandlerFetch(http),
+      now: () => options.now ?? signatureNow,
+      nonce: options.nonce ?? nonceSequence(),
+      ...(options.lifetimeSeconds === undefined ? {} : { lifetimeSeconds: options.lifetimeSeconds }),
+    }),
+  });
+}
+
+async function capturedSignedRequest(input: {
+  readonly material: DeviceSignatureMaterial;
+  readonly url: string;
+  readonly contentType: string;
+  readonly body: BodyInit;
+  readonly now?: number;
+  readonly nonce?: string;
+  readonly lifetimeSeconds?: number;
+}): Promise<Request> {
+  let captured: Request | undefined;
+  const sign = createHttpMessageSigningFetch({
+    keyId: input.material.credential.keyId,
+    privateKey: input.material.privateKey,
+    now: () => input.now ?? signatureNow,
+    nonce: () => input.nonce ?? "nonce-00000000000000000001",
+    ...(input.lifetimeSeconds === undefined ? {} : { lifetimeSeconds: input.lifetimeSeconds }),
+    fetch: async (requestInput, init) => {
+      captured = new Request(requestInput, init);
+      return new Response(null, { status: 204 });
+    },
+  });
+  await sign(input.url, {
+    method: "POST",
+    headers: { "content-type": input.contentType },
+    body: input.body,
+  });
+  if (captured === undefined) throw new Error("expected signed request capture");
+  return captured;
+}
+
+async function capturedProjectionRequest(
+  material: DeviceSignatureMaterial,
+  options: {
+    readonly now?: number;
+    readonly nonce?: string;
+    readonly lifetimeSeconds?: number;
+  } = {},
+): Promise<Request> {
+  return capturedSignedRequest({
+    material,
+    url: signedProjectionUrl,
+    contentType: signedJsonContentType,
+    body: signedProjectionBody,
+    ...options,
+  });
+}
+
+function signedHttp(
+  runtime: Awaited<ReturnType<typeof semanticRuntime>>,
+  material: DeviceSignatureMaterial,
+  options: {
+    readonly credentials?: readonly ReplicationDeviceCredential[];
+    readonly access?: ReplicationAccessGateway;
+    readonly now?: number;
+    readonly maxLifetime?: number;
+  } = {},
+): ReplicationHttpHandler {
+  return handler({
+    ...runtime,
+    ...(options.access === undefined ? {} : { access: options.access }),
+    authenticator: signatureAuthenticator(
+      options.credentials ?? [material.credential],
+      {
+        ...(options.now === undefined ? {} : { now: options.now }),
+        ...(options.maxLifetime === undefined ? {} : { maxLifetime: options.maxLifetime }),
+      },
+    ),
+  });
+}
+
+async function signedProjectionFixture(
+  observationId: string,
+  value: string,
+  options: {
+    readonly keyId?: string;
+    readonly devicePrincipal?: AccessPrincipal;
+    readonly status?: "active" | "revoked";
+    readonly access?: (runtime: Awaited<ReturnType<typeof semanticRuntime>>) => ReplicationAccessGateway;
+    readonly nonce?: () => string;
+  } = {},
+) {
+  const runtime = await semanticRuntime(observationId, value);
+  const material = await deviceSignatureMaterial(
+    options.keyId,
+    options.devicePrincipal,
+    options.status,
+  );
+  const http = signedHttp(runtime, material, {
+    ...(options.access === undefined ? {} : { access: options.access(runtime) }),
+  });
+  return {
+    runtime,
+    material,
+    http,
+    client: signedClient(http, material, {
+      ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
+    }),
+  };
+}
+
+function requestWith(
+  signed: Request,
+  body: BodyInit,
+  mutateHeaders?: (headers: Headers) => void,
+): Request {
+  const headers = new Headers(signed.headers);
+  mutateHeaders?.(headers);
+  return new Request(signed.url, { method: "POST", headers, body });
+}
+
 function localViewReader(
   endpoint: ReconciliationEndpoint,
   info: ReconciliationViewInfo,
@@ -196,12 +380,64 @@ function localViewReader(
 }
 
 
+async function convergeSemanticWithRemote(
+  left: Awaited<ReturnType<typeof semanticRuntime>>,
+  remote: ReplicationHttpClient,
+) {
+  const leftOpen = await left.access.openProjection({ principal, projectionId: "personal" });
+  const rightOpen = await remote.openProjection({ projectionId: "personal" });
+  const leftEndpoint = left.access.endpoint(principal, "personal");
+  const leftReader = localViewReader(leftEndpoint, leftOpen.view);
+  const session = await BoundedReconciliationSession.start(
+    leftReader,
+    remote.endpoint("personal"),
+    rightOpen.view.viewId,
+  );
+  const delta = await session.runToCompletion(leftReader, remote.endpoint("personal"));
+  if (delta.collisions.length > 0) throw new Error("unexpected replication collision");
+
+  const fromRight = await remote.readRecords({
+    projectionId: "personal",
+    viewId: rightOpen.view.viewId,
+    keys: delta.remoteOnly,
+  });
+  await left.access.applySemantic(left.semantic, {
+    principal,
+    projectionId: "personal",
+    records: fromRight,
+  });
+
+  const fromLeft = await left.access.readRecords({
+    principal,
+    projectionId: "personal",
+    viewId: leftOpen.view.viewId,
+    keys: delta.localOnly,
+  });
+  await remote.applySemantic({ projectionId: "personal", records: fromLeft });
+
+  const [leftFinal, rightFinal] = await Promise.all([
+    left.access.openProjection({ principal, projectionId: "personal" }),
+    remote.openProjection({ projectionId: "personal" }),
+  ]);
+  const rerun = await BoundedReconciliationSession.start(
+    localViewReader(left.access.endpoint(principal, "personal"), leftFinal.view),
+    remote.endpoint("personal"),
+    rightFinal.view.viewId,
+  );
+  const rerunResult = await rerun.runToCompletion(
+    localViewReader(left.access.endpoint(principal, "personal"), leftFinal.view),
+    remote.endpoint("personal"),
+  );
+  return { delta, leftFinal, rightFinal, rerunResult };
+}
+
+
 
 function handler(options: {
   readonly access: ReplicationAccessGateway;
   readonly semantic: SQLiteSemanticStateStore;
   readonly artifacts: ArtifactStore;
-  readonly authenticator?: BearerAuthenticator;
+  readonly authenticator?: ReplicationHttpAuthenticator;
 }) {
   return createReplicationHttpHandler({
     gateway: options.access,
@@ -310,53 +546,10 @@ describe("replication HTTP transport", () => {
       headers: () => ({ authorization: "Bearer alice-token" }),
     });
 
-    const leftOpen = await left.access.openProjection({ principal, projectionId: "personal" });
-    const rightOpen = await remote.openProjection({ projectionId: "personal" });
-    const leftEndpoint = left.access.endpoint(principal, "personal");
-    const leftReader = localViewReader(leftEndpoint, leftOpen.view);
-    const session = await BoundedReconciliationSession.start(
-      leftReader,
-      remote.endpoint("personal"),
-      rightOpen.view.viewId,
-    );
-    const delta = await session.runToCompletion(leftReader, remote.endpoint("personal"));
+    const { delta, leftFinal, rightFinal, rerunResult } = await convergeSemanticWithRemote(left, remote);
     expect(delta.collisions).toEqual([]);
-
-    const fromRight = await remote.readRecords({
-      projectionId: "personal",
-      viewId: rightOpen.view.viewId,
-      keys: delta.remoteOnly,
-    });
-    await left.access.applySemantic(left.semantic, {
-      principal,
-      projectionId: "personal",
-      records: fromRight,
-    });
-
-    const fromLeft = await left.access.readRecords({
-      principal,
-      projectionId: "personal",
-      viewId: leftOpen.view.viewId,
-      keys: delta.localOnly,
-    });
-    await remote.applySemantic({ projectionId: "personal", records: fromLeft });
-
-    const [leftFinal, rightFinal] = await Promise.all([
-      left.access.openProjection({ principal, projectionId: "personal" }),
-      remote.openProjection({ projectionId: "personal" }),
-    ]);
     expect(leftFinal.view.rootDigest).toBe(rightFinal.view.rootDigest);
     expect(leftFinal.view.recordCount).toBe(rightFinal.view.recordCount);
-
-    const rerun = await BoundedReconciliationSession.start(
-      localViewReader(left.access.endpoint(principal, "personal"), leftFinal.view),
-      remote.endpoint("personal"),
-      rightFinal.view.viewId,
-    );
-    const rerunResult = await rerun.runToCompletion(
-      localViewReader(left.access.endpoint(principal, "personal"), leftFinal.view),
-      remote.endpoint("personal"),
-    );
     expect(rerunResult).toMatchObject({ localOnly: [], remoteOnly: [], collisions: [] });
     left.semantic.close();
     right.semantic.close();
@@ -894,5 +1087,309 @@ describe("replication HTTP transport", () => {
     });
     await expect(oversized.openProjection({ projectionId: "personal" }))
       .rejects.toBeInstanceOf(InvalidReplicationHttpResponseError);
+  });
+});
+
+
+describe("device-bound replication HTTP message signatures", () => {
+  it("emits the fixed RFC 9421 / RFC 9530 v1 profile for a known request", async () => {
+    const material = await deviceSignatureMaterial("device:known-answer");
+    const request = await capturedProjectionRequest(material, {
+      now: signatureNow,
+      nonce: "nonce-00000000000000000001",
+      lifetimeSeconds: 60,
+    });
+
+    expect(request.headers.get("content-digest"))
+      .toBe("sha-256=:gCg7ojhY3IxxWYz5ABrPbNFLCvRNTvoxnw9wpVVsvf8=:");
+    expect(request.headers.get("signature-input")).toBe(
+      'ssrl=("@method" "@target-uri" "content-digest" "content-type")'
+      + ';created=1790294400;expires=1790294460;nonce="nonce-00000000000000000001"'
+      + ';keyid="device:known-answer";alg="ed25519";tag="ssrl-replication-v1"',
+    );
+    expect(request.headers.get("signature")).toMatch(/^ssrl=:[A-Za-z0-9+/]+={0,2}:$/);
+  });
+
+  it("authenticates an Ed25519-signed request and derives principal only from the device key", async () => {
+    const captured: string[] = [];
+    const { runtime, material, client } = await signedProjectionFixture("signed", "S", {
+      access: (value) => gateway(value.source, allowAlicePolicy(captured)),
+    });
+
+    const opened = await client.openProjection({ projectionId: "personal" });
+    expect(opened.projectionId).toBe("personal");
+    expect(captured.length).toBeGreaterThan(0);
+    expect(captured.every((value) => value.includes('"subject":"user:alice"'))).toBe(true);
+    expect(captured.join("\n")).not.toContain(material.credential.keyId);
+    runtime.semantic.close();
+  });
+
+  it("keeps replication authorization policy authoritative after device authentication", async () => {
+    const bob: AccessPrincipal = { subject: "user:bob", scopes: ["replication"] };
+    const { runtime, client } = await signedProjectionFixture("policy", "P", {
+      keyId: "device:bob-laptop",
+      devicePrincipal: bob,
+      access: (value) => gateway(value.source, allowAlicePolicy()),
+    });
+
+    const opened = await client.openProjection({ projectionId: "personal" });
+    expect(opened.view.recordCount).toBe(0);
+    expect(opened.accounting.allowedDescriptors).toBe(0);
+    expect(opened.accounting.policyEvaluations).toBeGreaterThan(0);
+    runtime.semantic.close();
+  });
+
+  it("rejects an exact signed-request replay before replication source/domain work", async () => {
+    const { runtime, client } = await signedProjectionFixture("replay", "R", {
+      nonce: () => "nonce-00000000000000000001",
+    });
+
+    await client.openProjection({ projectionId: "personal" });
+    const callsAfterFirst = runtime.source.calls;
+    await expect(client.openProjection({ projectionId: "personal" }))
+      .rejects.toMatchObject({ status: 401, code: "authentication-failed" });
+    expect(runtime.source.calls).toBe(callsAfterFirst);
+    runtime.semantic.close();
+  });
+
+  it("binds the signature to target URI, content type and exact body bytes", async () => {
+    const { runtime, material, http } = await signedProjectionFixture("tamper", "T");
+    const signed = await capturedProjectionRequest(material);
+    const callsBefore = runtime.source.calls;
+
+    const wrongUri = await http.fetch(new Request(
+      `http://localhost${REPLICATION_HTTP_ROUTES.viewInfo}`,
+      { method: "POST", headers: signed.headers, body: signedProjectionBody },
+    ));
+    expect(wrongUri.status).toBe(401);
+
+    const wrongType = await http.fetch(requestWith(
+      signed,
+      signedProjectionBody,
+      (headers) => headers.set("content-type", "application/problem+json"),
+    ));
+    expect(wrongType.status).toBe(401);
+
+    const wrongBody = await http.fetch(requestWith(
+      signed,
+      JSON.stringify({ projectionId: "tampered" }),
+    ));
+    expect(wrongBody.status).toBe(401);
+    expect(runtime.source.calls).toBe(callsBefore);
+
+    // Invalid content must not burn an otherwise valid one-time nonce. The
+    // authentic body can still claim it exactly once after digest verification.
+    const authentic = await http.fetch(requestWith(signed, signedProjectionBody));
+    expect(authentic.status).toBe(200);
+    expect(runtime.source.calls).toBeGreaterThan(callsBefore);
+    runtime.semantic.close();
+  });
+
+  it("returns one non-enumerating auth failure for unknown and revoked device keys", async () => {
+    const runtime = await semanticRuntime("trust", "K");
+    const active = await deviceSignatureMaterial("device:unknown");
+    const revoked = await deviceSignatureMaterial("device:revoked", principal, "revoked");
+    const unknownHttp = handler({
+      ...runtime,
+      authenticator: signatureAuthenticator([]),
+    });
+    const revokedHttp = handler({
+      ...runtime,
+      authenticator: signatureAuthenticator([revoked.credential]),
+    });
+
+    const [unknownRequest, revokedRequest] = await Promise.all([
+      capturedProjectionRequest(active),
+      capturedProjectionRequest(revoked),
+    ]);
+    const [unknownResponse, revokedResponse] = await Promise.all([
+      unknownHttp.fetch(unknownRequest),
+      revokedHttp.fetch(revokedRequest),
+    ]);
+    expect(unknownResponse.status).toBe(401);
+    expect(revokedResponse.status).toBe(401);
+    expect(await unknownResponse.text()).toBe(await revokedResponse.text());
+    runtime.semantic.close();
+  });
+
+  it("rejects future-created, expired and overlong signature lifetimes", async () => {
+    const runtime = await semanticRuntime("time", "C");
+    const material = await deviceSignatureMaterial();
+    const cases = [
+      { now: signatureNow + 60_000, lifetimeSeconds: 60, maxLifetime: 60 },
+      { now: signatureNow - 120_000, lifetimeSeconds: 60, maxLifetime: 60 },
+      { now: signatureNow, lifetimeSeconds: 120, maxLifetime: 60 },
+    ] as const;
+    for (const [index, item] of cases.entries()) {
+      const http = handler({
+        ...runtime,
+        authenticator: signatureAuthenticator([material.credential], {
+          now: signatureNow,
+          maxLifetime: item.maxLifetime,
+        }),
+      });
+      const request = await capturedProjectionRequest(material, {
+        now: item.now,
+        lifetimeSeconds: item.lifetimeSeconds,
+        nonce: `nonce-${String(index + 1).padStart(20, "0")}`,
+      });
+      expect((await http.fetch(request)).status).toBe(401);
+    }
+    runtime.semantic.close();
+  });
+
+  it("verifies signature headers without consuming the request body", async () => {
+    const material = await deviceSignatureMaterial();
+    const authenticator = signatureAuthenticator([material.credential]);
+    const request = await capturedProjectionRequest(material);
+
+    expect(request.bodyUsed).toBe(false);
+    const authenticated = await authenticator.authenticate(request);
+    expect(authenticated).not.toBeInstanceOf(Response);
+    expect(request.bodyUsed).toBe(false);
+  });
+
+  it("keeps a nonce replay-blocked through the accepted clock-skew window", async () => {
+    const runtime = await semanticRuntime("skew", "W");
+    const material = await deviceSignatureMaterial();
+    const replayStore = new InMemoryReplicationSignatureReplayStore();
+    let verifierNow = signatureNow + 2_000;
+    const authenticator = new HttpMessageSignatureAuthenticator({
+      keys: new StaticReplicationDeviceKeyResolver([material.credential]),
+      replayStore,
+      now: () => verifierNow,
+      maxSignatureLifetimeSeconds: 60,
+      clockSkewSeconds: 5,
+    });
+    const http = handler({ ...runtime, authenticator });
+    const request = await capturedProjectionRequest(material, {
+      now: signatureNow,
+      lifetimeSeconds: 1,
+      nonce: "nonce-00000000000000000001",
+    });
+    const body = await request.clone().arrayBuffer();
+    expect((await http.fetch(request)).status).toBe(200);
+
+    verifierNow = signatureNow + 3_000;
+    const replay = requestWith(request, body);
+    expect((await http.fetch(replay)).status).toBe(401);
+    runtime.semantic.close();
+  });
+
+  it("converges two SQLite semantic peers over real signed loopback HTTP", async () => {
+    const left = await semanticRuntime("signed-left", "L");
+    const right = await semanticRuntime("signed-right", "R");
+    const material = await deviceSignatureMaterial("device:left-replicator");
+    const rightServer = await startNodeReplicationHttpServer({
+      handler: handler({
+        ...right,
+        authenticator: signatureAuthenticator([material.credential]),
+      }),
+    });
+    servers.push(rightServer);
+    const remote = new ReplicationHttpClient({
+      baseUrl: rightServer.baseUrl,
+      fetch: createHttpMessageSigningFetch({
+        keyId: material.credential.keyId,
+        privateKey: material.privateKey,
+        now: () => signatureNow,
+        nonce: nonceSequence("network-nonce"),
+      }),
+    });
+
+    const result = await convergeSemanticWithRemote(left, remote);
+    expect(result.leftFinal.view.rootDigest).toBe(result.rightFinal.view.rootDigest);
+    expect(result.leftFinal.view.recordCount).toBe(result.rightFinal.view.recordCount);
+    expect(result.rerunResult).toMatchObject({ localOnly: [], remoteOnly: [], collisions: [] });
+    left.semantic.close();
+    right.semantic.close();
+  });
+
+  it("authenticates and content-binds binary artifact blob installation", async () => {
+    const sourceArtifacts = new LocalArtifactStore({ root: await tempPath("signed-source-cas") });
+    const bytes = new TextEncoder().encode("signed binary replication artifact");
+    const blob = await sourceArtifacts.putBlob(bytes, "application/octet-stream");
+    await sourceArtifacts.append([{
+      id: "signed-artifact-v1",
+      resource: {
+        sourceKey: "signed/source",
+        externalType: "binary",
+        externalId: "artifact.bin",
+      },
+      kind: "upsert",
+      effectiveAt: "2026-09-25T00:00:00Z",
+      recordedAt: "2026-09-25T00:00:01Z",
+      blob,
+    }]);
+    const record = (await exportArtifactReplicationRecords(sourceArtifacts))[0]!;
+
+    const target = await semanticRuntime("signed-blob-target", "target");
+    const material = await deviceSignatureMaterial("device:blob-sender");
+    const http = handler({
+      ...target,
+      authenticator: signatureAuthenticator([material.credential]),
+    });
+    const client = signedClient(http, material, { nonce: nonceSequence("blob-nonce") });
+
+    const installed = await client.installArtifactBlob({
+      projectionId: "personal",
+      record,
+      bytes,
+    });
+    expect(installed.descriptor).toEqual(blob);
+    expect(installed.accounting.transferredBytes).toBe(bytes.byteLength);
+    expect((await target.artifacts.snapshot()).blobs).toEqual([
+      { digest: blob.digest, size: blob.size },
+    ]);
+    expect((await target.artifacts.snapshot()).mutations).toEqual([]);
+    target.semantic.close();
+  });
+
+  it("rejects duplicate signature fields without consuming the valid nonce", async () => {
+    const { runtime, material, http } = await signedProjectionFixture(
+      "duplicate-signature-fields",
+      "D",
+    );
+    const signed = await capturedProjectionRequest(material, {
+      nonce: "nonce-00000000000000000999",
+    });
+
+    for (const header of ["signature-input", "signature", "content-digest"] as const) {
+      const headers = new Headers(signed.headers);
+      const original = headers.get(header);
+      if (original === null) throw new Error(`expected ${header}`);
+      headers.append(header, original);
+      const response = await http.fetch(requestWith(signed, signedProjectionBody, (target) => {
+        target.delete("signature-input");
+        target.delete("signature");
+        target.delete("content-digest");
+        for (const [key, value] of headers) target.append(key, value);
+      }));
+      expect(response.status).toBe(401);
+    }
+
+    const authentic = await http.fetch(requestWith(signed, signedProjectionBody));
+    expect(authentic.status).toBe(200);
+    runtime.semantic.close();
+  });
+
+  it("rejects malformed signature and content-digest fields fail-closed", async () => {
+    const { runtime, material, http } = await signedProjectionFixture("malformed", "M");
+    const signed = await capturedProjectionRequest(material);
+
+    for (const [header, value] of [
+      ["signature-input", "ssrl=garbage"],
+      ["signature", "ssrl=:not-base64!:"] ,
+      ["content-digest", "sha-256=:bad:"] ,
+    ] as const) {
+      const headers = new Headers(signed.headers);
+      headers.set(header, value);
+      expect((await http.fetch(requestWith(
+        signed,
+        signedProjectionBody,
+        (target) => target.set(header, value),
+      ))).status).toBe(401);
+    }
+    runtime.semantic.close();
   });
 });

@@ -410,8 +410,8 @@ v1 deliberately does not provide:
 - TLS certificate issuance/termination;
 - OAuth Authorization Server implementation;
 - JWT/DPoP verification;
-- HTTP Message Signature verification;
-- device enrollment or key exchange;
+- generic HTTP Message Signature algorithm/profile negotiation;
+- durable device enrollment, rotation, recovery or key exchange;
 - end-to-end replication payload encryption;
 - cloud relay service;
 - WebSocket or QUIC protocol;
@@ -423,16 +423,6 @@ v1 deliberately does not provide:
 
 Now that a real bounded wire boundary exists, device trust and confidentiality can be designed against a concrete protocol rather than against hypothetical library calls.
 
-The next security spike should evaluate:
+A concrete sender-constrained option now exists as the RFC 9421/RFC 9530 Ed25519 profile documented in `device-bound-http-signatures-v1.md`. OAuth deployments can still supply a DPoP-aware authenticator instead.
 
-```text
-device enrollment / rotation
-        ↓
-sender-constrained authenticator (DPoP/mTLS/device signature)
-        ↓
-optional application-level message authenticity
-        ↓
-E2E record/blob encryption for untrusted relay/cloud storage
-```
-
-That work should preserve the current separation between authentication, projection authorization, immutable record integrity and replication reconciliation.
+The next security work should add durable device enrollment/revocation/recovery and then evaluate E2E record/blob encryption for untrusted relay/cloud storage. That work must preserve the current separation between authentication, projection authorization, immutable record integrity and replication reconciliation.
