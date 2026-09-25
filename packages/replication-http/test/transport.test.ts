@@ -184,6 +184,9 @@ function clientFor(handler: ReplicationHttpHandler, token = "alice-token"): Repl
 }
 
 const signatureNow = Date.parse("2026-09-25T00:00:00Z");
+const signedProjectionUrl = `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`;
+const signedProjectionBody = JSON.stringify({ projectionId: "personal" });
+const signedJsonContentType = "application/json";
 
 interface DeviceSignatureMaterial {
   readonly privateKey: CryptoKey;
@@ -277,6 +280,86 @@ async function capturedSignedRequest(input: {
   });
   if (captured === undefined) throw new Error("expected signed request capture");
   return captured;
+}
+
+async function capturedProjectionRequest(
+  material: DeviceSignatureMaterial,
+  options: {
+    readonly now?: number;
+    readonly nonce?: string;
+    readonly lifetimeSeconds?: number;
+  } = {},
+): Promise<Request> {
+  return capturedSignedRequest({
+    material,
+    url: signedProjectionUrl,
+    contentType: signedJsonContentType,
+    body: signedProjectionBody,
+    ...options,
+  });
+}
+
+function signedHttp(
+  runtime: Awaited<ReturnType<typeof semanticRuntime>>,
+  material: DeviceSignatureMaterial,
+  options: {
+    readonly credentials?: readonly ReplicationDeviceCredential[];
+    readonly access?: ReplicationAccessGateway;
+    readonly now?: number;
+    readonly maxLifetime?: number;
+  } = {},
+): ReplicationHttpHandler {
+  return handler({
+    ...runtime,
+    ...(options.access === undefined ? {} : { access: options.access }),
+    authenticator: signatureAuthenticator(
+      options.credentials ?? [material.credential],
+      {
+        ...(options.now === undefined ? {} : { now: options.now }),
+        ...(options.maxLifetime === undefined ? {} : { maxLifetime: options.maxLifetime }),
+      },
+    ),
+  });
+}
+
+async function signedProjectionFixture(
+  observationId: string,
+  value: string,
+  options: {
+    readonly keyId?: string;
+    readonly devicePrincipal?: AccessPrincipal;
+    readonly status?: "active" | "revoked";
+    readonly access?: (runtime: Awaited<ReturnType<typeof semanticRuntime>>) => ReplicationAccessGateway;
+    readonly nonce?: () => string;
+  } = {},
+) {
+  const runtime = await semanticRuntime(observationId, value);
+  const material = await deviceSignatureMaterial(
+    options.keyId,
+    options.devicePrincipal,
+    options.status,
+  );
+  const http = signedHttp(runtime, material, {
+    ...(options.access === undefined ? {} : { access: options.access(runtime) }),
+  });
+  return {
+    runtime,
+    material,
+    http,
+    client: signedClient(http, material, {
+      ...(options.nonce === undefined ? {} : { nonce: options.nonce }),
+    }),
+  };
+}
+
+function requestWith(
+  signed: Request,
+  body: BodyInit,
+  mutateHeaders?: (headers: Headers) => void,
+): Request {
+  const headers = new Headers(signed.headers);
+  mutateHeaders?.(headers);
+  return new Request(signed.url, { method: "POST", headers, body });
 }
 
 function localViewReader(
@@ -1011,11 +1094,7 @@ describe("replication HTTP transport", () => {
 describe("device-bound replication HTTP message signatures", () => {
   it("emits the fixed RFC 9421 / RFC 9530 v1 profile for a known request", async () => {
     const material = await deviceSignatureMaterial("device:known-answer");
-    const request = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body: '{"projectionId":"personal"}',
+    const request = await capturedProjectionRequest(material, {
       now: signatureNow,
       nonce: "nonce-00000000000000000001",
       lifetimeSeconds: 60,
@@ -1032,16 +1111,10 @@ describe("device-bound replication HTTP message signatures", () => {
   });
 
   it("authenticates an Ed25519-signed request and derives principal only from the device key", async () => {
-    const runtime = await semanticRuntime("signed", "S");
-    const material = await deviceSignatureMaterial();
     const captured: string[] = [];
-    const access = gateway(runtime.source, allowAlicePolicy(captured));
-    const http = handler({
-      ...runtime,
-      access,
-      authenticator: signatureAuthenticator([material.credential]),
+    const { runtime, material, client } = await signedProjectionFixture("signed", "S", {
+      access: (value) => gateway(value.source, allowAlicePolicy(captured)),
     });
-    const client = signedClient(http, material);
 
     const opened = await client.openProjection({ projectionId: "personal" });
     expect(opened.projectionId).toBe("personal");
@@ -1052,15 +1125,12 @@ describe("device-bound replication HTTP message signatures", () => {
   });
 
   it("keeps replication authorization policy authoritative after device authentication", async () => {
-    const runtime = await semanticRuntime("policy", "P");
     const bob: AccessPrincipal = { subject: "user:bob", scopes: ["replication"] };
-    const material = await deviceSignatureMaterial("device:bob-laptop", bob);
-    const http = handler({
-      ...runtime,
-      access: gateway(runtime.source, allowAlicePolicy()),
-      authenticator: signatureAuthenticator([material.credential]),
+    const { runtime, client } = await signedProjectionFixture("policy", "P", {
+      keyId: "device:bob-laptop",
+      devicePrincipal: bob,
+      access: (value) => gateway(value.source, allowAlicePolicy()),
     });
-    const client = signedClient(http, material);
 
     const opened = await client.openProjection({ projectionId: "personal" });
     expect(opened.view.recordCount).toBe(0);
@@ -1070,13 +1140,7 @@ describe("device-bound replication HTTP message signatures", () => {
   });
 
   it("rejects an exact signed-request replay before replication source/domain work", async () => {
-    const runtime = await semanticRuntime("replay", "R");
-    const material = await deviceSignatureMaterial();
-    const http = handler({
-      ...runtime,
-      authenticator: signatureAuthenticator([material.credential]),
-    });
-    const client = signedClient(http, material, {
+    const { runtime, client } = await signedProjectionFixture("replay", "R", {
       nonce: () => "nonce-00000000000000000001",
     });
 
@@ -1089,52 +1153,33 @@ describe("device-bound replication HTTP message signatures", () => {
   });
 
   it("binds the signature to target URI, content type and exact body bytes", async () => {
-    const runtime = await semanticRuntime("tamper", "T");
-    const material = await deviceSignatureMaterial();
-    const http = handler({
-      ...runtime,
-      authenticator: signatureAuthenticator([material.credential]),
-    });
-    const body = JSON.stringify({ projectionId: "personal" });
-    const signed = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body,
-    });
-    const signedHeaders = new Headers(signed.headers);
+    const { runtime, material, http } = await signedProjectionFixture("tamper", "T");
+    const signed = await capturedProjectionRequest(material);
     const callsBefore = runtime.source.calls;
 
     const wrongUri = await http.fetch(new Request(
       `http://localhost${REPLICATION_HTTP_ROUTES.viewInfo}`,
-      { method: "POST", headers: signedHeaders, body },
+      { method: "POST", headers: signed.headers, body: signedProjectionBody },
     ));
     expect(wrongUri.status).toBe(401);
 
-    const wrongTypeHeaders = new Headers(signedHeaders);
-    wrongTypeHeaders.set("content-type", "application/problem+json");
-    const wrongType = await http.fetch(new Request(signed.url, {
-      method: "POST",
-      headers: wrongTypeHeaders,
-      body,
-    }));
+    const wrongType = await http.fetch(requestWith(
+      signed,
+      signedProjectionBody,
+      (headers) => headers.set("content-type", "application/problem+json"),
+    ));
     expect(wrongType.status).toBe(401);
 
-    const wrongBody = await http.fetch(new Request(signed.url, {
-      method: "POST",
-      headers: signedHeaders,
-      body: JSON.stringify({ projectionId: "tampered" }),
-    }));
+    const wrongBody = await http.fetch(requestWith(
+      signed,
+      JSON.stringify({ projectionId: "tampered" }),
+    ));
     expect(wrongBody.status).toBe(401);
     expect(runtime.source.calls).toBe(callsBefore);
 
     // Invalid content must not burn an otherwise valid one-time nonce. The
     // authentic body can still claim it exactly once after digest verification.
-    const authentic = await http.fetch(new Request(signed.url, {
-      method: "POST",
-      headers: signedHeaders,
-      body,
-    }));
+    const authentic = await http.fetch(requestWith(signed, signedProjectionBody));
     expect(authentic.status).toBe(200);
     expect(runtime.source.calls).toBeGreaterThan(callsBefore);
     runtime.semantic.close();
@@ -1153,18 +1198,10 @@ describe("device-bound replication HTTP message signatures", () => {
       authenticator: signatureAuthenticator([revoked.credential]),
     });
 
-    const unknownRequest = await capturedSignedRequest({
-      material: active,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body: JSON.stringify({ projectionId: "personal" }),
-    });
-    const revokedRequest = await capturedSignedRequest({
-      material: revoked,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body: JSON.stringify({ projectionId: "personal" }),
-    });
+    const [unknownRequest, revokedRequest] = await Promise.all([
+      capturedProjectionRequest(active),
+      capturedProjectionRequest(revoked),
+    ]);
     const [unknownResponse, revokedResponse] = await Promise.all([
       unknownHttp.fetch(unknownRequest),
       revokedHttp.fetch(revokedRequest),
@@ -1178,8 +1215,6 @@ describe("device-bound replication HTTP message signatures", () => {
   it("rejects future-created, expired and overlong signature lifetimes", async () => {
     const runtime = await semanticRuntime("time", "C");
     const material = await deviceSignatureMaterial();
-    const body = JSON.stringify({ projectionId: "personal" });
-
     const cases = [
       { now: signatureNow + 60_000, lifetimeSeconds: 60, maxLifetime: 60 },
       { now: signatureNow - 120_000, lifetimeSeconds: 60, maxLifetime: 60 },
@@ -1193,11 +1228,7 @@ describe("device-bound replication HTTP message signatures", () => {
           maxLifetime: item.maxLifetime,
         }),
       });
-      const request = await capturedSignedRequest({
-        material,
-        url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-        contentType: "application/json",
-        body,
+      const request = await capturedProjectionRequest(material, {
         now: item.now,
         lifetimeSeconds: item.lifetimeSeconds,
         nonce: `nonce-${String(index + 1).padStart(20, "0")}`,
@@ -1210,12 +1241,7 @@ describe("device-bound replication HTTP message signatures", () => {
   it("verifies signature headers without consuming the request body", async () => {
     const material = await deviceSignatureMaterial();
     const authenticator = signatureAuthenticator([material.credential]);
-    const request = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body: JSON.stringify({ projectionId: "personal" }),
-    });
+    const request = await capturedProjectionRequest(material);
 
     expect(request.bodyUsed).toBe(false);
     const authenticated = await authenticator.authenticate(request);
@@ -1236,11 +1262,7 @@ describe("device-bound replication HTTP message signatures", () => {
       clockSkewSeconds: 5,
     });
     const http = handler({ ...runtime, authenticator });
-    const request = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body: JSON.stringify({ projectionId: "personal" }),
+    const request = await capturedProjectionRequest(material, {
       now: signatureNow,
       lifetimeSeconds: 1,
       nonce: "nonce-00000000000000000001",
@@ -1249,11 +1271,7 @@ describe("device-bound replication HTTP message signatures", () => {
     expect((await http.fetch(request)).status).toBe(200);
 
     verifierNow = signatureNow + 3_000;
-    const replay = new Request(`http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`, {
-      method: "POST",
-      headers: request.headers,
-      body,
-    });
+    const replay = requestWith(request, body);
     expect((await http.fetch(replay)).status).toBe(401);
     runtime.semantic.close();
   });
@@ -1328,18 +1346,11 @@ describe("device-bound replication HTTP message signatures", () => {
   });
 
   it("rejects duplicate signature fields without consuming the valid nonce", async () => {
-    const runtime = await semanticRuntime("duplicate-signature-fields", "D");
-    const material = await deviceSignatureMaterial();
-    const http = handler({
-      ...runtime,
-      authenticator: signatureAuthenticator([material.credential]),
-    });
-    const body = JSON.stringify({ projectionId: "personal" });
-    const signed = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body,
+    const { runtime, material, http } = await signedProjectionFixture(
+      "duplicate-signature-fields",
+      "D",
+    );
+    const signed = await capturedProjectionRequest(material, {
       nonce: "nonce-00000000000000000999",
     });
 
@@ -1348,37 +1359,23 @@ describe("device-bound replication HTTP message signatures", () => {
       const original = headers.get(header);
       if (original === null) throw new Error(`expected ${header}`);
       headers.append(header, original);
-      const response = await http.fetch(new Request(signed.url, {
-        method: "POST",
-        headers,
-        body,
+      const response = await http.fetch(requestWith(signed, signedProjectionBody, (target) => {
+        target.delete("signature-input");
+        target.delete("signature");
+        target.delete("content-digest");
+        for (const [key, value] of headers) target.append(key, value);
       }));
       expect(response.status).toBe(401);
     }
 
-    const authentic = await http.fetch(new Request(signed.url, {
-      method: "POST",
-      headers: signed.headers,
-      body,
-    }));
+    const authentic = await http.fetch(requestWith(signed, signedProjectionBody));
     expect(authentic.status).toBe(200);
     runtime.semantic.close();
   });
 
   it("rejects malformed signature and content-digest fields fail-closed", async () => {
-    const runtime = await semanticRuntime("malformed", "M");
-    const material = await deviceSignatureMaterial();
-    const http = handler({
-      ...runtime,
-      authenticator: signatureAuthenticator([material.credential]),
-    });
-    const body = JSON.stringify({ projectionId: "personal" });
-    const signed = await capturedSignedRequest({
-      material,
-      url: `http://localhost${REPLICATION_HTTP_ROUTES.openProjection}`,
-      contentType: "application/json",
-      body,
-    });
+    const { runtime, material, http } = await signedProjectionFixture("malformed", "M");
+    const signed = await capturedProjectionRequest(material);
 
     for (const [header, value] of [
       ["signature-input", "ssrl=garbage"],
@@ -1387,11 +1384,11 @@ describe("device-bound replication HTTP message signatures", () => {
     ] as const) {
       const headers = new Headers(signed.headers);
       headers.set(header, value);
-      expect((await http.fetch(new Request(signed.url, {
-        method: "POST",
-        headers,
-        body,
-      }))).status).toBe(401);
+      expect((await http.fetch(requestWith(
+        signed,
+        signedProjectionBody,
+        (target) => target.set(header, value),
+      ))).status).toBe(401);
     }
     runtime.semantic.close();
   });
