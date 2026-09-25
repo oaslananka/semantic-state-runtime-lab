@@ -40,9 +40,11 @@ export function base64UrlEncode(value: ArrayBufferLike | ArrayBufferView): strin
   const chunkSize = 32_768;
   for (let offset = 0; offset < bytes.length; offset += chunkSize) {
     const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
-    for (const byte of chunk) binary += String.fromCharCode(byte);
+    for (const byte of chunk) binary += String.fromCodePoint(byte);
   }
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+  const encoded = btoa(binary).replaceAll("+", "-").replaceAll("/", "_");
+  if (encoded.endsWith("==")) return encoded.slice(0, -2);
+  return encoded.endsWith("=") ? encoded.slice(0, -1) : encoded;
 }
 
 export function decodedBase64UrlLength(value: string): number {
@@ -78,7 +80,13 @@ export function base64UrlDecode(
     throw new E2EValidationError(`${label} is not valid base64url`, { cause });
   }
   const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  for (let index = 0; index < binary.length; index += 1) {
+    const codePoint = binary.codePointAt(index);
+    if (codePoint === undefined || codePoint > 0xff) {
+      throw new E2EValidationError(`${label} decoded outside the byte range`);
+    }
+    bytes[index] = codePoint;
+  }
   if (base64UrlEncode(bytes) !== value) {
     throw new E2EValidationError(`${label} must use canonical unpadded base64url`);
   }
@@ -115,8 +123,9 @@ export function exactObjectKeys(
   expected: readonly string[],
   label: string,
 ): void {
-  const actual = Object.keys(object).toSorted();
-  const wanted = [...expected].toSorted();
+  const compare = (left: string, right: string) => left.localeCompare(right);
+  const actual = Object.keys(object).toSorted(compare);
+  const wanted = [...expected].toSorted(compare);
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     throw new E2EValidationError(`${label} has unexpected or missing fields`);
   }
