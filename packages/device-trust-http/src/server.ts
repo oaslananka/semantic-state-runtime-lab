@@ -281,7 +281,8 @@ function mapError(error: unknown, completion: boolean): Response {
 }
 
 function knownRoute(pathname: string): boolean {
-  return Object.values(DEVICE_TRUST_HTTP_ROUTES).some((route) => route === pathname);
+  const routes: readonly string[] = Object.values(DEVICE_TRUST_HTTP_ROUTES);
+  return routes.includes(pathname);
 }
 
 export function createDeviceTrustHttpHandler(

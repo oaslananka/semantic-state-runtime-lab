@@ -196,7 +196,7 @@ function parseSignatureInput(
 ): ParsedSignatureInput | undefined {
   if (value === null || value.length > 512) return undefined;
   const match = SIGNATURE_INPUT.exec(value);
-  if (match === null || match[5] !== expectedTag) return undefined;
+  if (match?.[5] !== expectedTag) return undefined;
   const created = Number(match[1]);
   const expires = Number(match[2]);
   if (!Number.isSafeInteger(created) || !Number.isSafeInteger(expires)) return undefined;

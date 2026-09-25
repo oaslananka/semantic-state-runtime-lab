@@ -103,9 +103,8 @@ async function normalizedResponse<T>(
     return await operation();
   } catch (cause) {
     if (cause instanceof InvalidDeviceTrustHttpResponseError) throw cause;
-    throw new InvalidDeviceTrustHttpResponseError(
-      `${label} is invalid${cause instanceof Error ? `: ${cause.message}` : ""}`,
-    );
+    const detail = cause instanceof Error ? `: ${cause.message}` : "";
+    throw new InvalidDeviceTrustHttpResponseError(`${label} is invalid${detail}`);
   }
 }
 

@@ -418,8 +418,7 @@ export async function deviceEnrollmentOfferJson(
 }
 
 function displayFingerprint(bytes: Uint8Array): string {
-  return [...bytes.slice(0, 8)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
+  return Array.from(bytes.slice(0, 8), (byte) => byte.toString(16).padStart(2, "0"))
     .join("")
     .toUpperCase()
     .match(/.{4}/g)!
