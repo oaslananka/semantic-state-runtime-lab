@@ -305,6 +305,37 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  packages/device-trust-http:
+    dependencies:
+      '@ssrl/access':
+        specifier: workspace:*
+        version: link:../access
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/device-trust':
+        specifier: workspace:*
+        version: link:../device-trust
+      '@ssrl/http-wire':
+        specifier: workspace:*
+        version: link:../http-wire
+    devDependencies:
+      '@ssrl/replication-http':
+        specifier: workspace:*
+        version: link:../replication-http
+      '@ssrl/storage-sqlite-device-trust':
+        specifier: workspace:*
+        version: link:../storage-sqlite-device-trust
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/http-wire:
+    devDependencies:
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
   packages/ingestion:
     dependencies:
       '@ssrl/artifact-store':
@@ -554,6 +585,9 @@ importers:
       '@ssrl/device-trust':
         specifier: workspace:*
         version: link:../device-trust
+      '@ssrl/http-wire':
+        specifier: workspace:*
+        version: link:../http-wire
       '@ssrl/replication':
         specifier: workspace:*
         version: link:../replication

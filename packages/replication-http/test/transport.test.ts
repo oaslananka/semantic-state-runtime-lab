@@ -252,7 +252,11 @@ function nonceSequence(prefix = "nonce"): () => string {
 
 function signatureAuthenticator(
   credentials: readonly ReplicationDeviceCredential[],
-  options: { readonly now?: number; readonly maxLifetime?: number } = {},
+  options: {
+    readonly now?: number;
+    readonly maxLifetime?: number;
+    readonly tag?: string;
+  } = {},
 ): HttpMessageSignatureAuthenticator {
   return new HttpMessageSignatureAuthenticator({
     keys: new StaticReplicationDeviceKeyResolver(credentials),
@@ -261,6 +265,7 @@ function signatureAuthenticator(
     ...(options.maxLifetime === undefined
       ? {}
       : { maxSignatureLifetimeSeconds: options.maxLifetime }),
+    ...(options.tag === undefined ? {} : { tag: options.tag }),
   });
 }
 
@@ -276,6 +281,7 @@ function signedClient(
     readonly nonce?: () => string;
     readonly lifetimeSeconds?: number;
     readonly baseUrl?: URL;
+    readonly tag?: string;
   } = {},
 ): ReplicationHttpClient {
   return new ReplicationHttpClient({
@@ -287,6 +293,7 @@ function signedClient(
       now: () => options.now ?? signatureNow,
       nonce: options.nonce ?? nonceSequence(),
       ...(options.lifetimeSeconds === undefined ? {} : { lifetimeSeconds: options.lifetimeSeconds }),
+      ...(options.tag === undefined ? {} : { tag: options.tag }),
     }),
   });
 }
@@ -299,6 +306,7 @@ async function capturedSignedRequest(input: {
   readonly now?: number;
   readonly nonce?: string;
   readonly lifetimeSeconds?: number;
+  readonly tag?: string;
 }): Promise<Request> {
   let captured: Request | undefined;
   const sign = createHttpMessageSigningFetch({
@@ -307,6 +315,7 @@ async function capturedSignedRequest(input: {
     now: () => input.now ?? signatureNow,
     nonce: () => input.nonce ?? "nonce-00000000000000000001",
     ...(input.lifetimeSeconds === undefined ? {} : { lifetimeSeconds: input.lifetimeSeconds }),
+    ...(input.tag === undefined ? {} : { tag: input.tag }),
     fetch: async (requestInput, init) => {
       captured = new Request(requestInput, init);
       return new Response(null, { status: 204 });
@@ -327,6 +336,7 @@ async function capturedProjectionRequest(
     readonly now?: number;
     readonly nonce?: string;
     readonly lifetimeSeconds?: number;
+    readonly tag?: string;
   } = {},
 ): Promise<Request> {
   return capturedSignedRequest({
@@ -1147,6 +1157,29 @@ describe("device-bound replication HTTP message signatures", () => {
       + ';keyid="device:known-answer";alg="ed25519";tag="ssrl-replication-v1"',
     );
     expect(request.headers.get("signature")).toMatch(/^ssrl=:[A-Za-z0-9+/]+={0,2}:$/);
+  });
+
+  it("isolates application profiles by signature tag and exposes verified device identity", async () => {
+    const material = await deviceSignatureMaterial("device:profile-key");
+    const credential = { ...material.credential, deviceId: "device:laptop" };
+    const request = await capturedProjectionRequest(material, {
+      tag: "ssrl-device-trust-v1",
+      nonce: "nonce-profile-00000000000001",
+    });
+
+    const replication = signatureAuthenticator([credential]);
+    expect(await replication.authenticate(request.clone())).toBeInstanceOf(Response);
+
+    const management = signatureAuthenticator([credential], { tag: "ssrl-device-trust-v1" });
+    const accepted = await management.authenticate(request.clone());
+    if (accepted instanceof Response) throw new Error(`expected management authentication, got ${accepted.status}`);
+    expect(accepted.device).toEqual({ keyId: credential.keyId, deviceId: "device:laptop" });
+    await expect(accepted.verifyBody!(new TextEncoder().encode(signedProjectionBody))).resolves.toBe(true);
+
+    const replicationRequest = await capturedProjectionRequest(material, {
+      nonce: "nonce-profile-00000000000002",
+    });
+    expect(await management.authenticate(replicationRequest)).toBeInstanceOf(Response);
   });
 
   it("authenticates an Ed25519-signed request and derives principal only from the device key", async () => {

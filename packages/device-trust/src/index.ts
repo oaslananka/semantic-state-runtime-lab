@@ -6,6 +6,7 @@ import { canonicalJson } from "@ssrl/core";
 
 const JWK_THUMBPRINT_URI_PREFIX = "urn:ietf:params:oauth:jwk-thumbprint:sha-256:";
 const DEVICE_TRUST_PROOF_SCHEMA = "ssrl-device-trust-proof-v1" as const;
+export const DEVICE_ENROLLMENT_OFFER_SCHEMA = "ssrl-device-enrollment-offer-v1" as const;
 const DEFAULT_CHALLENGE_LIFETIME_SECONDS = 300;
 const MAX_CHALLENGE_LIFETIME_SECONDS = 900;
 const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
@@ -24,6 +25,22 @@ export interface Ed25519PublicJwk {
   readonly kty: "OKP";
   readonly crv: "Ed25519";
   readonly x: string;
+}
+
+export interface DeviceEnrollmentOffer {
+  readonly schema: typeof DEVICE_ENROLLMENT_OFFER_SCHEMA;
+  readonly deviceId: string;
+  readonly displayName: string;
+  readonly publicKeyJwk: Ed25519PublicJwk;
+  readonly keyId: string;
+  readonly audience: string;
+}
+
+export interface DeviceEnrollmentOfferInput {
+  readonly deviceId: string;
+  readonly displayName: string;
+  readonly publicKeyJwk: JsonWebKey;
+  readonly audience: string;
 }
 
 export interface TrustedDevice {
@@ -203,6 +220,11 @@ export interface DeviceTrustRepository
   pruneExpired(now: string): number | Promise<number>;
 }
 
+export interface ActiveDeviceAuthorization {
+  readonly device: TrustedDevice;
+  readonly key: TrustedDeviceKey;
+}
+
 export interface DeviceTrustManagerOptions {
   readonly repository: DeviceTrustRepository;
   readonly now?: () => number;
@@ -359,6 +381,84 @@ export async function ed25519JwkThumbprintUri(value: JsonWebKey): Promise<string
   const bytes = new TextEncoder().encode(canonicalJson(publicJwk));
   const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
   return `${JWK_THUMBPRINT_URI_PREFIX}${base64Url(digest)}`;
+}
+
+
+export async function createDeviceEnrollmentOffer(
+  input: DeviceEnrollmentOfferInput,
+): Promise<DeviceEnrollmentOffer> {
+  const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+  return {
+    schema: DEVICE_ENROLLMENT_OFFER_SCHEMA,
+    deviceId: requiredString(input.deviceId, "offer deviceId"),
+    displayName: requiredString(input.displayName, "offer displayName"),
+    publicKeyJwk,
+    keyId: await ed25519JwkThumbprintUri(publicKeyJwk),
+    audience: requiredString(input.audience, "offer audience"),
+  };
+}
+
+export async function normalizeDeviceEnrollmentOffer(
+  value: DeviceEnrollmentOffer,
+): Promise<DeviceEnrollmentOffer> {
+  if (value.schema !== DEVICE_ENROLLMENT_OFFER_SCHEMA) {
+    throw new TypeError("device enrollment offer schema is invalid");
+  }
+  const normalized = await createDeviceEnrollmentOffer(value);
+  if (value.keyId !== normalized.keyId) {
+    throw new TypeError("device enrollment offer keyId does not match public JWK thumbprint");
+  }
+  return normalized;
+}
+
+export async function deviceEnrollmentOfferJson(
+  offer: DeviceEnrollmentOffer,
+): Promise<string> {
+  return canonicalJson(await normalizeDeviceEnrollmentOffer(offer));
+}
+
+function displayFingerprint(bytes: Uint8Array): string {
+  return Array.from(bytes.slice(0, 8), (byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()
+    .match(/.{4}/g)!
+    .join("-");
+}
+
+export async function deviceEnrollmentOfferFingerprint(
+  offer: DeviceEnrollmentOffer,
+): Promise<string> {
+  const bytes = new TextEncoder().encode(await deviceEnrollmentOfferJson(offer));
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
+  return displayFingerprint(digest);
+}
+
+export async function assertEnrollmentChallengeMatchesOffer(
+  challenge: DeviceTrustChallenge,
+  offer: DeviceEnrollmentOffer,
+): Promise<DeviceTrustChallenge> {
+  const normalizedOffer = await normalizeDeviceEnrollmentOffer(offer);
+  const normalizedChallenge = await validateDeviceTrustChallengeKeyId(challenge);
+  if (
+    normalizedChallenge.operation !== "enroll-device"
+    || normalizedChallenge.deviceId !== normalizedOffer.deviceId
+    || normalizedChallenge.displayName !== normalizedOffer.displayName
+    || normalizedChallenge.keyId !== normalizedOffer.keyId
+    || canonicalJson(normalizedChallenge.publicKeyJwk) !== canonicalJson(normalizedOffer.publicKeyJwk)
+    || normalizedChallenge.audience !== normalizedOffer.audience
+  ) {
+    throw new DeviceTrustChallengeError("enrollment challenge does not match the local device offer");
+  }
+  return normalizedChallenge;
+}
+
+export async function signEnrollmentChallengeForOffer(
+  challenge: DeviceTrustChallenge,
+  offer: DeviceEnrollmentOffer,
+  privateKey: CryptoKey,
+): Promise<Uint8Array> {
+  const normalized = await assertEnrollmentChallengeMatchesOffer(challenge, offer);
+  return signDeviceTrustChallenge(normalized, privateKey);
 }
 
 export function normalizeTrustedDevice(device: TrustedDevice): TrustedDevice {
@@ -626,10 +726,7 @@ export class DeviceTrustManager {
     this.#challengeLifetimeSeconds = configuredChallengeLifetime(options.challengeLifetimeSeconds);
   }
 
-  async #activeAuthorization(keyId: string): Promise<{
-    readonly device: TrustedDevice;
-    readonly key: TrustedDeviceKey;
-  }> {
+  async #activeAuthorization(keyId: string): Promise<ActiveDeviceAuthorization> {
     const key = await this.#repository.key(requiredString(keyId, "authorizingKeyId"));
     if (key?.status !== "active") {
       throw new DeviceTrustAuthorizationError("authorizing device key is not active");
@@ -639,6 +736,10 @@ export class DeviceTrustManager {
       throw new DeviceTrustAuthorizationError("authorizing device is not active");
     }
     return { device, key };
+  }
+
+  async activeAuthorization(keyId: string): Promise<ActiveDeviceAuthorization> {
+    return this.#activeAuthorization(keyId);
   }
 
   async #replayedKeyEvent(

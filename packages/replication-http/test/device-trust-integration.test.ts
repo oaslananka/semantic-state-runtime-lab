@@ -98,6 +98,7 @@ describe("durable trusted-device replication authentication", () => {
     const authentic = authenticated(await authenticator.authenticate(request.clone()));
     await expect(authentic.verifyBody!(new TextEncoder().encode(body))).resolves.toBe(true);
     expect(authentic.principal).toEqual({ subject: "user:alice", scopes: ["replication"] });
+    expect(authentic.device).toEqual({ keyId: keys.keyId, deviceId: "device:laptop" });
     store.close();
 
     const reopened = new SQLiteDeviceTrustStore({ path });

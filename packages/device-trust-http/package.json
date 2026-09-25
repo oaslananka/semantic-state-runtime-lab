@@ -1,0 +1,24 @@
+{
+  "name": "@ssrl/device-trust-http",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ssrl/access": "workspace:*",
+    "@ssrl/core": "workspace:*",
+    "@ssrl/device-trust": "workspace:*",
+    "@ssrl/http-wire": "workspace:*"
+  },
+  "devDependencies": {
+    "@ssrl/replication-http": "workspace:*",
+    "@ssrl/storage-sqlite-device-trust": "workspace:*",
+    "@types/node": "26.6.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}

@@ -326,8 +326,10 @@ v1 does not implement:
 
 The next trust work should be chosen from product risk rather than feature count:
 
-1. **Management transport and UX**: explicit local CLI plus trusted-device enrollment endpoint; optionally WebAuthn-authorized owner ceremony.
-2. **Recovery policy**: emergency device/key revocation and account recovery without creating an unauthenticated backdoor.
+1. **Recovery policy**: emergency recovery after loss of all active devices without creating an unauthenticated backdoor.
+2. **Management UX** over the implemented key-bound HTTP protocol: QR/copy/native-device flows that preserve explicit possession confirmation.
 3. **Hardware-backed key adapters**: Secure Enclave/TPM/Android Keystore without changing logical device/key semantics.
 4. **Shared trust/replay backend** for cloud or multi-process deployments.
 5. **E2E relay encryption** (for example an HPKE-based design) only after trust lifecycle and recovery semantics are stable.
+
+The signed management transport and key-bound enrollment offer are documented in `docs/device-trust-management-http-v1.md`.

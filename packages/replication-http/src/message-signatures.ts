@@ -19,7 +19,7 @@ import type { ReplicationHttpFetch } from "./client.js";
 import { REPLICATION_HTTP_ERROR_SCHEMA } from "./protocol.js";
 
 const SIGNATURE_LABEL = "ssrl";
-const SIGNATURE_TAG = "ssrl-replication-v1";
+const DEFAULT_SIGNATURE_TAG = "ssrl-replication-v1";
 const SIGNATURE_ALGORITHM = "ed25519";
 const CONTENT_DIGEST_ALGORITHM = "sha-256";
 const DEFAULT_SIGNATURE_LIFETIME_SECONDS = 60;
@@ -35,7 +35,8 @@ const PROFILE_COMPONENTS = [
 const PROFILE_COMPONENT_LIST = PROFILE_COMPONENTS.map((value) => `"${value}"`).join(" ");
 const SAFE_KEY_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_NONCE = /^[A-Za-z0-9_-]{16,128}$/;
-const SIGNATURE_INPUT = new RegExp(String.raw`^${SIGNATURE_LABEL}=\("@method" "@target-uri" "content-digest" "content-type"\);created=(\d+);expires=(\d+);nonce="([A-Za-z0-9_-]{16,128})";keyid="([A-Za-z0-9._:-]{1,128})";alg="${SIGNATURE_ALGORITHM}";tag="${SIGNATURE_TAG}"$`);
+const SAFE_SIGNATURE_TAG = /^[A-Za-z0-9._:-]{1,64}$/;
+const SIGNATURE_INPUT = new RegExp(String.raw`^${SIGNATURE_LABEL}=\("@method" "@target-uri" "content-digest" "content-type"\);created=(\d+);expires=(\d+);nonce="([A-Za-z0-9_-]{16,128})";keyid="([A-Za-z0-9._:-]{1,128})";alg="${SIGNATURE_ALGORITHM}";tag="([A-Za-z0-9._:-]{1,64})"$`);
 const SIGNATURE_VALUE = new RegExp(`^${SIGNATURE_LABEL}=:([A-Za-z0-9+/]+={0,2}):$`);
 const CONTENT_DIGEST_VALUE = new RegExp(`^${CONTENT_DIGEST_ALGORITHM}=:([A-Za-z0-9+/]+={0,2}):$`);
 
@@ -46,6 +47,7 @@ export interface HttpMessageSignatureAuthenticatorOptions {
   readonly now?: () => number;
   readonly maxSignatureLifetimeSeconds?: number;
   readonly clockSkewSeconds?: number;
+  readonly tag?: string;
 }
 
 export interface HttpMessageSigningFetchOptions {
@@ -56,6 +58,7 @@ export interface HttpMessageSigningFetchOptions {
   readonly now?: () => number;
   readonly nonce?: () => string;
   readonly lifetimeSeconds?: number;
+  readonly tag?: string;
 }
 
 interface SignatureParametersInput {
@@ -63,6 +66,7 @@ interface SignatureParametersInput {
   readonly expires: number;
   readonly nonce: string;
   readonly keyId: string;
+  readonly tag: string;
 }
 
 interface ParsedSignatureInput extends SignatureParametersInput {
@@ -101,6 +105,11 @@ function assertSafeKeyId(value: string): string {
 
 function assertSafeNonce(value: string): string {
   if (!SAFE_NONCE.test(value)) throw new TypeError("replication signature nonce is invalid");
+  return value;
+}
+
+function assertSafeSignatureTag(value: string): string {
+  if (!SAFE_SIGNATURE_TAG.test(value)) throw new TypeError("HTTP signature profile tag is invalid");
   return value;
 }
 
@@ -161,7 +170,7 @@ function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 function signatureParameters(input: SignatureParametersInput): string {
   return `(${PROFILE_COMPONENT_LIST});created=${input.created};expires=${input.expires}`
     + `;nonce="${input.nonce}";keyid="${input.keyId}";alg="${SIGNATURE_ALGORITHM}"`
-    + `;tag="${SIGNATURE_TAG}"`;
+    + `;tag="${input.tag}"`;
 }
 
 function signatureInputValue(input: SignatureParametersInput): string {
@@ -181,10 +190,13 @@ function signatureBase(request: Request, serializedParameters: string): string |
   ].join("\n");
 }
 
-function parseSignatureInput(value: string | null): ParsedSignatureInput | undefined {
+function parseSignatureInput(
+  value: string | null,
+  expectedTag: string,
+): ParsedSignatureInput | undefined {
   if (value === null || value.length > 512) return undefined;
   const match = SIGNATURE_INPUT.exec(value);
-  if (match === null) return undefined;
+  if (match?.[5] !== expectedTag) return undefined;
   const created = Number(match[1]);
   const expires = Number(match[2]);
   if (!Number.isSafeInteger(created) || !Number.isSafeInteger(expires)) return undefined;
@@ -194,6 +206,7 @@ function parseSignatureInput(value: string | null): ParsedSignatureInput | undef
     expires,
     nonce: match[3]!,
     keyId: match[4]!,
+    tag: match[5]!,
   };
 }
 
@@ -269,6 +282,7 @@ export class StaticReplicationDeviceKeyResolver implements ReplicationDeviceKeyR
         publicKeyJwk: { ...credential.publicKeyJwk },
         principal: normalizeAccessPrincipal(credential.principal),
         status: credential.status ?? "active",
+        ...(credential.deviceId === undefined ? {} : { deviceId: credential.deviceId }),
       });
     }
     this.#credentials = map;
@@ -308,6 +322,7 @@ export class HttpMessageSignatureAuthenticator implements ReplicationHttpAuthent
   readonly #now: () => number;
   readonly #maxLifetime: number;
   readonly #clockSkew: number;
+  readonly #tag: string;
 
   constructor(options: HttpMessageSignatureAuthenticatorOptions) {
     this.#keys = options.keys;
@@ -315,11 +330,12 @@ export class HttpMessageSignatureAuthenticator implements ReplicationHttpAuthent
     this.#now = options.now ?? Date.now;
     this.#maxLifetime = configuredLifetime(options.maxSignatureLifetimeSeconds);
     this.#clockSkew = configuredSkew(options.clockSkewSeconds);
+    this.#tag = assertSafeSignatureTag(options.tag ?? DEFAULT_SIGNATURE_TAG);
   }
 
   async authenticate(request: Request): Promise<ReplicationHttpAuthentication | Response> {
     try {
-      const parsed = parseSignatureInput(request.headers.get("signature-input"));
+      const parsed = parseSignatureInput(request.headers.get("signature-input"), this.#tag);
       const signature = parseSignature(request.headers.get("signature"));
       const expectedDigest = parseContentDigest(request.headers.get("content-digest"));
       const contentType = request.headers.get("content-type");
@@ -346,6 +362,10 @@ export class HttpMessageSignatureAuthenticator implements ReplicationHttpAuthent
       if (!verified) return authFailure();
       return {
         principal: normalizeAccessPrincipal(credential.principal),
+        device: {
+          keyId: credential.keyId,
+          ...(credential.deviceId === undefined ? {} : { deviceId: credential.deviceId }),
+        },
         verifyBody: async (bytes) => {
           if (!timingSafeEqual(await sha256(bytes), expectedDigest)) return false;
           return this.#replayStore.consume({
@@ -371,6 +391,7 @@ export function createHttpMessageSigningFetch(
   const now = options.now ?? Date.now;
   const nonce = options.nonce ?? randomNonce;
   const lifetime = configuredLifetime(options.lifetimeSeconds);
+  const tag = assertSafeSignatureTag(options.tag ?? DEFAULT_SIGNATURE_TAG);
 
   return async (input, init) => {
     const request = new Request(input, init);
@@ -386,7 +407,7 @@ export function createHttpMessageSigningFetch(
     const created = safeIntegerSeconds(Math.floor(now() / 1000), "signature created");
     const expires = created + lifetime;
     const nonceValue = assertSafeNonce(nonce());
-    const inputValue = signatureInputValue({ created, expires, nonce: nonceValue, keyId });
+    const inputValue = signatureInputValue({ created, expires, nonce: nonceValue, keyId, tag });
     headers.set("signature-input", inputValue);
     const unsigned = new Request(request.url, { method: request.method, headers });
     const base = signatureBase(unsigned, inputValue.slice(`${SIGNATURE_LABEL}=`.length));
