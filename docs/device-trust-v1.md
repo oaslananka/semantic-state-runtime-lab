@@ -330,7 +330,7 @@ v1 does not implement:
 
 The next trust work should be chosen from product risk rather than feature count:
 
-1. **Recovery management HTTP**: expose the implemented recovery state machine without adding enumeration leaks or weaker fallback factors.
+1. **E2E relay encryption/key distribution**: prevent sync relays from becoming plaintext trust roots now that the device lifecycle and recovery transport are complete.
 2. **Management UX** over the implemented key-bound protocols: QR/copy/native-device flows that preserve explicit possession confirmation.
 3. **Hardware-backed key adapters**: Secure Enclave/TPM/Android Keystore without changing logical device/key/recovery semantics.
 4. **Shared trust/replay backend** for cloud or multi-process deployments.
@@ -339,3 +339,5 @@ The next trust work should be chosen from product risk rather than feature count
 The signed management transport and key-bound enrollment offer are documented in `docs/device-trust-management-http-v1.md`.
 
 Owner-controlled destructive recovery is documented in `docs/owner-trust-recovery-v1.md`.
+
+Its anti-enumeration HTTP transport is documented in `docs/device-trust-recovery-http-v1.md`.

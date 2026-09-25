@@ -143,6 +143,10 @@ All v1 routes are POST and `application/json`:
 /v1/device-trust/rotations/complete
 /v1/device-trust/keys/revoke
 /v1/device-trust/devices/revoke
+/v1/device-trust/recovery-credentials/prepare
+/v1/device-trust/recovery-credentials/commit
+/v1/device-trust/recovery/start
+/v1/device-trust/recovery/complete
 ```
 
 Trusted-device HTTP signatures are required for:
@@ -151,11 +155,14 @@ Trusted-device HTTP signatures are required for:
 - rotation start
 - key revocation
 - device revocation
+- recovery credential prepare
+- recovery credential commit
 
-Candidate proof is required for:
+Candidate/key-bound proof is required for:
 
 - enrollment complete
 - rotation complete
+- public recovery start/complete use the separate owner-recovery ceremony rather than a surviving trusted-device signature
 
 There is no remote first-device bootstrap route.
 
@@ -260,7 +267,7 @@ Tests prove:
 v1 does not implement:
 
 - unauthenticated remote first-device bootstrap;
-- account recovery or social recovery;
+- password/email/SMS or social recovery;
 - WebAuthn/passkey RP/server stack;
 - low-entropy device-code polling authorization;
 - Bluetooth/NFC transport;
@@ -270,8 +277,12 @@ v1 does not implement:
 - distributed/cloud trust-registry consensus;
 - a graphical pairing UI.
 
+## Recovery transport
+
+Owner-controlled destructive recovery now has a separately profiled HTTP surface. Normal recovery-credential provisioning remains trusted-device signed, while emergency start/complete are authorized by the recovery ceremony itself and collapse durable state failures to one generic public response.
+
+See `docs/device-trust-recovery-http-v1.md`.
+
 ## Next risk
 
-The next trust problem is recovery, not more enrollment surface area.
-
-A useful recovery design must let a legitimate owner regain control after losing all active trusted devices **without** creating an unauthenticated remote backdoor that defeats the trust model. WebAuthn-authorized recovery, offline recovery material, quorum/social recovery, and explicit destructive reset have materially different security and product tradeoffs and should be evaluated before implementation.
+With lifecycle recovery transport in place, the next trust-layer candidate is end-to-end replication relay encryption/key distribution rather than adding weaker reset factors.

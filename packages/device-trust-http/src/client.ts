@@ -1,13 +1,21 @@
+import { canonicalJson } from "@ssrl/core";
 import {
   normalizeDeviceEnrollmentOffer,
   normalizeDeviceTrustEvent,
   normalizeEd25519PublicJwk,
+  normalizeRecoveryProvisioningProof,
   normalizeTrustedDevice,
   normalizeTrustedDeviceKey,
+  normalizeTrustedRecoveryCredential,
+  validateDeviceRecoveryChallengeKeyIds,
   validateDeviceTrustChallengeKeyId,
   type DeviceEnrollmentOffer,
+  type DeviceRecoveryChallenge,
   type DeviceTrustChallenge,
   type DeviceTrustMutationResult,
+  type RecoveryCredentialMutationResult,
+  type RecoveryProvisioningProof,
+  type RecoveryTrustSetMutationResult,
 } from "@ssrl/device-trust";
 import {
   collectBoundedBytes,
@@ -20,6 +28,10 @@ import {
   DEVICE_TRUST_HTTP_CHALLENGE_SCHEMA,
   DEVICE_TRUST_HTTP_ERROR_SCHEMA,
   DEVICE_TRUST_HTTP_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_CREDENTIAL_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_PROVISIONING_SCHEMA,
   DEVICE_TRUST_HTTP_ROUTES,
 } from "./protocol.js";
 
@@ -146,6 +158,109 @@ async function mutationResult(response: Response): Promise<DeviceTrustMutationRe
   return { outcome: raw.outcome, event, device, ...(key === undefined ? {} : { key }) };
 }
 
+async function recoveryProvisioningResult(response: Response): Promise<RecoveryProvisioningProof> {
+  const body = await checkedJson(response);
+  exactObjectKeys(body, ["schema", "proof"], "recovery provisioning response", invalidResponse);
+  if (body.schema !== DEVICE_TRUST_HTTP_RECOVERY_PROVISIONING_SCHEMA) {
+    throw new InvalidDeviceTrustHttpResponseError(
+      "Device trust recovery provisioning response schema is invalid",
+    );
+  }
+  return normalizedResponse(
+    () => normalizeRecoveryProvisioningProof(body.proof as RecoveryProvisioningProof),
+    "Device trust recovery provisioning response",
+  );
+}
+
+async function recoveryCredentialMutationResult(
+  response: Response,
+): Promise<RecoveryCredentialMutationResult> {
+  const body = await checkedJson(response);
+  exactObjectKeys(
+    body,
+    ["schema", "result"],
+    "recovery credential mutation response",
+    invalidResponse,
+  );
+  if (body.schema !== DEVICE_TRUST_HTTP_RECOVERY_CREDENTIAL_MUTATION_SCHEMA) {
+    throw new InvalidDeviceTrustHttpResponseError(
+      "Device trust recovery credential mutation response schema is invalid",
+    );
+  }
+  const raw = objectRecord(body.result, "recovery credential mutation result", invalidResponse);
+  exactObjectKeys(raw, ["outcome", "event", "credential"], "recovery credential mutation result", invalidResponse);
+  if (raw.outcome !== "inserted" && raw.outcome !== "replayed") {
+    throw new InvalidDeviceTrustHttpResponseError("Recovery credential mutation outcome is invalid");
+  }
+  const { event, credential } = await normalizedResponse(async () => ({
+    event: normalizeDeviceTrustEvent(raw.event as never),
+    credential: await normalizeTrustedRecoveryCredential(raw.credential as never),
+  }), "Recovery credential mutation response");
+  if (
+    event.type !== "set-recovery-credential"
+    || event.recoveryKeyId !== credential.keyId
+    || event.recoveryGeneration !== credential.generation
+    || canonicalJson(event.principal) !== canonicalJson(credential.principal)
+  ) {
+    throw new InvalidDeviceTrustHttpResponseError(
+      "Recovery credential mutation records disagree",
+    );
+  }
+  return { outcome: raw.outcome, event, credential };
+}
+
+async function recoveryChallengeResult(response: Response): Promise<DeviceRecoveryChallenge> {
+  const body = await checkedJson(response);
+  exactObjectKeys(body, ["schema", "challenge"], "recovery challenge response", invalidResponse);
+  if (body.schema !== DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA) {
+    throw new InvalidDeviceTrustHttpResponseError(
+      "Device trust recovery challenge response schema is invalid",
+    );
+  }
+  return normalizedResponse(
+    () => validateDeviceRecoveryChallengeKeyIds(body.challenge as DeviceRecoveryChallenge),
+    "Device trust recovery challenge response",
+  );
+}
+
+async function recoveryMutationResult(response: Response): Promise<RecoveryTrustSetMutationResult> {
+  const body = await checkedJson(response);
+  exactObjectKeys(body, ["schema", "result"], "recovery mutation response", invalidResponse);
+  if (body.schema !== DEVICE_TRUST_HTTP_RECOVERY_MUTATION_SCHEMA) {
+    throw new InvalidDeviceTrustHttpResponseError("Device trust recovery mutation response schema is invalid");
+  }
+  const raw = objectRecord(body.result, "recovery mutation result", invalidResponse);
+  exactObjectKeys(
+    raw,
+    ["outcome", "event", "device", "key", "recoveryCredential"],
+    "recovery mutation result",
+    invalidResponse,
+  );
+  if (raw.outcome !== "inserted" && raw.outcome !== "replayed") {
+    throw new InvalidDeviceTrustHttpResponseError("Recovery mutation outcome is invalid");
+  }
+  const { event, device, key, recoveryCredential } = await normalizedResponse(async () => ({
+    event: normalizeDeviceTrustEvent(raw.event as never),
+    device: normalizeTrustedDevice(raw.device as never),
+    key: await normalizeTrustedDeviceKey(raw.key as never),
+    recoveryCredential: await normalizeTrustedRecoveryCredential(raw.recoveryCredential as never),
+  }), "Recovery mutation response");
+  if (
+    event.type !== "recover-trust-set"
+    || event.deviceId !== device.deviceId
+    || event.keyId !== key.keyId
+    || key.deviceId !== device.deviceId
+    || event.nextRecoveryKeyId !== recoveryCredential.keyId
+    || event.nextRecoveryGeneration !== recoveryCredential.generation
+    || canonicalJson(event.principal) !== canonicalJson(device.principal)
+    || canonicalJson(event.principal) !== canonicalJson(recoveryCredential.principal)
+  ) {
+    throw new InvalidDeviceTrustHttpResponseError("Recovery mutation records disagree");
+  }
+  return { outcome: raw.outcome, event, device, key, recoveryCredential };
+}
+
+
 function endpoint(baseUrl: URL, route: string): URL {
   return new URL(route, baseUrl);
 }
@@ -204,6 +319,100 @@ export class DeviceTrustHttpClient {
       endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.completeRotation),
       jsonInit({ ...input, signature: bytesToBase64Url(input.signature) }),
     ));
+  }
+
+  async prepareRecoveryCredential(
+    eventId: string,
+    publicKeyJwk: JsonWebKey,
+  ): Promise<RecoveryProvisioningProof> {
+    const normalizedKey = normalizeEd25519PublicJwk(publicKeyJwk);
+    const proof = await recoveryProvisioningResult(await this.#trustedFetch(
+      endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential),
+      jsonInit({ eventId, publicKeyJwk: normalizedKey }),
+    ));
+    if (proof.eventId !== eventId || canonicalJson(proof.recoveryPublicKeyJwk) !== canonicalJson(normalizedKey)) {
+      throw new InvalidDeviceTrustHttpResponseError(
+        "Recovery provisioning response does not match the requested event/key",
+      );
+    }
+    return proof;
+  }
+
+  async commitRecoveryCredential(input: {
+    readonly eventId: string;
+    readonly publicKeyJwk: JsonWebKey;
+    readonly signature: Uint8Array;
+  }): Promise<RecoveryCredentialMutationResult> {
+    const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const result = await recoveryCredentialMutationResult(await this.#trustedFetch(
+      endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.commitRecoveryCredential),
+      jsonInit({
+        eventId: input.eventId,
+        publicKeyJwk,
+        signature: bytesToBase64Url(input.signature),
+      }),
+    ));
+    if (
+      result.event.eventId !== input.eventId
+      || canonicalJson(result.credential.publicKeyJwk) !== canonicalJson(publicKeyJwk)
+    ) {
+      throw new InvalidDeviceTrustHttpResponseError(
+        "Recovery credential mutation does not match the requested event/key",
+      );
+    }
+    return result;
+  }
+
+  async startRecovery(input: {
+    readonly recoveryKeyId: string;
+    readonly deviceId: string;
+    readonly displayName: string;
+    readonly publicKeyJwk: JsonWebKey;
+    readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+  }): Promise<DeviceRecoveryChallenge> {
+    const publicKeyJwk = normalizeEd25519PublicJwk(input.publicKeyJwk);
+    const nextRecoveryPublicKeyJwk = normalizeEd25519PublicJwk(input.nextRecoveryPublicKeyJwk);
+    const challenge = await recoveryChallengeResult(await this.#candidateFetch(
+      endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.startRecovery),
+      jsonInit({ ...input, publicKeyJwk, nextRecoveryPublicKeyJwk }),
+    ));
+    if (
+      challenge.recoveryKeyId !== input.recoveryKeyId
+      || challenge.deviceId !== input.deviceId
+      || challenge.displayName !== input.displayName
+      || canonicalJson(challenge.publicKeyJwk) !== canonicalJson(publicKeyJwk)
+      || canonicalJson(challenge.nextRecoveryPublicKeyJwk) !== canonicalJson(nextRecoveryPublicKeyJwk)
+    ) {
+      throw new InvalidDeviceTrustHttpResponseError(
+        "Recovery challenge does not match the requested recovery/device keys",
+      );
+    }
+    return challenge;
+  }
+
+  async completeRecovery(input: {
+    readonly eventId: string;
+    readonly challengeId: string;
+    readonly recoverySignature: Uint8Array;
+    readonly deviceSignature: Uint8Array;
+    readonly nextRecoverySignature: Uint8Array;
+  }): Promise<RecoveryTrustSetMutationResult> {
+    const result = await recoveryMutationResult(await this.#candidateFetch(
+      endpoint(this.#baseUrl, DEVICE_TRUST_HTTP_ROUTES.completeRecovery),
+      jsonInit({
+        eventId: input.eventId,
+        challengeId: input.challengeId,
+        recoverySignature: bytesToBase64Url(input.recoverySignature),
+        deviceSignature: bytesToBase64Url(input.deviceSignature),
+        nextRecoverySignature: bytesToBase64Url(input.nextRecoverySignature),
+      }),
+    ));
+    if (result.event.eventId !== input.eventId || result.event.challengeId !== input.challengeId) {
+      throw new InvalidDeviceTrustHttpResponseError(
+        "Recovery mutation does not match the requested event/challenge",
+      );
+    }
+    return result;
   }
 
   async revokeKey(eventId: string, targetKeyId: string): Promise<DeviceTrustMutationResult> {

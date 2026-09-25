@@ -241,7 +241,6 @@ Tests prove:
 
 v1 does not implement:
 
-- HTTP recovery endpoints
 - password/email/SMS reset
 - low-entropy printable recovery codes
 - social/quorum recovery
@@ -254,8 +253,12 @@ v1 does not implement:
 - end-to-end relay payload encryption
 - recovery UI
 
+## HTTP transport
+
+The recovery state machine is exposed through a separately profiled bounded HTTP surface. Recovery credential prepare/commit remain authenticated trusted-device management operations. Emergency recovery start/complete work without a surviving trusted-device signature and expose one generic state-dependent `recovery-failed` public error shape.
+
+See `docs/device-trust-recovery-http-v1.md`.
+
 ## Next step
 
-The next trust-layer work should expose provisioning/start/complete through a **separately profiled bounded management HTTP surface** with generic anti-enumeration failure shapes. That surface must not weaken the cryptographic state machine documented here.
-
-After recovery transport is stable, E2E relay encryption can be evaluated on top of a trust lifecycle that now covers bootstrap, enrollment, rotation, revocation, and total-device-loss recovery.
+E2E relay encryption/key distribution can now be evaluated on top of a trust lifecycle that covers bootstrap, enrollment, rotation, revocation, total-device-loss recovery, and remote recovery transport.

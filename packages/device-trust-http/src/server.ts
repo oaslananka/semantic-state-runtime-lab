@@ -9,8 +9,12 @@ import {
   normalizeDeviceEnrollmentOffer,
   normalizeEd25519PublicJwk,
   type DeviceEnrollmentOffer,
+  type DeviceRecoveryChallenge,
   type DeviceTrustChallenge,
   type DeviceTrustMutationResult,
+  type RecoveryCredentialMutationResult,
+  type RecoveryProvisioningProof,
+  type RecoveryTrustSetMutationResult,
 } from "@ssrl/device-trust";
 import {
   collectBoundedBytes,
@@ -27,6 +31,10 @@ import {
   DEVICE_TRUST_HTTP_CHALLENGE_SCHEMA,
   DEVICE_TRUST_HTTP_ERROR_SCHEMA,
   DEVICE_TRUST_HTTP_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_CREDENTIAL_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_MUTATION_SCHEMA,
+  DEVICE_TRUST_HTTP_RECOVERY_PROVISIONING_SCHEMA,
   DEVICE_TRUST_HTTP_ROUTES,
   type DeviceTrustHttpErrorBody,
 } from "./protocol.js";
@@ -187,14 +195,20 @@ async function parsedOffer(value: unknown, audience: string): Promise<DeviceEnro
   return normalized;
 }
 
-function parsedPublicJwk(value: unknown): JsonWebKey {
-  const jwk = objectRecord(value, "publicKeyJwk", invalidRequest);
-  exactObjectKeys(jwk, ["kty", "crv", "x"], "publicKeyJwk", invalidRequest);
-  return normalizeEd25519PublicJwk({
-    kty: nonEmptyString(jwk.kty, "publicKeyJwk.kty", invalidRequest),
-    crv: nonEmptyString(jwk.crv, "publicKeyJwk.crv", invalidRequest),
-    x: nonEmptyString(jwk.x, "publicKeyJwk.x", invalidRequest),
-  } as JsonWebKey);
+function parsedPublicJwk(value: unknown, label = "publicKeyJwk"): JsonWebKey {
+  const jwk = objectRecord(value, label, invalidRequest);
+  exactObjectKeys(jwk, ["kty", "crv", "x"], label, invalidRequest);
+  try {
+    return normalizeEd25519PublicJwk({
+      kty: nonEmptyString(jwk.kty, `${label}.kty`, invalidRequest),
+      crv: nonEmptyString(jwk.crv, `${label}.crv`, invalidRequest),
+      x: nonEmptyString(jwk.x, `${label}.x`, invalidRequest),
+    } as JsonWebKey);
+  } catch (cause) {
+    if (cause instanceof DeviceTrustHttpProtocolError) throw cause;
+    const detail = cause instanceof Error ? cause.message : `${label} is invalid`;
+    throw invalidRequest(detail);
+  }
 }
 
 function principalEqual(left: AccessPrincipal, right: AccessPrincipal): boolean {
@@ -235,6 +249,23 @@ function mutationResponse(result: DeviceTrustMutationResult): Response {
   return jsonResponse({ schema: DEVICE_TRUST_HTTP_MUTATION_SCHEMA, result });
 }
 
+
+function recoveryProvisioningResponse(proof: RecoveryProvisioningProof): Response {
+  return jsonResponse({ schema: DEVICE_TRUST_HTTP_RECOVERY_PROVISIONING_SCHEMA, proof });
+}
+
+function recoveryCredentialMutationResponse(result: RecoveryCredentialMutationResult): Response {
+  return jsonResponse({ schema: DEVICE_TRUST_HTTP_RECOVERY_CREDENTIAL_MUTATION_SCHEMA, result });
+}
+
+function recoveryChallengeResponse(challenge: DeviceRecoveryChallenge): Response {
+  return jsonResponse({ schema: DEVICE_TRUST_HTTP_RECOVERY_CHALLENGE_SCHEMA, challenge });
+}
+
+function recoveryMutationResponse(result: RecoveryTrustSetMutationResult): Response {
+  return jsonResponse({ schema: DEVICE_TRUST_HTTP_RECOVERY_MUTATION_SCHEMA, result });
+}
+
 async function signedBody(
   request: Request,
   options: {
@@ -263,11 +294,111 @@ function completionInput(body: Readonly<Record<string, unknown>>): {
   };
 }
 
-function mapError(error: unknown, completion: boolean): Response {
+function recoveryProvisioningInput(body: Readonly<Record<string, unknown>>): {
+  readonly eventId: string;
+  readonly publicKeyJwk: JsonWebKey;
+} {
+  exactObjectKeys(body, ["eventId", "publicKeyJwk"], "request body", invalidRequest);
+  return {
+    eventId: nonEmptyString(body.eventId, "eventId", invalidRequest),
+    publicKeyJwk: parsedPublicJwk(body.publicKeyJwk),
+  };
+}
+
+function recoveryCommitInput(body: Readonly<Record<string, unknown>>): {
+  readonly eventId: string;
+  readonly publicKeyJwk: JsonWebKey;
+  readonly signature: Uint8Array;
+} {
+  exactObjectKeys(body, ["eventId", "publicKeyJwk", "signature"], "request body", invalidRequest);
+  return {
+    ...recoveryProvisioningInput({ eventId: body.eventId, publicKeyJwk: body.publicKeyJwk }),
+    signature: base64UrlToSignature(nonEmptyString(body.signature, "signature", invalidRequest)),
+  };
+}
+
+function recoveryStartInput(body: Readonly<Record<string, unknown>>): {
+  readonly recoveryKeyId: string;
+  readonly deviceId: string;
+  readonly displayName: string;
+  readonly publicKeyJwk: JsonWebKey;
+  readonly nextRecoveryPublicKeyJwk: JsonWebKey;
+} {
+  exactObjectKeys(
+    body,
+    ["recoveryKeyId", "deviceId", "displayName", "publicKeyJwk", "nextRecoveryPublicKeyJwk"],
+    "request body",
+    invalidRequest,
+  );
+  return {
+    recoveryKeyId: nonEmptyString(body.recoveryKeyId, "recoveryKeyId", invalidRequest),
+    deviceId: nonEmptyString(body.deviceId, "deviceId", invalidRequest),
+    displayName: nonEmptyString(body.displayName, "displayName", invalidRequest),
+    publicKeyJwk: parsedPublicJwk(body.publicKeyJwk),
+    nextRecoveryPublicKeyJwk: parsedPublicJwk(
+      body.nextRecoveryPublicKeyJwk,
+      "nextRecoveryPublicKeyJwk",
+    ),
+  };
+}
+
+function recoveryCompletionInput(body: Readonly<Record<string, unknown>>): {
+  readonly eventId: string;
+  readonly challengeId: string;
+  readonly recoverySignature: Uint8Array;
+  readonly deviceSignature: Uint8Array;
+  readonly nextRecoverySignature: Uint8Array;
+} {
+  exactObjectKeys(
+    body,
+    ["eventId", "challengeId", "recoverySignature", "deviceSignature", "nextRecoverySignature"],
+    "request body",
+    invalidRequest,
+  );
+  return {
+    eventId: nonEmptyString(body.eventId, "eventId", invalidRequest),
+    challengeId: nonEmptyString(body.challengeId, "challengeId", invalidRequest),
+    recoverySignature: base64UrlToSignature(
+      nonEmptyString(body.recoverySignature, "recoverySignature", invalidRequest),
+    ),
+    deviceSignature: base64UrlToSignature(
+      nonEmptyString(body.deviceSignature, "deviceSignature", invalidRequest),
+    ),
+    nextRecoverySignature: base64UrlToSignature(
+      nonEmptyString(body.nextRecoverySignature, "nextRecoverySignature", invalidRequest),
+    ),
+  };
+}
+
+type DeviceTrustErrorProfile = "management" | "candidate-proof" | "public-recovery";
+
+function recoveryFailure(): Response {
+  return errorResponse(401, "recovery-failed", "Device trust recovery failed");
+}
+
+function mapError(error: unknown, profile: DeviceTrustErrorProfile): Response {
   if (error instanceof DeviceTrustHttpProtocolError) {
     return errorResponse(error.status, error.code, error.message);
   }
-  if (completion && (error instanceof DeviceTrustChallengeError || error instanceof DeviceTrustProofError)) {
+  if (
+    profile === "public-recovery"
+    && (
+      error instanceof DeviceTrustAuthorizationError
+      || error instanceof DeviceTrustConflictError
+      || error instanceof DeviceTrustChallengeError
+      || error instanceof DeviceTrustProofError
+      || error instanceof TypeError
+    )
+  ) {
+    return recoveryFailure();
+  }
+  if (
+    profile === "candidate-proof"
+    && (error instanceof DeviceTrustChallengeError || error instanceof DeviceTrustProofError)
+  ) {
+    return errorResponse(401, "proof-failed", "Device trust proof failed");
+  }
+  if (error instanceof DeviceTrustProofError) {
     return errorResponse(401, "proof-failed", "Device trust proof failed");
   }
   if (error instanceof DeviceTrustAuthorizationError) {
@@ -297,7 +428,7 @@ export function createDeviceTrustHttpHandler(
 
   return {
     async fetch(request: Request): Promise<Response> {
-      let completion = false;
+      let errorProfile: DeviceTrustErrorProfile = "management";
       try {
         validateRequestHost({
           request,
@@ -318,14 +449,31 @@ export function createDeviceTrustHttpHandler(
         }
 
         if (pathname === DEVICE_TRUST_HTTP_ROUTES.completeEnrollment) {
-          completion = true;
+          errorProfile = "candidate-proof";
           const body = jsonBody(await boundedBody(request, maxRequestBytes));
           return mutationResponse(await options.manager.completeEnrollment(completionInput(body)));
         }
         if (pathname === DEVICE_TRUST_HTTP_ROUTES.completeRotation) {
-          completion = true;
+          errorProfile = "candidate-proof";
           const body = jsonBody(await boundedBody(request, maxRequestBytes));
           return mutationResponse(await options.manager.completeRotation(completionInput(body)));
+        }
+
+        if (pathname === DEVICE_TRUST_HTTP_ROUTES.startRecovery) {
+          errorProfile = "public-recovery";
+          const body = jsonBody(await boundedBody(request, maxRequestBytes));
+          const input = recoveryStartInput(body);
+          return recoveryChallengeResponse(await options.manager.startRecovery({
+            ...input,
+            audience,
+          }));
+        }
+        if (pathname === DEVICE_TRUST_HTTP_ROUTES.completeRecovery) {
+          errorProfile = "public-recovery";
+          const body = jsonBody(await boundedBody(request, maxRequestBytes));
+          return recoveryMutationResponse(
+            await options.manager.completeRecovery(recoveryCompletionInput(body)),
+          );
         }
 
         const signed = await signedBody(request, {
@@ -335,6 +483,23 @@ export function createDeviceTrustHttpHandler(
         });
         if (signed instanceof Response) return signed;
         const authorizingKeyId = signed.authentication.device!.keyId;
+
+        if (pathname === DEVICE_TRUST_HTTP_ROUTES.prepareRecoveryCredential) {
+          const input = recoveryProvisioningInput(signed.body);
+          return recoveryProvisioningResponse(await options.manager.prepareRecoveryCredential({
+            ...input,
+            authorizingKeyId,
+            audience,
+          }));
+        }
+        if (pathname === DEVICE_TRUST_HTTP_ROUTES.commitRecoveryCredential) {
+          const input = recoveryCommitInput(signed.body);
+          return recoveryCredentialMutationResponse(await options.manager.setRecoveryCredential({
+            ...input,
+            authorizingKeyId,
+            audience,
+          }));
+        }
 
         if (pathname === DEVICE_TRUST_HTTP_ROUTES.startEnrollment) {
           exactObjectKeys(signed.body, ["offer"], "request body", invalidRequest);
@@ -373,7 +538,7 @@ export function createDeviceTrustHttpHandler(
         }
         return errorResponse(404, "route-not-found", "Device trust route does not exist");
       } catch (error) {
-        return mapError(error, completion);
+        return mapError(error, errorProfile);
       }
     },
   };
