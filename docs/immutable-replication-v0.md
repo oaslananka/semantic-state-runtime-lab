@@ -288,6 +288,8 @@ Willow's writer-owned subspaces / capability model is a useful architectural ref
 
 Opaque IDs and content digests are not authorization.
 
+The first concrete network binding is now documented in `replication-http-transport-v1.md`: authenticated principals are injected into a bounded HTTP transport, while projection/record/blob authorization remains in `ReplicationAccessGateway`. Device-bound authentication and E2E encryption are still intentionally separate follow-up layers.
+
 ## v0 benchmark
 
 Run:

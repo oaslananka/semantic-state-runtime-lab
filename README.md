@@ -39,7 +39,10 @@ Implemented checkpoints include:
 - local stdio MCP composition;
 - authenticated stateless MCP 2026-07-28 HTTP composition;
 - principal-aware, capsule-backed derived context access;
-- MCP `context.compile` projection with authenticated `context:read` preflight.
+- MCP `context.compile` projection with authenticated `context:read` preflight;
+- policy-scoped prefix-Merkle replication with bounded resumable sessions;
+- principal-scoped immutable record + artifact blob transfer;
+- authenticated bounded replication HTTP with real two-node semantic/artifact convergence.
 
 ## Design posture
 
@@ -58,12 +61,14 @@ See `docs/invariants.md` and the versioned design documents under `docs/`.
 
 The lab is not yet a consumer product. Important remaining work includes:
 
-- durable/search-optimized capsule cache backends;
 - more source connectors and semantic mappings;
 - historical context-access semantics;
 - opaque provenance/evidence expansion handles;
-- deployment composition, real IdP verifier integration, operational limits, and observability;
-- product UX, onboarding, sync/encryption strategy, and commercial packaging.
+- device enrollment, sender-constrained authentication and key rotation;
+- end-to-end replication encryption for untrusted relay/cloud deployments;
+- active-active source receipt/witness semantics;
+- deployment composition, real IdP verifier integration and observability;
+- product UX, onboarding, sync operations and commercial packaging.
 
 ## Commands
 

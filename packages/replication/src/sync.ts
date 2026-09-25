@@ -394,12 +394,12 @@ export interface ReconciliationViewReader {
 }
 
 export interface ReconciliationEndpoint {
-  viewInfo(viewId: string): ReconciliationViewInfo;
+  viewInfo(viewId: string): ReconciliationViewInfo | Promise<ReconciliationViewInfo>;
   nodeHashes(
     viewId: string,
     refs: readonly MerkleNodeRef[],
     options?: NodeQueryOptions,
-  ): MerkleNodeHashResponse;
+  ): MerkleNodeHashResponse | Promise<MerkleNodeHashResponse>;
   leafPage(viewId: string, options: LeafPageOptions): Promise<ReconciliationLeafPage>;
 }
 
@@ -793,7 +793,7 @@ export class BoundedReconciliationSession {
     options: ReconciliationSessionOptions = {},
   ): Promise<BoundedReconciliationSession> {
     const localInfo = local.info();
-    const remoteInfo = remote.viewInfo(remoteViewId);
+    const remoteInfo = await remote.viewInfo(remoteViewId);
     return new BoundedReconciliationSession(
       startState(localInfo, remoteInfo, resolveSessionOptions(options)),
     );
@@ -871,7 +871,7 @@ export class BoundedReconciliationSession {
     const localResponse = local.nodeHashes(refs, {
       maxNodeRefs: this.#state.options.maxNodeRefsPerStep,
     });
-    const remoteResponse = remote.nodeHashes(this.#state.remote.viewId, refs, {
+    const remoteResponse = await remote.nodeHashes(this.#state.remote.viewId, refs, {
       maxNodeRefs: this.#state.options.maxNodeRefsPerStep,
     });
     assertNodeResponse(this.#state.local, refs, localResponse);
