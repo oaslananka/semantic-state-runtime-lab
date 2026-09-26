@@ -6,7 +6,8 @@
   "dependencies": {
     "@ssrl/artifact-store": "workspace:*",
     "@ssrl/core": "workspace:*",
-    "@ssrl/state-store": "workspace:*"
+    "@ssrl/state-store": "workspace:*",
+    "@ssrl/e2e": "workspace:*"
   },
   "devDependencies": {
     "@ssrl/connector-markdown-fs": "workspace:*",
@@ -30,6 +31,11 @@
       "types": "./src/sync.ts",
       "import": "./dist/sync.js",
       "default": "./dist/sync.js"
+    },
+    "./encrypted": {
+      "types": "./src/encrypted.ts",
+      "import": "./dist/encrypted.js",
+      "default": "./dist/encrypted.js"
     }
   }
 }
