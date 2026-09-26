@@ -9,6 +9,7 @@ export interface MerkleDescriptorCodec<D, K extends string, C> {
   readonly defaultScope?: string;
   normalize(descriptor: D): Promise<D>;
   key(descriptor: D): K;
+  compareKeys?(left: K, right: K): number;
   scope(descriptor: D): string;
   canonicalValue(descriptor: D): unknown;
   compareSameKey(left: D, right: D): DescriptorComparison<C>;
@@ -77,7 +78,11 @@ export async function genericPrefixMerkleLeafIdForKey(
   return first16 >>> (16 - bits);
 }
 
-async function parentHash(level: number, left: string, right: string): Promise<string> {
+export async function genericPrefixMerkleParentHash(
+  level: number,
+  left: string,
+  right: string,
+): Promise<string> {
   return sha256Digest(canonicalJson([
     "ssrl-prefix-merkle-node-v1",
     level,
@@ -99,7 +104,11 @@ async function mapInBatches<T, U>(
 }
 
 function descriptorOrder<D, K extends string, C>(codec: MerkleDescriptorCodec<D, K, C>) {
-  return (left: D, right: D): number => codec.key(left).localeCompare(codec.key(right));
+  return (left: D, right: D): number => {
+    const leftKey = codec.key(left);
+    const rightKey = codec.key(right);
+    return codec.compareKeys?.(leftKey, rightKey) ?? leftKey.localeCompare(rightKey);
+  };
 }
 
 function descriptorJsonBytes<D, K extends string, C>(
@@ -110,14 +119,27 @@ function descriptorJsonBytes<D, K extends string, C>(
     .byteLength;
 }
 
-async function leafHash<D, K extends string, C>(
+export async function genericPrefixMerkleLeafHash<D, K extends string, C>(
   codec: MerkleDescriptorCodec<D, K, C>,
   descriptors: readonly D[],
 ): Promise<string> {
+  const ordered = [...descriptors].toSorted(descriptorOrder(codec));
   return sha256Digest(canonicalJson([
     "ssrl-prefix-merkle-leaf-v1",
-    descriptors.map((descriptor) => codec.canonicalValue(descriptor)),
+    ordered.map((descriptor) => codec.canonicalValue(descriptor)),
   ]));
+}
+
+export async function genericPrefixMerkleEmptyHashes<D, K extends string, C>(
+  codec: MerkleDescriptorCodec<D, K, C>,
+  prefixBits: PrefixMerkleBits,
+): Promise<readonly string[]> {
+  const hashes: string[] = [await genericPrefixMerkleLeafHash(codec, [])];
+  for (let level = 1; level <= prefixBits; level += 1) {
+    const child = hashes[level - 1]!;
+    hashes.push(await genericPrefixMerkleParentHash(level, child, child));
+  }
+  return hashes;
 }
 
 async function buildLevels(
@@ -129,7 +151,7 @@ async function buildLevels(
     const previous = levels[level - 1]!;
     const parents = await Promise.all(Array.from(
       { length: previous.length / 2 },
-      (_, index) => parentHash(level, previous[index * 2]!, previous[index * 2 + 1]!),
+      (_, index) => genericPrefixMerkleParentHash(level, previous[index * 2]!, previous[index * 2 + 1]!),
     ));
     levels.push(parents);
   }
@@ -210,10 +232,10 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
       leaves.set(leafId, records);
     });
 
-    const emptyHash = await leafHash(codec, []);
+    const emptyHash = await genericPrefixMerkleLeafHash(codec, []);
     const hashes = new Array<string>(2 ** options.prefixBits).fill(emptyHash);
     await Promise.all([...leaves.entries()].map(async ([leafId, records]) => {
-      hashes[leafId] = await leafHash(codec, [...records.values()].toSorted(descriptorOrder(codec)));
+      hashes[leafId] = await genericPrefixMerkleLeafHash(codec, [...records.values()].toSorted(descriptorOrder(codec)));
     }));
     return new GenericPrefixMerkleIndex({
       codec,
@@ -292,7 +314,7 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
     nextRecords.set(key, normalized);
     const updates = new Map<number, { readonly index: number; readonly hash: string }>();
     let childIndex = leafId;
-    let childHash = await leafHash(
+    let childHash = await genericPrefixMerkleLeafHash(
       this.#codec,
       [...nextRecords.values()].toSorted(descriptorOrder(this.#codec)),
     );
@@ -304,7 +326,7 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
       const rightIndex = leftIndex + 1;
       const leftHash = childIndex === leftIndex ? childHash : children[leftIndex]!;
       const rightHash = childIndex === rightIndex ? childHash : children[rightIndex]!;
-      childHash = await parentHash(level, leftHash, rightHash);
+      childHash = await genericPrefixMerkleParentHash(level, leftHash, rightHash);
       updates.set(level, { index: parentIndex, hash: childHash });
       childIndex = parentIndex;
     }

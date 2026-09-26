@@ -8,14 +8,22 @@ import {
 import {
   OpaqueReplicationCollisionError,
   encryptReplicationRecord,
+  normalizeOpaqueReplicationTag,
   opaqueReplicationRecordDescriptor,
   type OpaqueReplicationDescriptor,
+  type OpaqueReplicationTag,
 } from "../src/encrypted.js";
 import {
   OpaqueReplicationEpochMismatchError,
   buildOpaquePrefixMerkleIndex,
   compareOpaquePrefixMerkleIndexes,
+  compareOpaqueReplicationTags,
+  opaquePrefixMerkleEmptyHashes,
+  opaquePrefixMerkleLeafHash,
+  opaquePrefixMerkleLeafId,
+  opaquePrefixMerkleParentHash,
   opaquePrefixMerkleSnapshotJson,
+  opaqueReplicationTagOrderKey,
   restoreOpaquePrefixMerkleIndex,
 } from "../src/opaque-merkle.js";
 
@@ -61,7 +69,31 @@ async function descriptors(
   return result;
 }
 
+function exhaustiveOpaqueOrderTags(): OpaqueReplicationTag[] {
+  return Array.from({ length: 4096 }, (_, value) => {
+    const bytes = Buffer.alloc(32);
+    bytes[0] = value >> 4;
+    bytes[1] = (value & 0x0f) << 4;
+    return normalizeOpaqueReplicationTag(`hmac-sha256:${bytes.toString("base64url")}`);
+  });
+}
+
 describe("opaque prefix Merkle reconciliation", () => {
+  it("preserves the established v1 opaque-tag order with an explicit deterministic SQL-sortable key", () => {
+    const tags = exhaustiveOpaqueOrderTags();
+    const legacy = [...tags].sort((left, right) => left.localeCompare(right));
+    const explicit = [...tags].sort(compareOpaqueReplicationTags);
+    const byPersistedKey = [...tags].sort((left, right) => {
+      const leftKey = opaqueReplicationTagOrderKey(left);
+      const rightKey = opaqueReplicationTagOrderKey(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+
+    expect(explicit).toEqual(legacy);
+    expect(byPersistedKey).toEqual(explicit);
+    expect(new Set(tags.map(opaqueReplicationTagOrderKey)).size).toBe(tags.length);
+  });
+
   it("builds deterministic relay-safe roots and snapshots independent of input order", async () => {
     const epoch = generateVaultEpoch();
     const source = await descriptors(epoch, 128);
@@ -119,6 +151,29 @@ describe("opaque prefix Merkle reconciliation", () => {
       leafDescriptorsExamined: 0,
       estimatedLeafDescriptorBytesExchanged: 0,
     });
+  });
+
+  it("exposes hash primitives that reproduce index leaves, parents, and empty roots exactly", async () => {
+    const epoch = generateVaultEpoch();
+    const source = await descriptors(epoch, 32);
+    const index = await buildOpaquePrefixMerkleIndex(source, { prefixBits: 8 });
+    const snapshot = index.snapshot();
+    const leaf = snapshot.nonEmptyLeaves[0];
+    if (leaf === undefined) throw new Error("expected non-empty leaf");
+
+    expect(await opaquePrefixMerkleLeafId(leaf.descriptors[0]!.opaqueKey, 8)).toBe(leaf.leafId);
+    expect(await opaquePrefixMerkleLeafHash(leaf.descriptors)).toBe(index.nodeHash(0, leaf.leafId));
+
+    const parentIndex = Math.floor(leaf.leafId / 2);
+    const left = index.nodeHash(0, parentIndex * 2);
+    const right = index.nodeHash(0, parentIndex * 2 + 1);
+    expect(await opaquePrefixMerkleParentHash(1, left, right)).toBe(index.nodeHash(1, parentIndex));
+
+    const empty = await opaquePrefixMerkleEmptyHashes(8);
+    const emptyIndex = await buildOpaquePrefixMerkleIndex([], { prefixBits: 8, epochId: epoch.epochId });
+    expect(empty).toHaveLength(9);
+    expect(empty[8]).toBe(emptyIndex.rootDigest);
+    expect(empty[0]).toBe(emptyIndex.nodeHash(0, 0));
   });
 
   it("treats exact incremental replay as unchanged", async () => {

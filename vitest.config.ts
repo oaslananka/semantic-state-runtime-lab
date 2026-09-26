@@ -27,6 +27,8 @@ export default defineConfig({
       "@ssrl/replication/sync": source("./packages/replication/src/sync.ts"),
       "@ssrl/replication": source("./packages/replication/src/index.ts"),
       "@ssrl/opaque-replication-store": source("./packages/opaque-replication-store/src/index.ts"),
+      "@ssrl/opaque-merkle-view-store": source("./packages/opaque-merkle-view-store/src/index.ts"),
+      "@ssrl/storage-sqlite-opaque-merkle": source("./packages/storage-sqlite-opaque-merkle/src/index.ts"),
       "@ssrl/storage-local-opaque-replication": source("./packages/storage-local-opaque-replication/src/index.ts"),
       "@ssrl/replication-access": source("./packages/replication-access/src/index.ts"),
       "@ssrl/http-wire/node": source("./packages/http-wire/src/node.ts"),

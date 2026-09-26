@@ -89,3 +89,6 @@ jobs:
 
       - name: Durable opaque replication store catalog benchmark smoke test
         run: pnpm benchmark:replication:opaque-store:v1
+
+      - name: Incremental opaque Merkle materialization benchmark smoke test
+        run: pnpm benchmark:replication:opaque-incremental-merkle:v1

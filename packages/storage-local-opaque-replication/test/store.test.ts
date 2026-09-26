@@ -9,11 +9,14 @@ import { generateVaultEpoch, type VaultEpoch } from "@ssrl/e2e";
 import { canonicalJson } from "@ssrl/core";
 import {
   InvalidOpaqueDescriptorCatalogCursorError,
+  InvalidOpaqueDescriptorChangeCursorError,
   OpaqueDescriptorCatalogEntryTooLargeError,
+  OpaqueDescriptorChangeEntryTooLargeError,
   OpaqueReplicationObjectNotFoundError,
   OpaqueReplicationObjectReadLimitError,
   OpaqueReplicationStoreCorruptionError,
   type OpaqueDescriptorCatalogCursor,
+  type OpaqueDescriptorChangeCursor,
 } from "@ssrl/opaque-replication-store";
 import {
   createReplicationRecord,
@@ -158,6 +161,12 @@ function objectBodyPath(root: string, storage: string): string {
   return join(root, "objects", "sha256", storage.slice(0, 2), `${storage.slice(2)}.json`);
 }
 
+function binaryStringCompare(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
 function requireValue<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`missing ${label}`);
   return value;
@@ -166,10 +175,33 @@ function requireValue<T>(value: T | undefined, label: string): T {
 function deleteObjectMetadata(root: string, object: EncryptedReplicationObject): void {
   const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
   try {
+    db.exec("BEGIN IMMEDIATE");
+    db.prepare(`
+      DELETE FROM opaque_replication_changes
+      WHERE epoch_id = ? AND opaque_key = ?
+    `).run(object.descriptor.epochId, object.descriptor.opaqueKey);
     db.prepare(`
       DELETE FROM opaque_replication_objects
       WHERE epoch_id = ? AND opaque_key = ?
     `).run(object.descriptor.epochId, object.descriptor.opaqueKey);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+function downgradeStoreToV1(root: string): void {
+  const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
+  try {
+    db.exec(`
+      DROP TABLE opaque_replication_changes;
+      UPDATE opaque_replication_store_meta
+      SET schema_version = 1
+      WHERE component = 'local-opaque-replication-store';
+    `);
   } finally {
     db.close();
   }
@@ -392,6 +424,191 @@ describe("LocalOpaqueReplicationStore", () => {
     })).rejects.toBeInstanceOf(InvalidOpaqueDescriptorCatalogCursorError);
     store.close();
     other.close();
+  });
+
+  it("returns a store-bound head cursor even when the descriptor change feed is empty", async () => {
+    const root = await storeRoot();
+    const otherRoot = await storeRoot();
+    const first = new LocalOpaqueReplicationStore({ root });
+    const empty = await first.descriptorChangesAfter();
+    expect(empty.descriptors).toEqual([]);
+    expect(empty.hasMore).toBe(false);
+    expect(empty.nextCursor).toBeDefined();
+    const cursor = requireValue(empty.nextCursor, "empty change-feed cursor");
+    first.close();
+
+    const reopened = new LocalOpaqueReplicationStore({ root });
+    expect(await reopened.descriptorChangesAfter({ cursor })).toEqual({
+      descriptors: [],
+      descriptorBytes: 0,
+      hasMore: false,
+      nextCursor: cursor,
+    });
+
+    const other = new LocalOpaqueReplicationStore({ root: otherRoot });
+    await expect(other.descriptorChangesAfter({ cursor }))
+      .rejects.toBeInstanceOf(InvalidOpaqueDescriptorChangeCursorError);
+    reopened.close();
+    other.close();
+  });
+
+  it("emits one durable descriptor change only for an actual object insert", async () => {
+    const root = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const firstObject = await encryptedRecord(epoch, "change-one", "private-one");
+    const secondObject = await encryptedRecord(epoch, "change-two", "private-two");
+    const store = new LocalOpaqueReplicationStore({ root });
+
+    await store.install(firstObject);
+    expect((await store.descriptorChangesAfter()).descriptors).toEqual([firstObject.descriptor]);
+    const firstPage = await store.descriptorChangesAfter();
+    const cursor = requireValue(firstPage.nextCursor, "descriptor change cursor");
+
+    expect((await store.install(firstObject)).inserted).toBe(false);
+    expect(await store.descriptorChangesAfter({ cursor })).toEqual({
+      descriptors: [],
+      descriptorBytes: 0,
+      hasMore: false,
+      nextCursor: cursor,
+    });
+
+    await store.install(secondObject);
+    const secondPage = await store.descriptorChangesAfter({ cursor });
+    expect(secondPage.descriptors).toEqual([secondObject.descriptor]);
+    expect(secondPage.hasMore).toBe(false);
+    store.close();
+  });
+
+  it("does not append a descriptor change when a colliding object install fails", async () => {
+    const root = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const first = await encryptedRecord(epoch, "change-collision", "first");
+    const collision = await encryptedRecord(epoch, "change-collision", "second");
+    const store = new LocalOpaqueReplicationStore({ root });
+    await store.install(first);
+    const cursor = requireValue((await store.descriptorChangesAfter()).nextCursor, "change cursor");
+
+    await expect(store.install(collision)).rejects.toBeInstanceOf(OpaqueReplicationCollisionError);
+    expect(await store.descriptorChangesAfter({ cursor })).toEqual({
+      descriptors: [],
+      descriptorBytes: 0,
+      hasMore: false,
+      nextCursor: cursor,
+    });
+    store.close();
+  });
+
+  it("paginates durable descriptor changes with store-bound cursors across reopen", async () => {
+    const root = await storeRoot();
+    const otherRoot = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const store = new LocalOpaqueReplicationStore({ root });
+    const other = new LocalOpaqueReplicationStore({ root: otherRoot });
+    await installRecords(store, epoch, ["change-a", "change-b", "change-c", "change-d", "change-e"]);
+    await installRecords(other, epoch, ["other-change"]);
+
+    const first = await store.descriptorChangesAfter({ maxDescriptors: 2 });
+    expect(first.descriptors).toHaveLength(2);
+    expect(first.hasMore).toBe(true);
+    const cursor = requireValue(first.nextCursor, "first change page cursor");
+    store.close();
+
+    const reopened = new LocalOpaqueReplicationStore({ root });
+    const second = await reopened.descriptorChangesAfter({ cursor, maxDescriptors: 10 });
+    expect(second.descriptors).toHaveLength(3);
+    expect(second.hasMore).toBe(false);
+    await expect(other.descriptorChangesAfter({ cursor }))
+      .rejects.toBeInstanceOf(InvalidOpaqueDescriptorChangeCursorError);
+    const last = requireValue(cursor.at(-1), "change cursor signature character");
+    const forged = `${cursor.slice(0, -1)}${last === "A" ? "B" : "A"}` as OpaqueDescriptorChangeCursor;
+    await expect(reopened.descriptorChangesAfter({ cursor: forged }))
+      .rejects.toBeInstanceOf(InvalidOpaqueDescriptorChangeCursorError);
+    reopened.close();
+    other.close();
+  });
+
+  it("rejects syntactically valid change cursors whose sequence was never emitted", async () => {
+    const root = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const store = new LocalOpaqueReplicationStore({ root });
+    await installRecords(store, epoch, ["known-change"]);
+    const cursor = requireValue((await store.descriptorChangesAfter()).nextCursor, "known cursor");
+    const encoded = cursor.slice("ssrl-opaque-change-v1:".length);
+    const [payload] = encoded.split(".");
+    if (payload === undefined) throw new Error("missing cursor payload");
+    // A valid HMAC cannot be forged from the public API, so verify malformed/foreign paths above
+    // and verify a cursor becomes unknown if its referenced metadata is removed.
+    const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
+    db.prepare("DELETE FROM opaque_replication_changes").run();
+    db.close();
+    await expect(store.descriptorChangesAfter({ cursor }))
+      .rejects.toBeInstanceOf(InvalidOpaqueDescriptorChangeCursorError);
+    store.close();
+  });
+
+  it("fails closed with a typed corruption error when stored descriptor-change JSON is invalid", async () => {
+    const root = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const store = new LocalOpaqueReplicationStore({ root });
+    await installRecords(store, epoch, ["corrupt-change"]);
+    store.close();
+
+    const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
+    db.prepare(`
+      UPDATE opaque_replication_changes
+      SET descriptor_json = ?
+    `).run(JSON.stringify({ schema: "not-an-opaque-descriptor" }));
+    db.close();
+
+    const reopened = new LocalOpaqueReplicationStore({ root });
+    await expect(reopened.descriptorChangesAfter())
+      .rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
+    reopened.close();
+  });
+
+  it("enforces descriptor-change byte bounds without returning a non-advancing empty page", async () => {
+    const root = await storeRoot();
+    const epoch = generateVaultEpoch();
+    const store = new LocalOpaqueReplicationStore({ root });
+    await installRecords(store, epoch, ["change-bytes-1", "change-bytes-2"]);
+    const page = await store.descriptorChangesAfter({ maxDescriptors: 10 });
+    expect(page.descriptorBytes).toBeGreaterThan(1);
+
+    await expect(store.descriptorChangesAfter({ maxDescriptors: 10, maxBytes: 1 }))
+      .rejects.toBeInstanceOf(OpaqueDescriptorChangeEntryTooLargeError);
+    store.close();
+  });
+
+  it("migrates v1 metadata by bootstrapping deterministic descriptor changes", async () => {
+    const root = await storeRoot();
+    const epochA = generateVaultEpoch();
+    const epochB = generateVaultEpoch();
+    const store = new LocalOpaqueReplicationStore({ root });
+    await installRecords(store, epochB, ["migration-b2", "migration-b1"]);
+    await installRecords(store, epochA, ["migration-a2", "migration-a1"]);
+    const expected = [
+      ...(await store.descriptorPage({ epochId: epochA.epochId, maxDescriptors: 100 })).descriptors,
+      ...(await store.descriptorPage({ epochId: epochB.epochId, maxDescriptors: 100 })).descriptors,
+    ].toSorted((left, right) => (
+      binaryStringCompare(left.epochId, right.epochId)
+      || binaryStringCompare(left.opaqueKey, right.opaqueKey)
+    ));
+    store.close();
+    downgradeStoreToV1(root);
+
+    const migrated = new LocalOpaqueReplicationStore({ root });
+    const page = await migrated.descriptorChangesAfter({ maxDescriptors: 100 });
+    expect(page.descriptors).toEqual(expected);
+    expect(page.hasMore).toBe(false);
+    migrated.close();
+
+    const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
+    expect(db.prepare(`
+      SELECT schema_version
+      FROM opaque_replication_store_meta
+      WHERE component = 'local-opaque-replication-store'
+    `).get()).toEqual(expect.objectContaining({ schema_version: 2 }));
+    db.close();
   });
 
   it("enforces catalog byte bounds without returning a non-advancing empty page", async () => {
