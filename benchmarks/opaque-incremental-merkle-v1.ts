@@ -8,8 +8,6 @@ import { normalizeVaultEpochId } from "../packages/e2e/dist/index.js";
 import type {
   OpaqueDescriptorCatalogRequest,
   OpaqueDescriptorChangeRequest,
-  OpaqueObjectLocator,
-  OpaqueObjectReadOptions,
   OpaqueReplicationObjectStore,
 } from "../packages/opaque-replication-store/dist/index.js";
 import {
