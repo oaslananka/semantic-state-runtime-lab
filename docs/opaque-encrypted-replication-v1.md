@@ -58,10 +58,10 @@ v1 derives a 256-bit HMAC-SHA256 key using HKDF-SHA256:
 ```text
 IKM  = VaultEpochSecret
 salt = "ssrl-opaque-replication-index-salt-v1"
-info = "ssrl-opaque-replication-index-key-v1"
+info = canonical(["ssrl-opaque-replication-index-key-v1", epochId])
 ```
 
-The derived key is used only for opaque reconciliation tags.
+The derived key is used only for opaque reconciliation tags. The epoch ID is included in HKDF info so tags remain epoch-scoped even if an operational bug were to reuse the same raw epoch secret under two epoch identifiers.
 
 Payload encryption remains in `@ssrl/e2e` and derives its own AES key with a separate salt/info domain.
 
