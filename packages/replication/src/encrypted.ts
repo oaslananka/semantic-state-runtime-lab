@@ -1,6 +1,5 @@
 import { canonicalJson } from "@ssrl/core";
 import {
-  E2EValidationError,
   MAX_E2E_PAYLOAD_BYTES,
   base64UrlDecode,
   base64UrlEncode,
@@ -606,4 +605,4 @@ export async function decryptArtifactBlob(
 
 // Preserve the underlying E2E parser error class in the public dependency graph so
 // callers may distinguish malformed E2E envelopes from SSRL descriptor mismatches.
-export { E2EValidationError };
+export { E2EValidationError } from "@ssrl/e2e";

@@ -178,6 +178,31 @@ describe("opaque encrypted replication objects", () => {
       .toThrow(OpaqueReplicationCollisionError);
   });
 
+  it("rejects a valid alternate content tag for the same opaque key after authorized decrypt", async () => {
+    const epoch = generateVaultEpoch();
+    const firstRecord = await observationRecord("same-key-tamper", "active1");
+    const secondRecord = await observationRecord("same-key-tamper", "paused1");
+    const encrypted = await encryptReplicationRecord({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record: firstRecord,
+    });
+    const alternate = await opaqueReplicationRecordDescriptor({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record: secondRecord,
+    });
+
+    expect(alternate.opaqueKey).toBe(encrypted.descriptor.opaqueKey);
+    expect(alternate.opaqueContentTag).not.toBe(encrypted.descriptor.opaqueContentTag);
+    expect(alternate.ciphertextBytes).toBe(encrypted.descriptor.ciphertextBytes);
+
+    await expect(decryptReplicationRecord({
+      ...encrypted,
+      descriptor: alternate,
+    }, epoch.secret)).rejects.toThrow(/does not match opaque descriptor/);
+  });
+
   it("binds the content tag to logical identity instead of exposing a digest-only equality tag", async () => {
     const epoch = generateVaultEpoch();
     const record = await observationRecord("content-scope", "same-plaintext");
