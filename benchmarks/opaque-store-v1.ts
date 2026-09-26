@@ -9,7 +9,6 @@ import {
   OPAQUE_REPLICATION_DESCRIPTOR_SCHEMA,
   normalizeOpaqueReplicationDescriptor,
   opaqueReplicationDescriptorJson,
-  type OpaqueReplicationDescriptor,
 } from "../packages/replication/dist/encrypted.js";
 import { LocalOpaqueReplicationStore } from "../packages/storage-local-opaque-replication/dist/index.js";
 
@@ -26,7 +25,8 @@ function sha256Hex(value: string): string {
 }
 
 function syntheticTag(domain: string, index: number): string {
-  return `hmac-sha256:${sha256Base64Url(`${domain}:${index}`)}`;
+  const material = `${domain}:${index}`;
+  return `hmac-sha256:${sha256Base64Url(material)}`;
 }
 
 async function descriptor(epochId: ReturnType<typeof normalizeVaultEpochId>, index: number) {
@@ -89,7 +89,8 @@ try {
   let pages = 0;
   let maxDescriptorsSeen = 0;
   let maxBytesSeen = 0;
-  do {
+  let hasMore = true;
+  while (hasMore) {
     const page = await store.descriptorPage({
       epochId,
       ...(cursor === undefined ? {} : { cursor }),
@@ -101,8 +102,8 @@ try {
     maxDescriptorsSeen = Math.max(maxDescriptorsSeen, page.descriptors.length);
     maxBytesSeen = Math.max(maxBytesSeen, page.descriptorBytes);
     cursor = page.nextCursor;
-    if (!page.hasMore) break;
-  } while (true);
+    hasMore = page.hasMore;
+  }
   const elapsedMs = performance.now() - started;
   store.close();
 

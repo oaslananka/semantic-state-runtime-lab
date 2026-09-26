@@ -8,10 +8,10 @@ import {
   stat,
   unlink,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { canonicalJson } from "@ssrl/core";
-import { normalizeVaultEpochId, type VaultEpochId } from "@ssrl/e2e";
+import { type VaultEpochId } from "@ssrl/e2e";
 import {
   HARD_OPAQUE_OBJECT_READ_MAX_BYTES,
   InvalidOpaqueDescriptorCatalogCursorError,
@@ -47,6 +47,70 @@ import {
 const STORE_COMPONENT = "local-opaque-replication-store";
 const STORE_SCHEMA_VERSION = 1;
 const CATALOG_CURSOR_PREFIX = "ssrl-opaque-catalog-v1:";
+
+declare const opaqueStorePathBrand: unique symbol;
+type OpaqueStorePath = string & { readonly [opaqueStorePathBrand]: true };
+
+declare const opaqueStorageKeyBrand: unique symbol;
+type OpaqueStorageKey = string & { readonly [opaqueStorageKeyBrand]: true };
+
+function configuredStorePath(value: string): OpaqueStorePath {
+  return resolve(value) as OpaqueStorePath;
+}
+
+function childStorePath(root: OpaqueStorePath, ...segments: readonly string[]): OpaqueStorePath {
+  const candidate = resolve(root, ...segments);
+  if (candidate !== root && !candidate.startsWith(`${root}${sep}`)) {
+    throw new OpaqueReplicationStoreCorruptionError("Opaque store path escaped configured root");
+  }
+  return candidate as OpaqueStorePath;
+}
+
+function checkedStorageKey(value: string): OpaqueStorageKey {
+  if (!/^[0-9a-f]{64}$/.test(value)) {
+    throw new OpaqueReplicationStoreCorruptionError("Opaque storage key is invalid");
+  }
+  return value as OpaqueStorageKey;
+}
+
+function ensureDirectorySync(path: OpaqueStorePath): void {
+  // nosemgrep -- path is branded and created only by configuredStorePath/childStorePath.
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+}
+
+async function ensureDirectory(path: OpaqueStorePath): Promise<void> {
+  // nosemgrep -- path is branded and confined to the configured store root.
+  await mkdir(path, { recursive: true, mode: 0o700 });
+}
+
+async function openStorePath(
+  path: OpaqueStorePath,
+  flags: "r" | "wx",
+  mode?: number,
+) {
+  // nosemgrep -- path is branded and confined to the configured store root.
+  return mode === undefined ? open(path, flags) : open(path, flags, mode);
+}
+
+async function statStorePath(path: OpaqueStorePath) {
+  // nosemgrep -- path is branded and confined to the configured store root.
+  return stat(path);
+}
+
+async function readStorePath(path: OpaqueStorePath): Promise<Buffer> {
+  // nosemgrep -- path is branded and confined to the configured store root.
+  return readFile(path);
+}
+
+async function linkStorePath(source: OpaqueStorePath, target: OpaqueStorePath): Promise<void> {
+  // nosemgrep -- both paths are branded and confined to the configured store root.
+  await link(source, target);
+}
+
+async function unlinkStorePath(path: OpaqueStorePath): Promise<void> {
+  // nosemgrep -- path is branded and confined to the configured store root.
+  await unlink(path);
+}
 
 export interface LocalOpaqueReplicationStoreOptions {
   readonly root: string;
@@ -131,8 +195,8 @@ function bodyBytes(value: string): Uint8Array {
   return new TextEncoder().encode(value);
 }
 
-function storageKey(locator: OpaqueObjectLocator): string {
-  return sha256Hex(canonicalJson([locator.epochId, locator.opaqueKey]));
+function storageKey(locator: OpaqueObjectLocator): OpaqueStorageKey {
+  return checkedStorageKey(sha256Hex(canonicalJson([locator.epochId, locator.opaqueKey])));
 }
 
 function cursorSignature(secret: string, payload: string): string {
@@ -219,8 +283,8 @@ async function canonicalDescriptor(value: unknown): Promise<{
 }
 
 export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore {
-  readonly #objectRoot: string;
-  readonly #tempRoot: string;
+  readonly #objectRoot: OpaqueStorePath;
+  readonly #tempRoot: OpaqueStorePath;
   readonly #db: DatabaseSync;
   readonly #catalogId: string;
   readonly #cursorSecret: string;
@@ -241,11 +305,12 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
       8 * 1024 * 1024,
       "maxReadBytes",
     );
-    this.#objectRoot = join(options.root, "objects", "sha256");
-    this.#tempRoot = join(options.root, "tmp");
-    mkdirSync(this.#objectRoot, { recursive: true, mode: 0o700 });
-    mkdirSync(this.#tempRoot, { recursive: true, mode: 0o700 });
-    this.#db = new DatabaseSync(join(options.root, "opaque-replication.sqlite"), {
+    const root = configuredStorePath(options.root);
+    this.#objectRoot = childStorePath(root, "objects", "sha256");
+    this.#tempRoot = childStorePath(root, "tmp");
+    ensureDirectorySync(this.#objectRoot);
+    ensureDirectorySync(this.#tempRoot);
+    this.#db = new DatabaseSync(join(root, "opaque-replication.sqlite"), {
       timeout: options.timeoutMs ?? 5_000,
       defensive: true,
     });
@@ -417,14 +482,19 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
     return descriptor;
   }
 
-  #objectPath(storage: string): string {
-    return join(this.#objectRoot, storage.slice(0, 2), `${storage.slice(2)}.json`);
+  #objectPath(storageValue: string): OpaqueStorePath {
+    const storage = checkedStorageKey(storageValue);
+    return childStorePath(
+      this.#objectRoot,
+      storage.slice(0, 2),
+      `${storage.slice(2)}.json`,
+    );
   }
 
-  async #syncDirectory(path: string): Promise<void> {
+  async #syncDirectory(path: OpaqueStorePath): Promise<void> {
     let handle;
     try {
-      handle = await open(path, "r");
+      handle = await openStorePath(path, "r");
       await handle.sync();
     } catch (cause) {
       if (
@@ -447,7 +517,7 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
     const path = this.#objectPath(row.storage_key);
     let info;
     try {
-      info = await stat(path);
+      info = await statStorePath(path);
     } catch (cause) {
       if (isFsCode(cause, "ENOENT")) {
         throw new OpaqueReplicationStoreCorruptionError(
@@ -461,7 +531,7 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
         `Opaque object body shape disagrees with metadata for ${descriptor.epochId}/${descriptor.opaqueKey}`,
       );
     }
-    const bytes = await readFile(path);
+    const bytes = await readStorePath(path);
     if (bytes.byteLength !== required || sha256Digest(bytes) !== row.body_digest) {
       throw new OpaqueReplicationStoreCorruptionError(
         `Opaque object body integrity check failed for ${descriptor.epochId}/${descriptor.opaqueKey}`,
@@ -514,11 +584,12 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
   async #installBody(
     prepared: PreparedOpaqueBody,
   ): Promise<InstalledBodyFacts> {
-    const directory = join(this.#objectRoot, prepared.storage.slice(0, 2));
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    const target = this.#objectPath(prepared.storage);
-    const temporary = join(this.#tempRoot, `${randomUUID()}.json`);
-    const handle = await open(temporary, "wx", 0o600);
+    const storage = checkedStorageKey(prepared.storage);
+    const directory = childStorePath(this.#objectRoot, storage.slice(0, 2));
+    await ensureDirectory(directory);
+    const target = this.#objectPath(storage);
+    const temporary = childStorePath(this.#tempRoot, `${randomUUID()}.json`);
+    const handle = await openStorePath(temporary, "wx", 0o600);
     try {
       await handle.writeFile(prepared.bytes);
       await handle.sync();
@@ -527,19 +598,19 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
     }
     let installed = false;
     try {
-      await link(temporary, target);
+      await linkStorePath(temporary, target);
       installed = true;
     } catch (cause) {
       if (!isFsCode(cause, "EEXIST")) throw cause;
     } finally {
-      await unlink(temporary).catch((cause: unknown) => {
+      await unlinkStorePath(temporary).catch((cause: unknown) => {
         if (!isFsCode(cause, "ENOENT")) throw cause;
       });
     }
     if (installed) await this.#syncDirectory(directory);
 
     try {
-      const bytes = await readFile(target);
+      const bytes = await readStorePath(target);
       const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       const body = await parseEncryptedReplicationObjectJson(text);
       if (await encryptedReplicationObjectJson(body) !== text) throw new Error("non-canonical body");
@@ -640,16 +711,17 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
 
   async descriptorPage(request: OpaqueDescriptorCatalogRequest): Promise<OpaqueDescriptorCatalogPage> {
     const limits = opaqueCatalogLimits(request);
-    const after = request.cursor === undefined
+    const cursor = request.cursor;
+    const after = cursor === undefined
       ? undefined
-      : decodeCatalogCursor(request.cursor, this.#catalogId, this.#cursorSecret, limits.epochId);
-    if (after !== undefined) {
+      : decodeCatalogCursor(cursor, this.#catalogId, this.#cursorSecret, limits.epochId);
+    if (after !== undefined && cursor !== undefined) {
       const known = this.#db.prepare(`
         SELECT 1 AS present
         FROM opaque_replication_objects
         WHERE epoch_id = ? AND opaque_key = ?
       `).get(limits.epochId, after) as { readonly present: number } | undefined;
-      if (known === undefined) throw new InvalidOpaqueDescriptorCatalogCursorError(request.cursor!);
+      if (known === undefined) throw new InvalidOpaqueDescriptorCatalogCursorError(cursor);
     }
     const rows = this.#db.prepare(`
       SELECT epoch_id, opaque_key, opaque_content_tag, object_kind,

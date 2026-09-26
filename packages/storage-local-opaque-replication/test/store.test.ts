@@ -138,6 +138,43 @@ async function installRecords(
   return objects;
 }
 
+
+function locator(object: EncryptedReplicationObject) {
+  return {
+    epochId: object.descriptor.epochId,
+    opaqueKey: object.descriptor.opaqueKey,
+  };
+}
+
+async function readStoredObject(
+  store: LocalOpaqueReplicationStore,
+  object: EncryptedReplicationObject,
+  maxBytes = 1024 * 1024,
+) {
+  return store.readObject(locator(object), { maxBytes });
+}
+
+function objectBodyPath(root: string, storage: string): string {
+  return join(root, "objects", "sha256", storage.slice(0, 2), `${storage.slice(2)}.json`);
+}
+
+function requireValue<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error(`missing ${label}`);
+  return value;
+}
+
+function deleteObjectMetadata(root: string, object: EncryptedReplicationObject): void {
+  const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
+  try {
+    db.prepare(`
+      DELETE FROM opaque_replication_objects
+      WHERE epoch_id = ? AND opaque_key = ?
+    `).run(object.descriptor.epochId, object.descriptor.opaqueKey);
+  } finally {
+    db.close();
+  }
+}
+
 describe("LocalOpaqueReplicationStore", () => {
   it("persists an encrypted replication-record object exactly across reopen", async () => {
     const root = await storeRoot();
@@ -158,10 +195,7 @@ describe("LocalOpaqueReplicationStore", () => {
       epochId: object.descriptor.epochId,
       opaqueKey: object.descriptor.opaqueKey,
     })).toEqual(object.descriptor);
-    expect(await reopened.readObject({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    }, { maxBytes: installed.storedBytes })).toEqual(object);
+    expect(await readStoredObject(reopened, object, installed.storedBytes)).toEqual(object);
     reopened.close();
   });
 
@@ -179,10 +213,7 @@ describe("LocalOpaqueReplicationStore", () => {
     const store = new LocalOpaqueReplicationStore({ root });
 
     expect((await store.install(object)).inserted).toBe(true);
-    const read = await store.readObject({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 });
+    const read = await readStoredObject(store, object);
     expect(read).toEqual(object);
     store.close();
 
@@ -215,10 +246,7 @@ describe("LocalOpaqueReplicationStore", () => {
     expect((await store.install(firstObject)).inserted).toBe(false);
     expect((await store.install(secondObject)).inserted).toBe(false);
 
-    const retained = await store.readObject({
-      epochId: firstObject.descriptor.epochId,
-      opaqueKey: firstObject.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 });
+    const retained = await readStoredObject(store, firstObject);
     expect(retained).toEqual(firstObject);
     store.close();
   });
@@ -234,10 +262,7 @@ describe("LocalOpaqueReplicationStore", () => {
     const store = new LocalOpaqueReplicationStore({ root });
     await store.install(first);
     await expect(store.install(second)).rejects.toBeInstanceOf(OpaqueReplicationCollisionError);
-    expect(await store.readObject({
-      epochId: first.descriptor.epochId,
-      opaqueKey: first.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 })).toEqual(first);
+    expect(await readStoredObject(store, first)).toEqual(first);
     store.close();
   });
 
@@ -342,8 +367,7 @@ describe("LocalOpaqueReplicationStore", () => {
     const first = await store.descriptorPage({ epochId: epoch.epochId, maxDescriptors: 2 });
     expect(first.descriptors).toHaveLength(2);
     expect(first.hasMore).toBe(true);
-    expect(first.nextCursor).toBeDefined();
-    const cursor = first.nextCursor!;
+    const cursor = requireValue(first.nextCursor, "first descriptor page cursor");
     const second = await store.descriptorPage({
       epochId: epoch.epochId,
       cursor,
@@ -360,7 +384,7 @@ describe("LocalOpaqueReplicationStore", () => {
       epochId: otherEpoch.epochId,
       cursor,
     })).rejects.toBeInstanceOf(InvalidOpaqueDescriptorCatalogCursorError);
-    const last = cursor.at(-1)!;
+    const last = requireValue(cursor.at(-1), "cursor signature character");
     const forged = `${cursor.slice(0, -1)}${last === "A" ? "B" : "A"}` as OpaqueDescriptorCatalogCursor;
     await expect(store.descriptorPage({
       epochId: epoch.epochId,
@@ -393,10 +417,8 @@ describe("LocalOpaqueReplicationStore", () => {
     const store = new LocalOpaqueReplicationStore({ root, maxReadBytes: 1024 * 1024 });
     await store.install(object);
 
-    await expect(store.readObject({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    }, { maxBytes: 1 })).rejects.toBeInstanceOf(OpaqueReplicationObjectReadLimitError);
+    await expect(readStoredObject(store, object, 1))
+      .rejects.toBeInstanceOf(OpaqueReplicationObjectReadLimitError);
     store.close();
   });
 
@@ -418,20 +440,21 @@ describe("LocalOpaqueReplicationStore", () => {
       ORDER BY opaque_key
     `).all() as unknown as { readonly opaque_key: string; readonly storage_key: string }[];
     db.close();
-    const pathFor = (storage: string) => join(root, "objects", "sha256", storage.slice(0, 2), `${storage.slice(2)}.json`);
-    const firstRow = rows.find((row) => row.opaque_key === first.descriptor.opaqueKey)!;
-    const secondRow = rows.find((row) => row.opaque_key === second.descriptor.opaqueKey)!;
-    await unlink(pathFor(firstRow.storage_key));
-    await writeFile(pathFor(secondRow.storage_key), "{}", { mode: 0o600 });
+    const firstRow = requireValue(
+      rows.find((row) => row.opaque_key === first.descriptor.opaqueKey),
+      "first opaque object row",
+    );
+    const secondRow = requireValue(
+      rows.find((row) => row.opaque_key === second.descriptor.opaqueKey),
+      "second opaque object row",
+    );
+    await unlink(objectBodyPath(root, firstRow.storage_key));
+    await writeFile(objectBodyPath(root, secondRow.storage_key), "{}", { mode: 0o600 });
 
-    await expect(store.readObject({
-      epochId: first.descriptor.epochId,
-      opaqueKey: first.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 })).rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
-    await expect(store.readObject({
-      epochId: second.descriptor.epochId,
-      opaqueKey: second.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 })).rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
+    await expect(readStoredObject(store, first))
+      .rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
+    await expect(readStoredObject(store, second))
+      .rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
     store.close();
   });
 
@@ -452,19 +475,11 @@ describe("LocalOpaqueReplicationStore", () => {
     const store = new LocalOpaqueReplicationStore({ root });
     await store.install(first);
 
-    const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
-    db.prepare(`
-      DELETE FROM opaque_replication_objects
-      WHERE epoch_id = ? AND opaque_key = ?
-    `).run(first.descriptor.epochId, first.descriptor.opaqueKey);
-    db.close();
+    deleteObjectMetadata(root, first);
 
     const recovered = await store.install(alternate);
     expect(recovered.inserted).toBe(true);
-    expect(await store.readObject({
-      epochId: first.descriptor.epochId,
-      opaqueKey: first.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 })).toEqual(first);
+    expect(await readStoredObject(store, first)).toEqual(first);
     store.close();
   });
 
@@ -480,7 +495,7 @@ describe("LocalOpaqueReplicationStore", () => {
       SELECT storage_key FROM opaque_replication_objects
       WHERE epoch_id = ? AND opaque_key = ?
     `).get(object.descriptor.epochId, object.descriptor.opaqueKey) as { readonly storage_key: string };
-    const path = join(root, "objects", "sha256", row.storage_key.slice(0, 2), `${row.storage_key.slice(2)}.json`);
+    const path = objectBodyPath(root, row.storage_key);
     const parsed = JSON.parse(await encryptedReplicationObjectJson(object)) as Record<string, unknown>;
     const nonCanonical = JSON.stringify({ envelope: parsed.envelope, schema: parsed.schema, descriptor: parsed.descriptor });
     const bytes = new TextEncoder().encode(nonCanonical);
@@ -492,10 +507,8 @@ describe("LocalOpaqueReplicationStore", () => {
     `).run(bytes.byteLength, await sha256(bytes), object.descriptor.epochId, object.descriptor.opaqueKey);
     db.close();
 
-    await expect(store.readObject({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    }, { maxBytes: 1024 * 1024 })).rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
+    await expect(readStoredObject(store, object))
+      .rejects.toBeInstanceOf(OpaqueReplicationStoreCorruptionError);
     store.close();
   });
 
@@ -506,21 +519,11 @@ describe("LocalOpaqueReplicationStore", () => {
     const store = new LocalOpaqueReplicationStore({ root });
     await store.install(object);
 
-    const db = new DatabaseSync(join(root, "opaque-replication.sqlite"));
-    db.prepare(`
-      DELETE FROM opaque_replication_objects
-      WHERE epoch_id = ? AND opaque_key = ?
-    `).run(object.descriptor.epochId, object.descriptor.opaqueKey);
-    db.close();
+    deleteObjectMetadata(root, object);
 
-    expect(await store.descriptor({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    })).toBeUndefined();
-    await expect(store.readObject({
-      epochId: object.descriptor.epochId,
-      opaqueKey: object.descriptor.opaqueKey,
-    })).rejects.toBeInstanceOf(OpaqueReplicationObjectNotFoundError);
+    expect(await store.descriptor(locator(object))).toBeUndefined();
+    await expect(store.readObject(locator(object)))
+      .rejects.toBeInstanceOf(OpaqueReplicationObjectNotFoundError);
     expect(await objectBodyFiles(root)).toHaveLength(1);
     store.close();
   });
