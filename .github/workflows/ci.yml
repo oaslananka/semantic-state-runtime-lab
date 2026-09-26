@@ -86,3 +86,6 @@ jobs:
 
       - name: Opaque Merkle reconciliation benchmark smoke test
         run: pnpm benchmark:replication:opaque:v1
+
+      - name: Durable opaque replication store catalog benchmark smoke test
+        run: pnpm benchmark:replication:opaque-store:v1
