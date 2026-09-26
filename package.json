@@ -23,7 +23,8 @@
     "benchmark:replication:access:v1": "node benchmarks/replication-access-v1.ts",
     "benchmark:replication:blob-access:v1": "node benchmarks/replication-blob-access-v1.ts",
     "benchmark:replication:http:v1": "node benchmarks/replication-http-v1.ts",
-    "benchmark:replication:encrypted:v1": "node benchmarks/encrypted-replication-v1.ts"
+    "benchmark:replication:encrypted:v1": "node benchmarks/encrypted-replication-v1.ts",
+    "benchmark:replication:opaque:v1": "node benchmarks/opaque-reconciliation-v1.ts"
   },
   "devDependencies": {
     "@types/node": "26.6.2",

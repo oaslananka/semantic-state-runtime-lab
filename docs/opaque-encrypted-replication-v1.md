@@ -345,3 +345,7 @@ ciphertext objects
 It must not overload existing fields such as `payloadDigest` with secret-keyed tags merely because they have a similar textual shape.
 
 After that, the authenticated HTTP replication transport can be integrated with relay ciphertext storage using the vault keyring as epoch/grant authority.
+
+## Reconciliation follow-up
+
+The descriptor is now consumed by an epoch-scoped opaque Prefix-Merkle and bounded reconciliation adapter. See `docs/opaque-merkle-reconciliation-v1.md`. Ciphertext object storage/HTTP remains a separate follow-up.

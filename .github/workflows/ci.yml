@@ -83,3 +83,6 @@ jobs:
 
       - name: Opaque encrypted replication overhead benchmark smoke test
         run: pnpm benchmark:replication:encrypted:v1
+
+      - name: Opaque Merkle reconciliation benchmark smoke test
+        run: pnpm benchmark:replication:opaque:v1
