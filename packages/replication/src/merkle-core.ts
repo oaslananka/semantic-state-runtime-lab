@@ -319,39 +319,33 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
     return descriptorJsonBytes(this.#codec, descriptors);
   }
 
-  compare(remote: GenericPrefixMerkleIndex<D, K, C>): CoreMerkleDiff<K, C> {
-    if (this.scopeId !== remote.scopeId) throw this.#codec.scopeMismatch(this.scopeId, remote.scopeId);
+  #assertComparable(remote: GenericPrefixMerkleIndex<D, K, C>): void {
+    if (this.scopeId !== remote.scopeId) {
+      throw this.#codec.scopeMismatch(this.scopeId, remote.scopeId);
+    }
     if (this.prefixBits !== remote.prefixBits) {
       throw this.#codec.invalid(
         `Merkle prefixBits mismatch: ${this.prefixBits} != ${remote.prefixBits}`,
       );
     }
-    let internalHashComparisons = 1;
-    if (this.rootDigest === remote.rootDigest) {
-      return {
-        rootEqual: true,
-        internalHashComparisons,
-        mismatchedLeafIds: [],
-        localOnly: [],
-        remoteOnly: [],
-        collisions: [],
-        leafDescriptorsExamined: 0,
-        estimatedLeafDescriptorBytesExchanged: 0,
-      };
-    }
+  }
 
-    const mismatchedLeafIds: number[] = [];
+  #mismatchedLeaves(remote: GenericPrefixMerkleIndex<D, K, C>): {
+    readonly leafIds: readonly number[];
+    readonly internalHashComparisons: number;
+  } {
+    const leafIds: number[] = [];
     const stack: { readonly level: number; readonly index: number }[] = [{
       level: this.prefixBits,
       index: 0,
     }];
-    internalHashComparisons = 0;
+    let internalHashComparisons = 0;
     while (stack.length > 0) {
       const node = stack.pop()!;
       internalHashComparisons += 1;
       if (this.nodeHash(node.level, node.index) === remote.nodeHash(node.level, node.index)) continue;
       if (node.level === 0) {
-        mismatchedLeafIds.push(node.index);
+        leafIds.push(node.index);
         continue;
       }
       stack.push(
@@ -359,13 +353,29 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
         { level: node.level - 1, index: node.index * 2 },
       );
     }
+    return {
+      leafIds: leafIds.toSorted((left, right) => left - right),
+      internalHashComparisons,
+    };
+  }
 
+  #compareLeaves(
+    remote: GenericPrefixMerkleIndex<D, K, C>,
+    leafIds: readonly number[],
+  ): {
+    readonly localOnly: readonly K[];
+    readonly remoteOnly: readonly K[];
+    readonly collisions: readonly C[];
+    readonly leafDescriptorsExamined: number;
+    readonly estimatedLeafDescriptorBytesExchanged: number;
+  } {
     const localOnly: K[] = [];
     const remoteOnly: K[] = [];
     const collisions: C[] = [];
     let leafDescriptorsExamined = 0;
     let estimatedLeafDescriptorBytesExchanged = 0;
-    for (const leafId of mismatchedLeafIds.toSorted((left, right) => left - right)) {
+
+    for (const leafId of leafIds) {
       const localLeaf = this.leafDescriptors(leafId);
       const remoteLeaf = remote.leafDescriptors(leafId);
       leafDescriptorsExamined += localLeaf.length + remoteLeaf.length;
@@ -378,23 +388,16 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
       for (const key of keys) {
         const left = localMap.get(key);
         const right = remoteMap.get(key);
-        if (left === undefined) {
-          remoteOnly.push(key);
-          continue;
+        if (left === undefined) remoteOnly.push(key);
+        else if (right === undefined) localOnly.push(key);
+        else {
+          const comparison = this.#codec.compareSameKey(left, right);
+          if (comparison.collision !== undefined) collisions.push(comparison.collision);
         }
-        if (right === undefined) {
-          localOnly.push(key);
-          continue;
-        }
-        const comparison = this.#codec.compareSameKey(left, right);
-        if (comparison.collision !== undefined) collisions.push(comparison.collision);
       }
     }
 
     return {
-      rootEqual: false,
-      internalHashComparisons,
-      mismatchedLeafIds: mismatchedLeafIds.toSorted((left, right) => left - right),
       localOnly: [...new Set(localOnly)].toSorted((left, right) => left.localeCompare(right)),
       remoteOnly: [...new Set(remoteOnly)].toSorted((left, right) => left.localeCompare(right)),
       collisions: [...new Map(
@@ -404,6 +407,31 @@ export class GenericPrefixMerkleIndex<D, K extends string, C> {
       )),
       leafDescriptorsExamined,
       estimatedLeafDescriptorBytesExchanged,
+    };
+  }
+
+  compare(remote: GenericPrefixMerkleIndex<D, K, C>): CoreMerkleDiff<K, C> {
+    this.#assertComparable(remote);
+    if (this.rootDigest === remote.rootDigest) {
+      return {
+        rootEqual: true,
+        internalHashComparisons: 1,
+        mismatchedLeafIds: [],
+        localOnly: [],
+        remoteOnly: [],
+        collisions: [],
+        leafDescriptorsExamined: 0,
+        estimatedLeafDescriptorBytesExchanged: 0,
+      };
+    }
+
+    const mismatch = this.#mismatchedLeaves(remote);
+    const leaves = this.#compareLeaves(remote, mismatch.leafIds);
+    return {
+      rootEqual: false,
+      internalHashComparisons: mismatch.internalHashComparisons,
+      mismatchedLeafIds: mismatch.leafIds,
+      ...leaves,
     };
   }
 }

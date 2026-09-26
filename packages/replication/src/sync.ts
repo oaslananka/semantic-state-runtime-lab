@@ -7,7 +7,6 @@ import {
   PLAINTEXT_RECONCILIATION_SCOPE,
   plaintextMerkleCodec,
   type PrefixMerkleIndex,
-  type PrefixMerkleBits,
 } from "./merkle.js";
 import {
   createReconciliationProtocolRuntime,
@@ -77,4 +76,4 @@ export const BoundedReconciliationSession = runtime.Session;
 export type BoundedReconciliationSession = Awaited<ReturnType<typeof BoundedReconciliationSession.start>>;
 
 // Keep PrefixMerkleBits reachable to downstream declaration consumers through ReconciliationViewInfo.
-export type { PrefixMerkleBits };
+export type { PrefixMerkleBits } from "./merkle.js";

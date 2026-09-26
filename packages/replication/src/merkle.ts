@@ -16,18 +16,13 @@ import {
   type MerkleLeafSnapshotBase,
   type MerkleSnapshotBase,
 } from "./merkle-adapter.js";
-import {
-  DEFAULT_PREFIX_MERKLE_BITS,
-  SUPPORTED_PREFIX_MERKLE_BITS,
-  resolvePrefixMerkleBits,
-  type PrefixMerkleBits,
-} from "./merkle-common.js";
+import { resolvePrefixMerkleBits, type PrefixMerkleBits } from "./merkle-common.js";
 import { genericPrefixMerkleLeafIdForKey, type MerkleDescriptorCodec } from "./merkle-core.js";
 
 export const PREFIX_MERKLE_SCHEMA = "ssrl-prefix-merkle-v1" as const;
 export const PLAINTEXT_RECONCILIATION_SCOPE = "ssrl-plaintext-replication-v1";
-export { DEFAULT_PREFIX_MERKLE_BITS, SUPPORTED_PREFIX_MERKLE_BITS };
-export type { PrefixMerkleBits };
+export { DEFAULT_PREFIX_MERKLE_BITS, SUPPORTED_PREFIX_MERKLE_BITS } from "./merkle-common.js";
+export type { PrefixMerkleBits } from "./merkle-common.js";
 
 export type PrefixMerkleAddResult = "inserted" | "unchanged";
 

@@ -5,11 +5,9 @@ import type {
   OpaqueReplicationTag,
 } from "./encrypted.js";
 import {
-  OpaqueReplicationEpochMismatchError,
   opaqueMerkleCodec,
   type OpaquePrefixMerkleIndex,
 } from "./opaque-merkle.js";
-import type { PrefixMerkleBits } from "./merkle.js";
 import {
   createReconciliationProtocolRuntime,
   protocolViewInfoBase,
@@ -79,4 +77,4 @@ export type InMemoryOpaqueReconciliationEndpoint = InstanceType<typeof InMemoryO
 export const OpaqueBoundedReconciliationSession = runtime.Session;
 export type OpaqueBoundedReconciliationSession = Awaited<ReturnType<typeof OpaqueBoundedReconciliationSession.start>>;
 
-export type { PrefixMerkleBits };
+export type { PrefixMerkleBits } from "./merkle.js";

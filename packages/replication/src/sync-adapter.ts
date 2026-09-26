@@ -7,7 +7,6 @@ import {
   type GenericLeafPageOptions,
   type GenericReconciliationEndpoint,
   type GenericReconciliationLeafPage,
-  type GenericReconciliationResult,
   type GenericReconciliationViewInfo,
   type GenericReconciliationViewReader,
   type MerkleNodeHash,

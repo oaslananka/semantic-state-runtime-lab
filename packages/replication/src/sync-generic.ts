@@ -47,11 +47,9 @@ export interface NodeQueryOptions {
   readonly maxNodeRefs?: number;
 }
 
-export type GenericReconciliationLeafCursor = string;
-
 export interface GenericLeafPageOptions {
   readonly leafId: number;
-  readonly cursor?: GenericReconciliationLeafCursor;
+  readonly cursor?: string;
   readonly maxDescriptors?: number;
   readonly maxBytes?: number;
 }
@@ -62,7 +60,7 @@ export interface GenericReconciliationLeafPage<D> {
   readonly leafId: number;
   readonly descriptors: readonly D[];
   readonly estimatedBytes: number;
-  readonly nextCursor?: GenericReconciliationLeafCursor;
+  readonly nextCursor?: string;
   readonly completed: boolean;
 }
 
@@ -252,14 +250,14 @@ interface LeafCursorPayload {
 async function encodeLeafCursor(
   secret: CryptoKey,
   payload: LeafCursorPayload,
-): Promise<GenericReconciliationLeafCursor> {
+): Promise<string> {
   const material = canonicalJson(payload);
   return `${hex(utf8Bytes(material))}.${await hmac(secret, material)}`;
 }
 
 async function decodeLeafCursor(
   secret: CryptoKey,
-  cursor: GenericReconciliationLeafCursor,
+  cursor: string,
 ): Promise<LeafCursorPayload> {
   const [encoded, signature, extra] = cursor.split(".");
   if (encoded === undefined || signature === undefined || extra !== undefined) {
@@ -527,8 +525,8 @@ implements GenericReconciliationEndpoint<D> {
 
 interface LeafWorkState<D> {
   readonly leafId: number;
-  localCursor?: GenericReconciliationLeafCursor;
-  remoteCursor?: GenericReconciliationLeafCursor;
+  localCursor?: string;
+  remoteCursor?: string;
   localBuffer: D[];
   remoteBuffer: D[];
   localCompleted: boolean;
@@ -806,16 +804,13 @@ async function validateRestoredState<D, K extends string, C>(input: {
 
 export class GenericBoundedReconciliationSession<D, K extends string, C> {
   readonly #codec: MerkleDescriptorCodec<D, K, C>;
-  readonly #schema: string;
   readonly #state: GenericReconciliationSessionState<D, K, C>;
 
   private constructor(input: {
     readonly codec: MerkleDescriptorCodec<D, K, C>;
-    readonly schema: string;
     readonly state: GenericReconciliationSessionState<D, K, C>;
   }) {
     this.#codec = input.codec;
-    this.#schema = input.schema;
     this.#state = input.state;
   }
 
@@ -831,7 +826,6 @@ export class GenericBoundedReconciliationSession<D, K extends string, C> {
     const remote = await input.remote.viewInfo(input.remoteViewId);
     return new GenericBoundedReconciliationSession({
       codec: input.codec,
-      schema: input.schema,
       state: startState({
         codec: input.codec,
         schema: input.schema,
@@ -862,7 +856,6 @@ export class GenericBoundedReconciliationSession<D, K extends string, C> {
     await validateRestoredState({ codec: input.codec, schema: input.schema, state });
     return new GenericBoundedReconciliationSession({
       codec: input.codec,
-      schema: input.schema,
       state,
     });
   }
@@ -922,12 +915,13 @@ export class GenericBoundedReconciliationSession<D, K extends string, C> {
     remote: GenericReconciliationEndpoint<D>,
   ): Promise<void> {
     const refs = this.#state.pendingNodes.splice(0, this.#state.options.maxNodeRefsPerStep);
-    const [localResponse, remoteResponse] = await Promise.all([
-      local.nodeHashes(refs, { maxNodeRefs: this.#state.options.maxNodeRefsPerStep }),
-      remote.nodeHashes(this.#state.remote.viewId, refs, {
-        maxNodeRefs: this.#state.options.maxNodeRefsPerStep,
-      }),
-    ]);
+    const localResponse = local.nodeHashes(
+      refs,
+      { maxNodeRefs: this.#state.options.maxNodeRefsPerStep },
+    );
+    const remoteResponse = await remote.nodeHashes(this.#state.remote.viewId, refs, {
+      maxNodeRefs: this.#state.options.maxNodeRefsPerStep,
+    });
     assertNodeResponse(this.#state.local, refs, localResponse);
     assertNodeResponse(this.#state.remote, refs, remoteResponse);
     this.#state.counters.remoteNodeQueries += 1;
