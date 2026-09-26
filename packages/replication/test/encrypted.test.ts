@@ -127,6 +127,44 @@ describe("opaque encrypted replication objects", () => {
       .toThrow(OpaqueReplicationCollisionError);
   });
 
+  it("does not expose global content equality across unrelated logical record keys", async () => {
+    const epoch = generateVaultEpoch();
+    const sharedPayload = temporalObservationJson({
+      id: "payload-shared",
+      entityId: project,
+      property: "Project.status",
+      value: "same-plaintext",
+      source: { provider: "fixture", externalId: "shared", revision: "r1" },
+      validFrom: "2026-09-01T00:00:00Z",
+      recordedAt: "2026-09-01T00:00:00Z",
+    });
+    const firstRecord = await createReplicationRecord({
+      kind: "semantic-observation",
+      recordId: "logical-key-a",
+      payload: sharedPayload,
+    });
+    const secondRecord = await createReplicationRecord({
+      kind: "semantic-observation",
+      recordId: "logical-key-b",
+      payload: sharedPayload,
+    });
+    expect(secondRecord.payloadDigest).toBe(firstRecord.payloadDigest);
+
+    const first = await opaqueReplicationRecordDescriptor({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record: firstRecord,
+    });
+    const second = await opaqueReplicationRecordDescriptor({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record: secondRecord,
+    });
+
+    expect(second.opaqueKey).not.toBe(first.opaqueKey);
+    expect(second.opaqueContentTag).not.toBe(first.opaqueContentTag);
+  });
+
   it("does not serialize semantic identifiers, plaintext digests, payloads, or the epoch secret", async () => {
     const epoch = generateVaultEpoch();
     const privateValue = "ultra-private-low-entropy-secret";
