@@ -135,6 +135,21 @@ SSRL does **not** derive an AES-GCM nonce from record identity or content. Deter
 
 The stable reconciliation identity comes from keyed HMAC tags, not deterministic ciphertext.
 
+### Relay representative semantics
+
+Two valid ciphertext envelopes may therefore share one opaque descriptor.
+
+A future relay store may deduplicate/select one ciphertext representative for an opaque descriptor, but the relay cannot prove that ciphertext decrypts to the intended SSRL record because it does not possess the epoch secret.
+
+Authorized clients remain the integrity boundary:
+
+- decrypt the selected ciphertext;
+- verify the canonical ReplicationRecord or artifact digest;
+- recompute the opaque descriptor;
+- reject any mismatch.
+
+A corrupted or malicious relay ciphertext is an availability/integrity failure for that fetch. It is never accepted as a different semantic value and never invokes last-write-wins.
+
 ## Public descriptor
 
 `OpaqueReplicationDescriptor` contains:
