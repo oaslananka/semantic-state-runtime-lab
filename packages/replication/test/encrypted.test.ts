@@ -67,8 +67,8 @@ async function sha256Digest(bytes: Uint8Array): Promise<string> {
 }
 
 function mutateBase64Url(value: string): string {
-  const replacement = value.endsWith("A") ? "B" : "A";
-  return value.slice(0, -1) + replacement;
+  const replacement = value.startsWith("A") ? "B" : "A";
+  return replacement + value.slice(1);
 }
 
 describe("opaque encrypted replication objects", () => {
