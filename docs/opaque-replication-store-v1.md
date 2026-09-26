@@ -45,6 +45,7 @@ interface OpaqueReplicationObjectStore {
   descriptor(locator): Promise<OpaqueReplicationDescriptor | undefined>;
   readObject(locator, options?): Promise<EncryptedReplicationObject>;
   descriptorPage(request): Promise<OpaqueDescriptorCatalogPage>;
+  descriptorChangesAfter(request?): Promise<OpaqueDescriptorChangePage>;
 }
 ```
 
@@ -227,6 +228,14 @@ Consequences:
 
 The cursor is navigation state, not an authorization credential. HTTP authorization will be a separate trusted-device/vault/epoch layer.
 
+## Durable descriptor change feed
+
+Local schema v2 adds a global append-only descriptor change feed. A row is committed in the same SQLite transaction as newly visible object metadata, so exact replay emits no duplicate change and failed/colliding installs emit no orphan change.
+
+Change pages are count/byte bounded and use an HMAC-authenticated store-bound cursor. Even an empty feed returns a sequence-0 head cursor; this lets downstream derived state bind to the source store before the first descriptor exists.
+
+The v1 -> v2 migration deterministically bootstraps changes from existing descriptor rows. See `incremental-opaque-merkle-v1.md` for the derived Merkle consumer and cursor/replay semantics.
+
 ## Merkle integration
 
 The descriptor catalog is the persistence bridge to the opaque reconciliation engine:
@@ -308,13 +317,12 @@ v1 does not implement:
 - delete mutation
 - retention/garbage collection
 - quotas/billing
-- persisted incremental Merkle trees
 - S3/R2/cloud object-store adapter
 - metadata padding/access-pattern hiding
 
 ## Next step
 
-The next layer should be an authenticated opaque relay service:
+The durable incremental Merkle materializer described in `incremental-opaque-merkle-v1.md` now removes the steady-state full-catalog rebuild. The next layer should be an authenticated opaque relay service:
 
 ```text
 existing device-bound request signatures / trust registry

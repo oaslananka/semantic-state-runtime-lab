@@ -15,15 +15,21 @@ import { type VaultEpochId } from "@ssrl/e2e";
 import {
   HARD_OPAQUE_OBJECT_READ_MAX_BYTES,
   InvalidOpaqueDescriptorCatalogCursorError,
+  InvalidOpaqueDescriptorChangeCursorError,
   OpaqueDescriptorCatalogEntryTooLargeError,
+  OpaqueDescriptorChangeEntryTooLargeError,
   OpaqueReplicationObjectNotFoundError,
   OpaqueReplicationObjectReadLimitError,
   OpaqueReplicationStoreCorruptionError,
   normalizeOpaqueObjectLocator,
   opaqueCatalogLimits,
+  opaqueChangeLimits,
   opaqueObjectReadLimit,
   type OpaqueDescriptorCatalogCursor,
   type OpaqueDescriptorCatalogPage,
+  type OpaqueDescriptorChangeCursor,
+  type OpaqueDescriptorChangePage,
+  type OpaqueDescriptorChangeRequest,
   type OpaqueDescriptorCatalogRequest,
   type OpaqueObjectInstallResult,
   type OpaqueObjectLocator,
@@ -45,8 +51,9 @@ import {
 } from "@ssrl/replication/encrypted";
 
 const STORE_COMPONENT = "local-opaque-replication-store";
-const STORE_SCHEMA_VERSION = 1;
+const STORE_SCHEMA_VERSION = 2;
 const CATALOG_CURSOR_PREFIX = "ssrl-opaque-catalog-v1:";
+const CHANGE_CURSOR_PREFIX = "ssrl-opaque-change-v1:";
 
 declare const opaqueStorePathBrand: unique symbol;
 type OpaqueStorePath = string & { readonly [opaqueStorePathBrand]: true };
@@ -138,6 +145,13 @@ interface ObjectRow {
   readonly storage_key: string;
   readonly body_json_bytes: number | bigint;
   readonly body_digest: string;
+  readonly descriptor_json: string;
+}
+
+interface DescriptorChangeRow {
+  readonly sequence: number | bigint;
+  readonly epoch_id: string;
+  readonly opaque_key: string;
   readonly descriptor_json: string;
 }
 
@@ -273,6 +287,77 @@ function decodeCatalogCursor(
   }
 }
 
+function changeCursor(
+  catalogId: string,
+  cursorSecret: string,
+  sequence: number | bigint,
+): OpaqueDescriptorChangeCursor {
+  const sequenceText = String(sequence);
+  if (!/^(?:0|[1-9]\d*)$/.test(sequenceText)) {
+    throw new OpaqueReplicationStoreCorruptionError("Opaque descriptor change sequence is invalid");
+  }
+  const material = canonicalJson([catalogId, sequenceText]);
+  const payload = Buffer.from(material, "utf8").toString("base64url");
+  const encoded = `${CHANGE_CURSOR_PREFIX}${payload}.${cursorSignature(cursorSecret, payload)}`;
+  return encoded as OpaqueDescriptorChangeCursor;
+}
+
+function decodeChangeCursor(
+  cursor: OpaqueDescriptorChangeCursor,
+  catalogId: string,
+  cursorSecret: string,
+): bigint {
+  if (!cursor.startsWith(CHANGE_CURSOR_PREFIX)) {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  const encoded = cursor.slice(CHANGE_CURSOR_PREFIX.length);
+  const separator = encoded.indexOf(".");
+  if (separator < 1 || separator !== encoded.lastIndexOf(".")) {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  const payload = encoded.slice(0, separator);
+  const signature = encoded.slice(separator + 1);
+  if (
+    !/^[A-Za-z0-9_-]+$/.test(payload)
+    || !/^[A-Za-z0-9_-]{43}$/.test(signature)
+    || cursorSignature(cursorSecret, payload) !== signature
+  ) {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  let material: string;
+  try {
+    const bytes = Buffer.from(payload, "base64url");
+    if (bytes.toString("base64url") !== payload) {
+      throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+    }
+    material = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch (cause) {
+    if (cause instanceof InvalidOpaqueDescriptorChangeCursorError) throw cause;
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(material) as unknown;
+  } catch {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  if (
+    !Array.isArray(parsed)
+    || parsed.length !== 2
+    || canonicalJson(parsed) !== material
+    || parsed[0] !== catalogId
+    || typeof parsed[1] !== "string"
+    || !/^(?:0|[1-9]\d*)$/.test(parsed[1])
+  ) {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+  try {
+    return BigInt(parsed[1]);
+  } catch {
+    throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+  }
+}
+
 async function canonicalDescriptor(value: unknown): Promise<{
   readonly descriptor: OpaqueReplicationDescriptor;
   readonly json: string;
@@ -362,18 +447,21 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
     if (version > STORE_SCHEMA_VERSION) {
       throw new UnsupportedLocalOpaqueReplicationStoreSchemaError(version, STORE_SCHEMA_VERSION);
     }
-    if (version !== STORE_SCHEMA_VERSION) {
-      throw new OpaqueReplicationStoreCorruptionError(
-        `Unsupported opaque replication schema version ${version}`,
-      );
+    if (version === STORE_SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.#migrateV1ToV2();
+      return;
     }
+    throw new OpaqueReplicationStoreCorruptionError(
+      `Unsupported opaque replication schema version ${version}`,
+    );
   }
 
   #createFreshSchema(): void {
     const existing = this.#db.prepare(`
       SELECT name
       FROM sqlite_master
-      WHERE type = 'table' AND name IN ('opaque_replication_objects', 'opaque_replication_catalog_meta')
+      WHERE type = 'table' AND name IN ('opaque_replication_objects', 'opaque_replication_catalog_meta', 'opaque_replication_changes')
       ORDER BY name
     `).all() as unknown as { readonly name: string }[];
     if (existing.length > 0) {
@@ -405,6 +493,16 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
 
         CREATE INDEX opaque_replication_epoch_catalog
           ON opaque_replication_objects(epoch_id, opaque_key);
+
+        CREATE TABLE opaque_replication_changes (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          epoch_id TEXT NOT NULL,
+          opaque_key TEXT NOT NULL,
+          descriptor_json TEXT NOT NULL CHECK(json_valid(descriptor_json)),
+          UNIQUE(epoch_id, opaque_key),
+          FOREIGN KEY(epoch_id, opaque_key)
+            REFERENCES opaque_replication_objects(epoch_id, opaque_key)
+        ) STRICT;
       `);
       this.#db.prepare(`
         INSERT INTO opaque_replication_catalog_meta(singleton, catalog_id, cursor_secret)
@@ -414,6 +512,42 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
         INSERT INTO opaque_replication_store_meta(component, schema_version)
         VALUES (?, ?)
       `).run(STORE_COMPONENT, STORE_SCHEMA_VERSION);
+    });
+  }
+
+  #migrateV1ToV2(): void {
+    const existing = this.#db.prepare(`
+      SELECT name
+      FROM sqlite_master
+      WHERE type = 'table' AND name = 'opaque_replication_changes'
+    `).get() as { readonly name: string } | undefined;
+    if (existing !== undefined) {
+      throw new OpaqueReplicationStoreCorruptionError(
+        "opaque_replication_changes exists while store schema is still v1",
+      );
+    }
+    this.#transaction(() => {
+      this.#db.exec(`
+        CREATE TABLE opaque_replication_changes (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          epoch_id TEXT NOT NULL,
+          opaque_key TEXT NOT NULL,
+          descriptor_json TEXT NOT NULL CHECK(json_valid(descriptor_json)),
+          UNIQUE(epoch_id, opaque_key),
+          FOREIGN KEY(epoch_id, opaque_key)
+            REFERENCES opaque_replication_objects(epoch_id, opaque_key)
+        ) STRICT;
+
+        INSERT INTO opaque_replication_changes(epoch_id, opaque_key, descriptor_json)
+        SELECT epoch_id, opaque_key, descriptor_json
+        FROM opaque_replication_objects
+        ORDER BY epoch_id, opaque_key;
+      `);
+      this.#db.prepare(`
+        UPDATE opaque_replication_store_meta
+        SET schema_version = ?
+        WHERE component = ?
+      `).run(STORE_SCHEMA_VERSION, STORE_COMPONENT);
     });
   }
 
@@ -480,6 +614,40 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
       throw new OpaqueReplicationStoreCorruptionError("Stored opaque body digest is invalid");
     }
     return descriptor;
+  }
+
+  async #validatedChangeRow(
+    row: DescriptorChangeRow,
+  ): Promise<{ readonly descriptor: OpaqueReplicationDescriptor; readonly json: string }> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.descriptor_json) as unknown;
+    } catch (cause) {
+      throw new OpaqueReplicationStoreCorruptionError(
+        `Opaque descriptor change ${String(row.sequence)} JSON is invalid`,
+        { cause },
+      );
+    }
+    let descriptor: OpaqueReplicationDescriptor;
+    let json: string;
+    try {
+      ({ descriptor, json } = await canonicalDescriptor(parsed));
+    } catch (cause) {
+      throw new OpaqueReplicationStoreCorruptionError(
+        `Opaque descriptor change ${String(row.sequence)} is invalid`,
+        { cause },
+      );
+    }
+    if (
+      json !== row.descriptor_json
+      || descriptor.epochId !== row.epoch_id
+      || descriptor.opaqueKey !== row.opaque_key
+    ) {
+      throw new OpaqueReplicationStoreCorruptionError(
+        `Opaque descriptor change ${String(row.sequence)} disagrees with stored descriptor`,
+      );
+    }
+    return { descriptor, json };
   }
 
   #objectPath(storageValue: string): OpaqueStorePath {
@@ -647,24 +815,34 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
 
     const installedBody = await this.#installBody(prepared);
     try {
-      this.#db.prepare(`
-        INSERT INTO opaque_replication_objects(
-          epoch_id, opaque_key, opaque_content_tag, object_kind,
-          ciphertext_bytes, descriptor_fingerprint, storage_key,
-          body_json_bytes, body_digest, descriptor_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        prepared.normalized.descriptor.epochId,
-        prepared.normalized.descriptor.opaqueKey,
-        prepared.normalized.descriptor.opaqueContentTag,
-        prepared.normalized.descriptor.objectKind,
-        prepared.normalized.descriptor.ciphertextBytes,
-        prepared.normalized.descriptor.fingerprint,
-        prepared.storage,
-        installedBody.bodyJsonBytes,
-        installedBody.bodyDigest,
-        prepared.descriptorJson,
-      );
+      this.#transaction(() => {
+        this.#db.prepare(`
+          INSERT INTO opaque_replication_objects(
+            epoch_id, opaque_key, opaque_content_tag, object_kind,
+            ciphertext_bytes, descriptor_fingerprint, storage_key,
+            body_json_bytes, body_digest, descriptor_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          prepared.normalized.descriptor.epochId,
+          prepared.normalized.descriptor.opaqueKey,
+          prepared.normalized.descriptor.opaqueContentTag,
+          prepared.normalized.descriptor.objectKind,
+          prepared.normalized.descriptor.ciphertextBytes,
+          prepared.normalized.descriptor.fingerprint,
+          prepared.storage,
+          installedBody.bodyJsonBytes,
+          installedBody.bodyDigest,
+          prepared.descriptorJson,
+        );
+        this.#db.prepare(`
+          INSERT INTO opaque_replication_changes(epoch_id, opaque_key, descriptor_json)
+          VALUES (?, ?, ?)
+        `).run(
+          prepared.normalized.descriptor.epochId,
+          prepared.normalized.descriptor.opaqueKey,
+          prepared.descriptorJson,
+        );
+      });
     } catch (cause) {
       const raced = this.#row(locator);
       if (raced === undefined) throw cause;
@@ -765,6 +943,60 @@ export class LocalOpaqueReplicationStore implements OpaqueReplicationObjectStore
       descriptorBytes,
       hasMore,
       ...(nextCursor === undefined ? {} : { nextCursor }),
+    };
+  }
+
+  async descriptorChangesAfter(
+    request: OpaqueDescriptorChangeRequest = {},
+  ): Promise<OpaqueDescriptorChangePage> {
+    const limits = opaqueChangeLimits(request);
+    const cursor = request.cursor;
+    const after = cursor === undefined
+      ? 0n
+      : decodeChangeCursor(cursor, this.#catalogId, this.#cursorSecret);
+    if (cursor !== undefined && after !== 0n) {
+      const known = this.#db.prepare(`
+        SELECT 1 AS present
+        FROM opaque_replication_changes
+        WHERE sequence = ?
+      `).get(after) as { readonly present: number } | undefined;
+      if (known === undefined) throw new InvalidOpaqueDescriptorChangeCursorError(cursor);
+    }
+    const rows = this.#db.prepare(`
+      SELECT sequence, epoch_id, opaque_key, descriptor_json
+      FROM opaque_replication_changes
+      WHERE sequence > ?
+      ORDER BY sequence
+      LIMIT ?
+    `).all(after, limits.maxDescriptors + 1) as unknown as DescriptorChangeRow[];
+
+    const descriptors: OpaqueReplicationDescriptor[] = [];
+    let descriptorBytes = 0;
+    let consumedRows = 0;
+    let lastSequence: number | bigint | undefined;
+    for (const row of rows.slice(0, limits.maxDescriptors)) {
+      const { descriptor, json } = await this.#validatedChangeRow(row);
+      const bytes = new TextEncoder().encode(json).byteLength;
+      if (descriptorBytes + bytes > limits.maxBytes) {
+        if (descriptors.length === 0) {
+          throw new OpaqueDescriptorChangeEntryTooLargeError(bytes, limits.maxBytes);
+        }
+        break;
+      }
+      descriptors.push(descriptor);
+      descriptorBytes += bytes;
+      consumedRows += 1;
+      lastSequence = row.sequence;
+    }
+    const hasMore = consumedRows < rows.length;
+    const nextCursor = lastSequence === undefined
+      ? (cursor ?? changeCursor(this.#catalogId, this.#cursorSecret, 0))
+      : changeCursor(this.#catalogId, this.#cursorSecret, lastSequence);
+    return {
+      descriptors,
+      descriptorBytes,
+      hasMore,
+      nextCursor,
     };
   }
 

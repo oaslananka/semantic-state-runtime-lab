@@ -4,9 +4,12 @@ import { normalizeOpaqueReplicationTag } from "@ssrl/replication/encrypted";
 import {
   DEFAULT_OPAQUE_CATALOG_MAX_BYTES,
   DEFAULT_OPAQUE_CATALOG_MAX_DESCRIPTORS,
+  DEFAULT_OPAQUE_CHANGE_MAX_BYTES,
+  DEFAULT_OPAQUE_CHANGE_MAX_DESCRIPTORS,
   DEFAULT_OPAQUE_OBJECT_READ_MAX_BYTES,
   normalizeOpaqueObjectLocator,
   opaqueCatalogLimits,
+  opaqueChangeLimits,
   opaqueObjectReadLimit,
 } from "../src/index.js";
 
@@ -27,5 +30,10 @@ describe("opaque replication store contracts", () => {
     });
     expect(() => opaqueObjectReadLimit(0)).toThrow(RangeError);
     expect(() => opaqueCatalogLimits({ epochId, maxDescriptors: 0 })).toThrow(RangeError);
+    expect(opaqueChangeLimits()).toEqual({
+      maxDescriptors: DEFAULT_OPAQUE_CHANGE_MAX_DESCRIPTORS,
+      maxBytes: DEFAULT_OPAQUE_CHANGE_MAX_BYTES,
+    });
+    expect(() => opaqueChangeLimits({ maxBytes: 0 })).toThrow(RangeError);
   });
 });

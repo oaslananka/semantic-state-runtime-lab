@@ -537,6 +537,15 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/opaque-merkle-view-store:
+    dependencies:
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+      '@ssrl/replication':
+        specifier: workspace:*
+        version: link:../replication
+
   packages/opaque-replication-store:
     dependencies:
       '@ssrl/e2e':
@@ -770,6 +779,34 @@ importers:
       '@ssrl/e2e':
         specifier: workspace:*
         version: link:../e2e
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/storage-sqlite-opaque-merkle:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+      '@ssrl/opaque-merkle-view-store':
+        specifier: workspace:*
+        version: link:../opaque-merkle-view-store
+      '@ssrl/opaque-replication-store':
+        specifier: workspace:*
+        version: link:../opaque-replication-store
+      '@ssrl/replication':
+        specifier: workspace:*
+        version: link:../replication
+    devDependencies:
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
+      '@ssrl/storage-local-opaque-replication':
+        specifier: workspace:*
+        version: link:../storage-local-opaque-replication
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2

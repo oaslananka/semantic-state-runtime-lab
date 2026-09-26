@@ -13,10 +13,19 @@ export const DEFAULT_OPAQUE_CATALOG_MAX_DESCRIPTORS = 256;
 export const HARD_OPAQUE_CATALOG_MAX_DESCRIPTORS = 4_096;
 export const DEFAULT_OPAQUE_CATALOG_MAX_BYTES = 1024 * 1024;
 export const HARD_OPAQUE_CATALOG_MAX_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_OPAQUE_CHANGE_MAX_DESCRIPTORS = 256;
+export const HARD_OPAQUE_CHANGE_MAX_DESCRIPTORS = 4_096;
+export const DEFAULT_OPAQUE_CHANGE_MAX_BYTES = 1024 * 1024;
+export const HARD_OPAQUE_CHANGE_MAX_BYTES = 8 * 1024 * 1024;
 
 declare const opaqueDescriptorCatalogCursorBrand: unique symbol;
 export type OpaqueDescriptorCatalogCursor = string & {
   readonly [opaqueDescriptorCatalogCursorBrand]: true;
+};
+
+declare const opaqueDescriptorChangeCursorBrand: unique symbol;
+export type OpaqueDescriptorChangeCursor = string & {
+  readonly [opaqueDescriptorChangeCursorBrand]: true;
 };
 
 export interface OpaqueObjectLocator {
@@ -50,6 +59,20 @@ export interface OpaqueDescriptorCatalogPage {
   readonly nextCursor?: OpaqueDescriptorCatalogCursor;
 }
 
+export interface OpaqueDescriptorChangeRequest {
+  readonly cursor?: OpaqueDescriptorChangeCursor;
+  readonly maxDescriptors?: number;
+  readonly maxBytes?: number;
+}
+
+export interface OpaqueDescriptorChangePage {
+  readonly descriptors: readonly OpaqueReplicationDescriptor[];
+  readonly descriptorBytes: number;
+  readonly hasMore: boolean;
+  /** Store-bound checkpoint cursor, including for an empty feed. */
+  readonly nextCursor: OpaqueDescriptorChangeCursor;
+}
+
 export interface OpaqueReplicationObjectStore {
   install(object: EncryptedReplicationObject): Promise<OpaqueObjectInstallResult>;
   descriptor(locator: OpaqueObjectLocator): Promise<OpaqueReplicationDescriptor | undefined>;
@@ -58,6 +81,9 @@ export interface OpaqueReplicationObjectStore {
     options?: OpaqueObjectReadOptions,
   ): Promise<EncryptedReplicationObject>;
   descriptorPage(request: OpaqueDescriptorCatalogRequest): Promise<OpaqueDescriptorCatalogPage>;
+  descriptorChangesAfter(
+    request?: OpaqueDescriptorChangeRequest,
+  ): Promise<OpaqueDescriptorChangePage>;
 }
 
 export class OpaqueReplicationObjectNotFoundError extends Error {
@@ -88,10 +114,24 @@ export class InvalidOpaqueDescriptorCatalogCursorError extends Error {
   }
 }
 
+export class InvalidOpaqueDescriptorChangeCursorError extends Error {
+  constructor(readonly cursor: string) {
+    super("Invalid opaque descriptor change cursor");
+    this.name = "InvalidOpaqueDescriptorChangeCursorError";
+  }
+}
+
 export class OpaqueDescriptorCatalogEntryTooLargeError extends Error {
   constructor(readonly requiredBytes: number, readonly maxBytes: number) {
     super(`Opaque descriptor requires ${requiredBytes} bytes; catalog maxBytes is ${maxBytes}`);
     this.name = "OpaqueDescriptorCatalogEntryTooLargeError";
+  }
+}
+
+export class OpaqueDescriptorChangeEntryTooLargeError extends Error {
+  constructor(readonly requiredBytes: number, readonly maxBytes: number) {
+    super(`Opaque descriptor change requires ${requiredBytes} bytes; maxBytes is ${maxBytes}`);
+    this.name = "OpaqueDescriptorChangeEntryTooLargeError";
   }
 }
 
@@ -122,6 +162,26 @@ export function opaqueObjectReadLimit(value?: number): number {
     HARD_OPAQUE_OBJECT_READ_MAX_BYTES,
     "maxBytes",
   );
+}
+
+export function opaqueChangeLimits(request: OpaqueDescriptorChangeRequest = {}): {
+  readonly maxDescriptors: number;
+  readonly maxBytes: number;
+} {
+  return {
+    maxDescriptors: boundedInteger(
+      request.maxDescriptors,
+      DEFAULT_OPAQUE_CHANGE_MAX_DESCRIPTORS,
+      HARD_OPAQUE_CHANGE_MAX_DESCRIPTORS,
+      "maxDescriptors",
+    ),
+    maxBytes: boundedInteger(
+      request.maxBytes,
+      DEFAULT_OPAQUE_CHANGE_MAX_BYTES,
+      HARD_OPAQUE_CHANGE_MAX_BYTES,
+      "maxBytes",
+    ),
+  };
 }
 
 export function opaqueCatalogLimits(request: OpaqueDescriptorCatalogRequest): {

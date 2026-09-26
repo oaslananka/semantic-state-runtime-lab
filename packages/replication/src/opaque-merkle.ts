@@ -4,6 +4,7 @@ import {
   OpaqueReplicationCollisionError,
   assertSameOpaqueReplicationDescriptor,
   normalizeOpaqueReplicationDescriptor,
+  normalizeOpaqueReplicationTag,
   type OpaqueReplicationCollision,
   type OpaqueReplicationDescriptor,
   type OpaqueReplicationTag,
@@ -20,9 +21,92 @@ import {
   resolvePrefixMerkleBits,
   type PrefixMerkleBits,
 } from "./merkle-common.js";
-import type { MerkleDescriptorCodec } from "./merkle-core.js";
+import {
+  genericPrefixMerkleEmptyHashes,
+  genericPrefixMerkleLeafHash,
+  genericPrefixMerkleLeafIdForKey,
+  genericPrefixMerkleParentHash,
+  type MerkleDescriptorCodec,
+} from "./merkle-core.js";
 
 export const OPAQUE_PREFIX_MERKLE_SCHEMA = "ssrl-opaque-prefix-merkle-v1" as const;
+
+
+const OPAQUE_TAG_PREFIX = "hmac-sha256:";
+
+function opaqueTagCodePoint(character: string): number {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) {
+    throw new EncryptedReplicationValidationError(
+      "Opaque replication tag contains an invalid base64url character",
+    );
+  }
+  return codePoint;
+}
+
+function opaqueTagPrimaryRank(character: string): number {
+  if (character === "_") return 0;
+  if (character === "-") return 1;
+  const code = opaqueTagCodePoint(character);
+  if (code >= 48 && code <= 57) return 2 + code - 48;
+  const lower = opaqueTagCodePoint(character.toLowerCase());
+  if (lower >= 97 && lower <= 122) return 12 + lower - 97;
+  throw new EncryptedReplicationValidationError(
+    "Opaque replication tag contains an invalid base64url character",
+  );
+}
+
+function opaqueTagCaseRank(character: string): number {
+  const code = opaqueTagCodePoint(character);
+  return code >= 65 && code <= 90 ? 1 : 0;
+}
+
+function opaqueTagCharacter(value: string, index: number): string {
+  const character = value.at(index);
+  if (character === undefined) {
+    throw new EncryptedReplicationValidationError("Opaque replication tags have different lengths");
+  }
+  return character;
+}
+
+/**
+ * Deterministic v1 opaque-tag collation key.
+ *
+ * Opaque tags use a fixed prefix and a 43-character base64url suffix. The v1
+ * implementation historically used JavaScript localeCompare(), whose default
+ * locale is not a wire-safe ordering contract. This explicit two-level key
+ * preserves the established base64url ordering (primary case-insensitive,
+ * lower-case before upper-case on tertiary ties) while making it stable across
+ * runtimes and directly sortable with SQLite BINARY collation.
+ */
+export function opaqueReplicationTagOrderKey(value: OpaqueReplicationTag): string {
+  const normalized = normalizeOpaqueReplicationTag(value, "opaque replication tag order key");
+  const suffix = normalized.slice(OPAQUE_TAG_PREFIX.length);
+  const primary = [...suffix]
+    .map((character) => opaqueTagPrimaryRank(character).toString(16).padStart(2, "0"))
+    .join("");
+  const tertiary = [...suffix].map((character) => String(opaqueTagCaseRank(character))).join("");
+  return `${primary}ff${tertiary}`;
+}
+
+export function compareOpaqueReplicationTags(
+  left: OpaqueReplicationTag,
+  right: OpaqueReplicationTag,
+): number {
+  const leftSuffix = left.slice(OPAQUE_TAG_PREFIX.length);
+  const rightSuffix = right.slice(OPAQUE_TAG_PREFIX.length);
+  for (let index = 0; index < leftSuffix.length; index += 1) {
+    const primary = opaqueTagPrimaryRank(opaqueTagCharacter(leftSuffix, index))
+      - opaqueTagPrimaryRank(opaqueTagCharacter(rightSuffix, index));
+    if (primary !== 0) return primary;
+  }
+  for (let index = 0; index < leftSuffix.length; index += 1) {
+    const tertiary = opaqueTagCaseRank(opaqueTagCharacter(leftSuffix, index))
+      - opaqueTagCaseRank(opaqueTagCharacter(rightSuffix, index));
+    if (tertiary !== 0) return tertiary;
+  }
+  return 0;
+}
 
 export interface OpaquePrefixMerkleBuildOptions {
   readonly prefixBits?: PrefixMerkleBits;
@@ -65,6 +149,7 @@ export const opaqueMerkleCodec: MerkleDescriptorCodec<
 > = {
   normalize: normalizeOpaqueReplicationDescriptor,
   key: (descriptor) => descriptor.opaqueKey,
+  compareKeys: compareOpaqueReplicationTags,
   scope: (descriptor) => descriptor.epochId,
   canonicalValue: (descriptor) => descriptor,
   compareSameKey(left, right) {
@@ -148,3 +233,34 @@ export function opaquePrefixMerkleSnapshotJson(index: OpaquePrefixMerkleIndex): 
 }
 
 export type { PrefixMerkleBits };
+
+
+export function opaquePrefixMerkleLeafId(
+  opaqueKey: OpaqueReplicationTag,
+  prefixBits: PrefixMerkleBits,
+): Promise<number> {
+  return genericPrefixMerkleLeafIdForKey(opaqueKey, prefixBits);
+}
+
+export async function opaquePrefixMerkleLeafHash(
+  descriptors: readonly OpaqueReplicationDescriptor[],
+): Promise<string> {
+  const normalized = await Promise.all(descriptors.map((descriptor) => (
+    normalizeOpaqueReplicationDescriptor(descriptor)
+  )));
+  return genericPrefixMerkleLeafHash(opaqueMerkleCodec, normalized);
+}
+
+export function opaquePrefixMerkleParentHash(
+  level: number,
+  left: string,
+  right: string,
+): Promise<string> {
+  return genericPrefixMerkleParentHash(level, left, right);
+}
+
+export function opaquePrefixMerkleEmptyHashes(
+  prefixBits: PrefixMerkleBits,
+): Promise<readonly string[]> {
+  return genericPrefixMerkleEmptyHashes(opaqueMerkleCodec, prefixBits);
+}

@@ -247,12 +247,17 @@ Interpretation:
 
 The existing plaintext 100k bounded reconciliation test also passes after the generic-core refactor.
 
+## Durable incremental view follow-up
+
+`incremental-opaque-merkle-v1.md` adds a SQLite-backed versioned Merkle materializer behind this same `OpaqueReconciliationEndpoint` contract. It consumes a transactional opaque descriptor change feed, preserves frozen-view semantics without cloning the full index, and updates one Merkle path per new descriptor. The bounded reconciliation state machine described here remains unchanged.
+
+The durable implementation also makes opaque-key ordering an explicit protocol primitive instead of relying on runtime locale collation. A persisted SQL sort key preserves the established v1 order while keeping leaf pagination bounded and deterministic.
+
 ## What this does not solve
 
 v1 does not implement:
 
-- ciphertext object storage;
-- relay HTTP endpoints for opaque inventory/object transfer;
+- authenticated public relay HTTP routes for opaque inventory/object transfer;
 - vault-keyring lookup inside the relay;
 - cross-epoch reconciliation;
 - historical epoch re-encryption;
@@ -266,7 +271,7 @@ The relay still learns the leakage documented by `opaque-encrypted-replication-v
 
 ## Next step
 
-The next untrusted-cloud checkpoint should use the opaque view as the **only** relay reconciliation surface:
+The durable opaque object store and incremental SQL-backed Merkle views now provide the persistence/reconciliation substrate. The next untrusted-cloud checkpoint should expose them only behind authenticated vault/epoch authorization:
 
 ```text
 authorized client
