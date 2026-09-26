@@ -21,6 +21,7 @@ import {
   encryptedReplicationObjectJson,
   encryptReplicationRecord,
   opaqueArtifactBlobDescriptor,
+  opaqueReplicationDescriptorJson,
   opaqueReplicationRecordDescriptor,
   parseEncryptedReplicationObjectJson,
 } from "../src/encrypted.js";
@@ -55,6 +56,18 @@ function fullRecordJson(record: ReplicationRecord): string {
     fingerprint: record.fingerprint,
     payloadBytes: record.payloadBytes,
     payload: record.payload,
+  });
+}
+
+function nonCanonicalRecordJson(record: ReplicationRecord): string {
+  return JSON.stringify({
+    payload: record.payload,
+    payloadBytes: record.payloadBytes,
+    fingerprint: record.fingerprint,
+    payloadDigest: record.payloadDigest,
+    recordId: record.recordId,
+    kind: record.kind,
+    key: record.key,
   });
 }
 
@@ -267,6 +280,55 @@ describe("opaque encrypted replication objects", () => {
       ...first,
       envelope: mismatchedEnvelope,
     }, epoch.secret)).rejects.toBeInstanceOf(EncryptedReplicationValidationError);
+  });
+
+  it("rejects decrypted non-canonical ReplicationRecord JSON even when byte accounting still matches", async () => {
+    const epoch = generateVaultEpoch();
+    const record = await observationRecord("noncanonical-record", "private");
+    const encrypted = await encryptReplicationRecord({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record,
+    });
+    const canonical = fullRecordJson(record);
+    const nonCanonical = nonCanonicalRecordJson(record);
+    expect(nonCanonical).not.toBe(canonical);
+    expect(utf8(nonCanonical).byteLength).toBe(utf8(canonical).byteLength);
+
+    const envelope = await encryptPayload({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      objectKind: "replication-record",
+      objectId: encrypted.descriptor.opaqueKey,
+      plaintext: utf8(nonCanonical),
+    });
+
+    await expect(decryptReplicationRecord({
+      ...encrypted,
+      envelope,
+    }, epoch.secret)).rejects.toThrow(/must use canonical JSON/);
+  });
+
+  it("canonicalizes opaque descriptor JSON independently of object property insertion order", async () => {
+    const epoch = generateVaultEpoch();
+    const record = await observationRecord("descriptor-order", "private");
+    const descriptor = await opaqueReplicationRecordDescriptor({
+      epochId: epoch.epochId,
+      epochSecret: epoch.secret,
+      record,
+    });
+    const reordered = {
+      fingerprint: descriptor.fingerprint,
+      ciphertextBytes: descriptor.ciphertextBytes,
+      opaqueContentTag: descriptor.opaqueContentTag,
+      opaqueKey: descriptor.opaqueKey,
+      objectKind: descriptor.objectKind,
+      epochId: descriptor.epochId,
+      schema: descriptor.schema,
+    };
+
+    expect(await opaqueReplicationDescriptorJson(reordered))
+      .toBe(await opaqueReplicationDescriptorJson(descriptor));
   });
 
   it("enforces exact public object and descriptor fields", async () => {
