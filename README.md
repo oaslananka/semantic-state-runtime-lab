@@ -43,7 +43,8 @@ Implemented checkpoints include:
 - policy-scoped prefix-Merkle replication with bounded resumable sessions;
 - principal-scoped immutable record + artifact blob transfer;
 - authenticated bounded replication HTTP with real two-node semantic/artifact convergence;
-- optional Ed25519 device-bound HTTP Message Signature authentication with replay defense.
+- optional Ed25519 device-bound HTTP Message Signature authentication with replay defense;
+- epoch-scoped opaque encrypted replication object identities that hide plaintext record/blob identifiers and digests from an untrusted relay.
 
 ## Design posture
 
@@ -66,7 +67,7 @@ The lab is not yet a consumer product. Important remaining work includes:
 - historical context-access semantics;
 - opaque provenance/evidence expansion handles;
 - device enrollment, sender-constrained authentication and key rotation;
-- end-to-end replication encryption for untrusted relay/cloud deployments;
+- opaque-descriptor Merkle/reconciliation and ciphertext HTTP/storage integration for untrusted relay/cloud deployments;
 - active-active source receipt/witness semantics;
 - deployment composition, real IdP verifier integration and observability;
 - product UX, onboarding, sync operations and commercial packaging.
