@@ -80,7 +80,8 @@ opaqueContentTag =
   HMAC(indexKey,
        canonical(["ssrl-opaque-replication-tag-v1",
                   "record-content",
-                  plaintext payloadDigest]))
+                  canonical([ReplicationRecord.key,
+                             plaintext payloadDigest])]))
 ```
 
 Both are encoded as:
@@ -90,6 +91,8 @@ hmac-sha256:<unpadded-base64url-32-bytes>
 ```
 
 Domain separation prevents a record key tag, record content tag, blob key tag and blob content tag from being interchangeable.
+
+The content tag is additionally scoped to the logical key. This is deliberate privacy minimization: the relay needs to know whether **one immutable opaque key** has conflicting content, but it does not need a global equality tag that links identical plaintext content stored under unrelated record keys.
 
 ## Collision law
 
