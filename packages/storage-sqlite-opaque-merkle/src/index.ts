@@ -10,6 +10,7 @@ import {
 import {
   InvalidOpaqueDescriptorChangeCursorError,
   type OpaqueDescriptorChangeCursor,
+  type OpaqueDescriptorChangePage,
   type OpaqueReplicationObjectStore,
 } from "@ssrl/opaque-replication-store";
 import {
@@ -40,13 +41,11 @@ import {
   MAX_LEAF_BYTES,
   MAX_LEAF_DESCRIPTORS,
   MAX_NODE_REFS,
+  OPAQUE_RECONCILIATION_PROTOCOL_SCHEMA,
   ReconciliationLimitError,
   StaleReconciliationViewError,
   type MerkleNodeRef,
   type NodeQueryOptions,
-} from "@ssrl/replication/opaque-sync";
-import {
-  OPAQUE_RECONCILIATION_PROTOCOL_SCHEMA,
   type OpaqueLeafPageOptions,
   type OpaqueMerkleNodeHashResponse,
   type OpaqueReconciliationLeafCursor,
@@ -148,8 +147,27 @@ function positiveInteger(value: number, max: number, label: string): number {
   return value;
 }
 
+function isLowerHex(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    const digit = codePoint !== undefined && codePoint >= 48 && codePoint <= 57;
+    const lowerHex = codePoint !== undefined && codePoint >= 97 && codePoint <= 102;
+    if (!digit && !lowerHex) return false;
+  }
+  return true;
+}
+
 function digest(value: string, label: string): string {
-  if (!/^sha256:[0-9a-f]{64}$/.test(value)) throw new CorruptOpaqueMerkleViewStoreError(`${label} is invalid`);
+  const hex = value.startsWith("sha256:") ? value.slice("sha256:".length) : "";
+  if (hex.length !== 64 || !isLowerHex(hex)) {
+    throw new CorruptOpaqueMerkleViewStoreError(`${label} is invalid`);
+  }
+  return value;
+}
+
+function requiredMapValue<K, V>(map: ReadonlyMap<K, V>, key: K, label: string): V {
+  const value = map.get(key);
+  if (value === undefined) throw new CorruptOpaqueMerkleViewStoreError(`${label} is missing`);
   return value;
 }
 
@@ -383,13 +401,24 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
     return descriptor;
   }
 
+  #emptyHash(level: number): string {
+    if (!Number.isSafeInteger(level) || level < 0 || level >= this.#emptyHashes.length) {
+      throw new CorruptOpaqueMerkleViewStoreError(`Empty Merkle hash level ${level} is invalid`);
+    }
+    const value = this.#emptyHashes.at(level);
+    if (value === undefined) {
+      throw new CorruptOpaqueMerkleViewStoreError(`Empty Merkle hash level ${level} is missing`);
+    }
+    return digest(value, "empty Merkle hash");
+  }
+
   #nodeHashAt(epochId: VaultEpochId, level: number, index: number, version: number): string {
     const row = this.#db.prepare(`
       SELECT hash FROM opaque_merkle_node_versions
       WHERE epoch_id=? AND level=? AND node_index=? AND version<=?
       ORDER BY version DESC LIMIT 1
     `).get(epochId, level, index, version) as NodeRow | undefined;
-    return row === undefined ? this.#emptyHashes[level]! : digest(row.hash, "node hash");
+    return row === undefined ? this.#emptyHash(level) : digest(row.hash, "node hash");
   }
 
   async #bootstrapEpoch(epochId: VaultEpochId, descriptors: readonly OpaqueReplicationDescriptor[]): Promise<BootstrapEpoch> {
@@ -433,12 +462,42 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
     });
   }
 
+  async #sourceChangePageForCatchUp(
+    cursor?: OpaqueDescriptorChangeCursor,
+  ): Promise<OpaqueDescriptorChangePage> {
+    try {
+      return await this.#sourceChangePage(cursor);
+    } catch (error) {
+      if (error instanceof InvalidOpaqueDescriptorChangeCursorError) {
+        throw new OpaqueMerkleSourceCheckpointError();
+      }
+      throw error;
+    }
+  }
+
+  async #applyIncrementalPage(
+    page: OpaqueDescriptorChangePage,
+  ): Promise<{ readonly descriptorsRead: number; readonly descriptorsInserted: number }> {
+    let descriptorsInserted = 0;
+    for (const descriptor of page.descriptors) {
+      const plan = await this.#planIncremental(descriptor);
+      if (plan === undefined) continue;
+      this.#commitIncremental(plan);
+      descriptorsInserted += 1;
+    }
+    return {
+      descriptorsRead: page.descriptors.length,
+      descriptorsInserted,
+    };
+  }
+
   async #bootstrap(): Promise<OpaqueMerkleCatchUpResult> {
     const groups = new Map<VaultEpochId, OpaqueReplicationDescriptor[]>();
     let cursor: OpaqueDescriptorChangeCursor | undefined;
     let pages = 0;
     let descriptorsRead = 0;
-    while (true) {
+    let hasMore = true;
+    while (hasMore) {
       const page = await this.#sourceChangePage(cursor);
       pages += 1;
       for (const value of page.descriptors) {
@@ -449,7 +508,7 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
         descriptorsRead += 1;
       }
       cursor = page.nextCursor;
-      if (!page.hasMore) break;
+      hasMore = page.hasMore;
     }
     const epochs: BootstrapEpoch[] = [];
     for (const [epochId, descriptors] of groups) epochs.push(await this.#bootstrapEpoch(epochId, descriptors));
@@ -463,9 +522,9 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
           epoch.epochId,
           descriptor.opaqueKey,
           opaqueReplicationTagOrderKey(descriptor.opaqueKey),
-          epoch.leafIds.get(descriptor.opaqueKey)!,
+          requiredMapValue(epoch.leafIds, descriptor.opaqueKey, "bootstrap leaf id"),
           1,
-          epoch.descriptorJson.get(descriptor.opaqueKey)!,
+          requiredMapValue(epoch.descriptorJson, descriptor.opaqueKey, "bootstrap descriptor JSON"),
         );
         for (const node of epoch.nodes) nodeInsert.run(epoch.epochId, node.level, node.index, 1, node.hash);
       }
@@ -481,7 +540,7 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
       assertSameOpaqueReplicationDescriptor(await this.#validatedDescriptorRow(existing), descriptor);
       return undefined;
     }
-    const head = this.#head(descriptor.epochId) ?? { version: 0, recordCount: 0, rootDigest: this.#emptyHashes[this.#prefixBits]! };
+    const head = this.#head(descriptor.epochId) ?? { version: 0, recordCount: 0, rootDigest: this.#emptyHash(this.#prefixBits) };
     const leafId = await opaquePrefixMerkleLeafId(descriptor.opaqueKey, this.#prefixBits);
     const rows = this.#db.prepare(`SELECT epoch_id,opaque_key,sort_key,leaf_id,inserted_version,descriptor_json FROM opaque_merkle_descriptors WHERE epoch_id=? AND leaf_id=? ORDER BY sort_key`).all(descriptor.epochId, leafId) as unknown as DescriptorRow[];
     const leafDescriptors = await Promise.all(rows.map((row) => this.#validatedDescriptorRow(row)));
@@ -533,31 +592,27 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
   async catchUp(): Promise<OpaqueMerkleCatchUpResult> {
     const state = this.#sourceState();
     if (!state.initialized) return this.#bootstrap();
+
     let cursor = state.cursor;
     let pages = 0;
     let descriptorsRead = 0;
     let descriptorsInserted = 0;
-    while (true) {
-      let page;
-      try {
-        page = await this.#sourceChangePage(cursor);
-      } catch (error) {
-        if (error instanceof InvalidOpaqueDescriptorChangeCursorError) throw new OpaqueMerkleSourceCheckpointError();
-        throw error;
-      }
+    let hasMore = true;
+    while (hasMore) {
+      const page = await this.#sourceChangePageForCatchUp(cursor);
+      const applied = await this.#applyIncrementalPage(page);
       pages += 1;
-      for (const descriptor of page.descriptors) {
-        descriptorsRead += 1;
-        const plan = await this.#planIncremental(descriptor);
-        if (plan !== undefined) {
-          this.#commitIncremental(plan);
-          descriptorsInserted += 1;
-        }
-      }
+      descriptorsRead += applied.descriptorsRead;
+      descriptorsInserted += applied.descriptorsInserted;
+
       const nextCursor = page.nextCursor;
-      if (nextCursor !== cursor) this.#transaction(() => this.#setSourceState(true, nextCursor));
+      if (nextCursor !== cursor) {
+        this.#transaction(() => {
+          this.#setSourceState(true, nextCursor);
+        });
+      }
       cursor = nextCursor;
-      if (!page.hasMore) break;
+      hasMore = page.hasMore;
     }
     return { bootstrapped: false, pages, descriptorsRead, descriptorsInserted };
   }
@@ -585,7 +640,7 @@ export class SQLiteOpaqueMerkleViewStore implements OpaqueMerkleViewProvider {
     await this.catchUp();
     this.#pruneViews();
     const epochId = normalizeVaultEpochId(epochValue);
-    const head = this.#head(epochId) ?? { version: 0, recordCount: 0, rootDigest: this.#emptyHashes[this.#prefixBits]! };
+    const head = this.#head(epochId) ?? { version: 0, recordCount: 0, rootDigest: this.#emptyHash(this.#prefixBits) };
     const viewId = `sql-opaque-view-${randomUUID()}`;
     const info: OpaqueReconciliationViewInfo = {
       schema: OPAQUE_RECONCILIATION_PROTOCOL_SCHEMA,

@@ -36,7 +36,8 @@ function sha256Hex(value: string): string {
 }
 
 function syntheticTag(domain: string, index: number): string {
-  return `hmac-sha256:${sha256Base64Url(`${domain}:${index}`)}`;
+  const material = `${domain}:${index}`;
+  return `hmac-sha256:${sha256Base64Url(material)}`;
 }
 
 async function descriptor(
@@ -137,17 +138,18 @@ function sourceFacade(
   store: LocalOpaqueReplicationStore,
   counters: { catalogCalls: number; changeCalls: number },
 ): OpaqueReplicationObjectStore {
+  const install = store.install.bind(store);
+  const descriptor = store.descriptor.bind(store);
+  const readObject = store.readObject.bind(store);
   return {
-    install: (object) => store.install(object),
-    descriptor: (locator: OpaqueObjectLocator) => store.descriptor(locator),
-    readObject: (locator: OpaqueObjectLocator, options?: OpaqueObjectReadOptions) => (
-      store.readObject(locator, options)
-    ),
-    descriptorPage: (request: OpaqueDescriptorCatalogRequest) => {
+    install,
+    descriptor,
+    readObject,
+    descriptorPage(request: OpaqueDescriptorCatalogRequest) {
       counters.catalogCalls += 1;
       return store.descriptorPage(request);
     },
-    descriptorChangesAfter: (request?: OpaqueDescriptorChangeRequest) => {
+    descriptorChangesAfter(request?: OpaqueDescriptorChangeRequest) {
       counters.changeCalls += 1;
       return store.descriptorChangesAfter(request);
     },

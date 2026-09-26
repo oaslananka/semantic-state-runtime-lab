@@ -34,19 +34,39 @@ export const OPAQUE_PREFIX_MERKLE_SCHEMA = "ssrl-opaque-prefix-merkle-v1" as con
 
 const OPAQUE_TAG_PREFIX = "hmac-sha256:";
 
+function opaqueTagCodePoint(character: string): number {
+  const codePoint = character.codePointAt(0);
+  if (codePoint === undefined) {
+    throw new EncryptedReplicationValidationError(
+      "Opaque replication tag contains an invalid base64url character",
+    );
+  }
+  return codePoint;
+}
+
 function opaqueTagPrimaryRank(character: string): number {
   if (character === "_") return 0;
   if (character === "-") return 1;
-  const code = character.charCodeAt(0);
+  const code = opaqueTagCodePoint(character);
   if (code >= 48 && code <= 57) return 2 + code - 48;
-  const lower = character.toLowerCase().charCodeAt(0);
+  const lower = opaqueTagCodePoint(character.toLowerCase());
   if (lower >= 97 && lower <= 122) return 12 + lower - 97;
-  throw new EncryptedReplicationValidationError("Opaque replication tag contains an invalid base64url character");
+  throw new EncryptedReplicationValidationError(
+    "Opaque replication tag contains an invalid base64url character",
+  );
 }
 
 function opaqueTagCaseRank(character: string): number {
-  const code = character.charCodeAt(0);
+  const code = opaqueTagCodePoint(character);
   return code >= 65 && code <= 90 ? 1 : 0;
+}
+
+function opaqueTagCharacter(value: string, index: number): string {
+  const character = value.at(index);
+  if (character === undefined) {
+    throw new EncryptedReplicationValidationError("Opaque replication tags have different lengths");
+  }
+  return character;
 }
 
 /**
@@ -76,13 +96,13 @@ export function compareOpaqueReplicationTags(
   const leftSuffix = left.slice(OPAQUE_TAG_PREFIX.length);
   const rightSuffix = right.slice(OPAQUE_TAG_PREFIX.length);
   for (let index = 0; index < leftSuffix.length; index += 1) {
-    const primary = opaqueTagPrimaryRank(leftSuffix[index]!)
-      - opaqueTagPrimaryRank(rightSuffix[index]!);
+    const primary = opaqueTagPrimaryRank(opaqueTagCharacter(leftSuffix, index))
+      - opaqueTagPrimaryRank(opaqueTagCharacter(rightSuffix, index));
     if (primary !== 0) return primary;
   }
   for (let index = 0; index < leftSuffix.length; index += 1) {
-    const tertiary = opaqueTagCaseRank(leftSuffix[index]!)
-      - opaqueTagCaseRank(rightSuffix[index]!);
+    const tertiary = opaqueTagCaseRank(opaqueTagCharacter(leftSuffix, index))
+      - opaqueTagCaseRank(opaqueTagCharacter(rightSuffix, index));
     if (tertiary !== 0) return tertiary;
   }
   return 0;
