@@ -269,6 +269,25 @@ describe("opaque encrypted replication objects", () => {
     )).rejects.toThrow(/do not match/);
   });
 
+  it("cryptographically scopes tags to epochId even if a raw epoch secret were reused", async () => {
+    const firstEpoch = generateVaultEpoch();
+    const secondEpoch = generateVaultEpoch();
+    const record = await observationRecord("epoch-id-bound", "private");
+    const first = await opaqueReplicationRecordDescriptor({
+      epochId: firstEpoch.epochId,
+      epochSecret: firstEpoch.secret,
+      record,
+    });
+    const second = await opaqueReplicationRecordDescriptor({
+      epochId: secondEpoch.epochId,
+      epochSecret: firstEpoch.secret,
+      record,
+    });
+
+    expect(second.opaqueKey).not.toBe(first.opaqueKey);
+    expect(second.opaqueContentTag).not.toBe(first.opaqueContentTag);
+  });
+
   it("binds descriptor equality to one epoch", async () => {
     const firstEpoch = generateVaultEpoch();
     const secondEpoch = generateVaultEpoch();
