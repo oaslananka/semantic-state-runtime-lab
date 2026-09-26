@@ -71,6 +71,44 @@ function mutateBase64Url(value: string): string {
   return replacement + value.slice(1);
 }
 
+async function unscopedRecordContentTag(
+  epochId: string,
+  epochSecret: Uint8Array,
+  payloadDigest: string,
+): Promise<string> {
+  const ownedSecret = Uint8Array.from(epochSecret);
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    ownedSecret.buffer,
+    "HKDF",
+    false,
+    ["deriveKey"],
+  );
+  const hmacKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: utf8("ssrl-opaque-replication-index-salt-v1"),
+      info: utf8(canonicalJson([
+        "ssrl-opaque-replication-index-key-v1",
+        epochId,
+      ])),
+    },
+    keyMaterial,
+    { name: "HMAC", hash: "SHA-256", length: 256 },
+    false,
+    ["sign"],
+  );
+  const material = utf8(canonicalJson([
+    "ssrl-opaque-replication-tag-v1",
+    "record-content",
+    payloadDigest,
+  ]));
+  return `hmac-sha256:${base64UrlEncode(
+    await crypto.subtle.sign("HMAC", hmacKey, material),
+  )}`;
+}
+
 describe("opaque encrypted replication objects", () => {
   it("round-trips a canonical replication record exactly", async () => {
     const epoch = generateVaultEpoch();
@@ -127,42 +165,21 @@ describe("opaque encrypted replication objects", () => {
       .toThrow(OpaqueReplicationCollisionError);
   });
 
-  it("does not expose global content equality across unrelated logical record keys", async () => {
+  it("binds the content tag to logical identity instead of exposing a digest-only equality tag", async () => {
     const epoch = generateVaultEpoch();
-    const sharedPayload = temporalObservationJson({
-      id: "payload-shared",
-      entityId: project,
-      property: "Project.status",
-      value: "same-plaintext",
-      source: { provider: "fixture", externalId: "shared", revision: "r1" },
-      validFrom: "2026-09-01T00:00:00Z",
-      recordedAt: "2026-09-01T00:00:00Z",
-    });
-    const firstRecord = await createReplicationRecord({
-      kind: "semantic-observation",
-      recordId: "logical-key-a",
-      payload: sharedPayload,
-    });
-    const secondRecord = await createReplicationRecord({
-      kind: "semantic-observation",
-      recordId: "logical-key-b",
-      payload: sharedPayload,
-    });
-    expect(secondRecord.payloadDigest).toBe(firstRecord.payloadDigest);
-
-    const first = await opaqueReplicationRecordDescriptor({
+    const record = await observationRecord("content-scope", "same-plaintext");
+    const descriptor = await opaqueReplicationRecordDescriptor({
       epochId: epoch.epochId,
       epochSecret: epoch.secret,
-      record: firstRecord,
+      record,
     });
-    const second = await opaqueReplicationRecordDescriptor({
-      epochId: epoch.epochId,
-      epochSecret: epoch.secret,
-      record: secondRecord,
-    });
+    const digestOnlyTag = await unscopedRecordContentTag(
+      epoch.epochId,
+      epoch.secret,
+      record.payloadDigest,
+    );
 
-    expect(second.opaqueKey).not.toBe(first.opaqueKey);
-    expect(second.opaqueContentTag).not.toBe(first.opaqueContentTag);
+    expect(descriptor.opaqueContentTag).not.toBe(digestOnlyTag);
   });
 
   it("does not serialize semantic identifiers, plaintext digests, payloads, or the epoch secret", async () => {
