@@ -1,0 +1,25 @@
+export {
+  DEFAULT_MAX_LEAF_BYTES,
+  DEFAULT_MAX_LEAF_DESCRIPTORS,
+  DEFAULT_MAX_NODE_REFS,
+  DEFAULT_MAX_PENDING_LEAVES,
+  DEFAULT_MAX_PENDING_NODES,
+  InvalidReconciliationCursorError,
+  InvalidReconciliationResponseError,
+  MAX_LEAF_BYTES,
+  MAX_LEAF_DESCRIPTORS,
+  MAX_NODE_REFS,
+  MAX_PENDING_LEAVES,
+  MAX_PENDING_NODES,
+  MAX_RECONCILIATION_STATE_BYTES,
+  ReconciliationBudgetExceededError,
+  ReconciliationLimitError,
+  StaleReconciliationViewError,
+} from "./sync-generic.js";
+export type {
+  MerkleNodeHash,
+  MerkleNodeRef,
+  NodeQueryOptions,
+  ReconciliationCounters,
+  ReconciliationSessionOptions,
+} from "./sync-generic.js";

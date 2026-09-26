@@ -36,6 +36,16 @@
       "types": "./src/encrypted.ts",
       "import": "./dist/encrypted.js",
       "default": "./dist/encrypted.js"
+    },
+    "./opaque-merkle": {
+      "types": "./src/opaque-merkle.ts",
+      "import": "./dist/opaque-merkle.js",
+      "default": "./dist/opaque-merkle.js"
+    },
+    "./opaque-sync": {
+      "types": "./src/opaque-sync.ts",
+      "import": "./dist/opaque-sync.js",
+      "default": "./dist/opaque-sync.js"
     }
   }
 }
