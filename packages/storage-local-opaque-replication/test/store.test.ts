@@ -531,10 +531,10 @@ describe("LocalOpaqueReplicationStore", () => {
   it("does not persist fixture plaintext record identity or values in DB, bodies, or filenames", async () => {
     const root = await storeRoot();
     const epoch = generateVaultEpoch();
-    const secretId = "ULTRA-SECRET-RECORD-ID-DO-NOT-LEAK";
-    const secretValue = "ULTRA-SECRET-PERSONAL-VALUE-DO-NOT-LEAK";
-    const object = await encryptedRecord(epoch, secretId, secretValue);
-    const record = await observationRecord(secretId, secretValue);
+    const privateIdFixture = "FIXTURE-PLAINTEXT-RECORD-ID-DO-NOT-LEAK";
+    const privateValueFixture = "FIXTURE-PLAINTEXT-PERSONAL-VALUE-DO-NOT-LEAK";
+    const object = await encryptedRecord(epoch, privateIdFixture, privateValueFixture);
+    const record = await observationRecord(privateIdFixture, privateValueFixture);
     const store = new LocalOpaqueReplicationStore({ root });
     await store.install(object);
     store.close();
@@ -543,7 +543,13 @@ describe("LocalOpaqueReplicationStore", () => {
     const filenames = paths.join("\n");
     const physical = Buffer.concat(await Promise.all(paths.map((path) => readFile(path))))
       .toString("latin1");
-    for (const forbidden of [secretId, secretValue, record.key, record.payloadDigest, project]) {
+    for (const forbidden of [
+      privateIdFixture,
+      privateValueFixture,
+      record.key,
+      record.payloadDigest,
+      project,
+    ]) {
       expect(filenames).not.toContain(forbidden);
       expect(physical).not.toContain(forbidden);
     }

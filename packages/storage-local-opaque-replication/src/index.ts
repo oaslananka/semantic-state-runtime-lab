@@ -74,12 +74,12 @@ function checkedStorageKey(value: string): OpaqueStorageKey {
 }
 
 function ensureDirectorySync(path: OpaqueStorePath): void {
-  // nosemgrep -- path is branded and created only by configuredStorePath/childStorePath.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   mkdirSync(path, { recursive: true, mode: 0o700 });
 }
 
 async function ensureDirectory(path: OpaqueStorePath): Promise<void> {
-  // nosemgrep -- path is branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   await mkdir(path, { recursive: true, mode: 0o700 });
 }
 
@@ -88,27 +88,27 @@ async function openStorePath(
   flags: "r" | "wx",
   mode?: number,
 ) {
-  // nosemgrep -- path is branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   return mode === undefined ? open(path, flags) : open(path, flags, mode);
 }
 
 async function statStorePath(path: OpaqueStorePath) {
-  // nosemgrep -- path is branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   return stat(path);
 }
 
 async function readStorePath(path: OpaqueStorePath): Promise<Buffer> {
-  // nosemgrep -- path is branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   return readFile(path);
 }
 
 async function linkStorePath(source: OpaqueStorePath, target: OpaqueStorePath): Promise<void> {
-  // nosemgrep -- both paths are branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root paths.
   await link(source, target);
 }
 
 async function unlinkStorePath(path: OpaqueStorePath): Promise<void> {
-  // nosemgrep -- path is branded and confined to the configured store root.
+  // eslint-disable-next-line security/detect-non-literal-fs-filename -- branded store-root path.
   await unlink(path);
 }
 
