@@ -31,7 +31,7 @@ export const ENCRYPTED_REPLICATION_OBJECT_SCHEMA =
   "ssrl-encrypted-replication-object-v1" as const;
 
 const INDEX_KDF_SALT = utf8("ssrl-opaque-replication-index-salt-v1");
-const INDEX_KDF_INFO = utf8("ssrl-opaque-replication-index-key-v1");
+const INDEX_KDF_INFO_DOMAIN = "ssrl-opaque-replication-index-key-v1";
 const HMAC_TAG_PREFIX = "hmac-sha256:";
 const AES_GCM_TAG_BYTES = 16;
 const MAX_PUBLIC_OBJECT_JSON_CHARS =
@@ -134,7 +134,10 @@ function fingerprint(value: unknown): string {
   return normalized;
 }
 
-async function indexHmacKey(secret: VaultEpochSecret): Promise<CryptoKey> {
+async function indexHmacKey(
+  secret: VaultEpochSecret,
+  epochId: VaultEpochId,
+): Promise<CryptoKey> {
   const keyMaterial = await globalThis.crypto.subtle.importKey(
     "raw",
     vaultEpochSecret(secret),
@@ -147,7 +150,7 @@ async function indexHmacKey(secret: VaultEpochSecret): Promise<CryptoKey> {
       name: "HKDF",
       hash: "SHA-256",
       salt: INDEX_KDF_SALT,
-      info: INDEX_KDF_INFO,
+      info: utf8(canonicalJson([INDEX_KDF_INFO_DOMAIN, normalizeVaultEpochId(epochId)])),
     },
     keyMaterial,
     { name: "HMAC", hash: "SHA-256", length: 256 },
@@ -190,7 +193,7 @@ async function createOpaqueDescriptor(input: {
     "opaque descriptor plaintext bytes",
     MAX_E2E_PAYLOAD_BYTES,
   );
-  const hmacKey = await indexHmacKey(input.epochSecret);
+  const hmacKey = await indexHmacKey(input.epochSecret, epochId);
   const record = input.objectKind === "replication-record";
   const [opaqueKey, opaqueContentTag] = await Promise.all([
     keyedTag(hmacKey, record ? "record-key" : "blob-key", input.logicalKey),
