@@ -545,6 +545,9 @@ importers:
       '@ssrl/core':
         specifier: workspace:*
         version: link:../core
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
       '@ssrl/state-store':
         specifier: workspace:*
         version: link:../state-store
