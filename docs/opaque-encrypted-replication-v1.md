@@ -243,6 +243,8 @@ v1 does not require whole-vault re-encryption during rotation.
 
 This trades public cross-epoch deduplication for less relay-visible linkage.
 
+A device that legitimately learned an old epoch secret can continue computing opaque identifiers for that historical epoch even after later trust revocation. Rotation provides forward separation for new epochs; it cannot retroactively make previously disclosed epoch secrets or historical equality information unknown.
+
 ## What the relay still learns
 
 v1 explicitly leaks:
