@@ -200,7 +200,7 @@ async function createOpaqueDescriptor(input: {
     keyedTag(
       hmacKey,
       record ? "record-content" : "blob-content",
-      input.contentIdentity,
+      canonicalJson([input.logicalKey, input.contentIdentity]),
     ),
   ]);
   const material: DescriptorMaterial = {
