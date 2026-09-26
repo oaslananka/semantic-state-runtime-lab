@@ -537,6 +537,15 @@ importers:
         specifier: 26.6.2
         version: 26.6.2
 
+  packages/opaque-replication-store:
+    dependencies:
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+      '@ssrl/replication':
+        specifier: workspace:*
+        version: link:../replication
+
   packages/replication:
     dependencies:
       '@ssrl/artifact-store':
@@ -679,6 +688,28 @@ importers:
         specifier: workspace:*
         version: link:../core
     devDependencies:
+      '@types/node':
+        specifier: 26.6.2
+        version: 26.6.2
+
+  packages/storage-local-opaque-replication:
+    dependencies:
+      '@ssrl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ssrl/e2e':
+        specifier: workspace:*
+        version: link:../e2e
+      '@ssrl/opaque-replication-store':
+        specifier: workspace:*
+        version: link:../opaque-replication-store
+      '@ssrl/replication':
+        specifier: workspace:*
+        version: link:../replication
+    devDependencies:
+      '@ssrl/state-store':
+        specifier: workspace:*
+        version: link:../state-store
       '@types/node':
         specifier: 26.6.2
         version: 26.6.2

@@ -1,0 +1,17 @@
+{
+  "name": "@ssrl/opaque-replication-store",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@ssrl/e2e": "workspace:*",
+    "@ssrl/replication": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  }
+}

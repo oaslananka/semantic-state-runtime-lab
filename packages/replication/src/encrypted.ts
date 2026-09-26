@@ -112,7 +112,10 @@ function encryptedObjectKind(value: unknown): EncryptedObjectKind {
   return value;
 }
 
-function opaqueTag(value: unknown, label: string): OpaqueReplicationTag {
+export function normalizeOpaqueReplicationTag(
+  value: unknown,
+  label = "opaque replication tag",
+): OpaqueReplicationTag {
   const normalized = requiredString(value, label, HMAC_TAG_PREFIX.length + 43);
   if (!normalized.startsWith(HMAC_TAG_PREFIX)) {
     throw new EncryptedReplicationValidationError(
@@ -242,8 +245,8 @@ export async function normalizeOpaqueReplicationDescriptor(
     schema: OPAQUE_REPLICATION_DESCRIPTOR_SCHEMA,
     epochId: normalizeVaultEpochId(object.epochId),
     objectKind: encryptedObjectKind(object.objectKind),
-    opaqueKey: opaqueTag(object.opaqueKey, "opaque replication key"),
-    opaqueContentTag: opaqueTag(
+    opaqueKey: normalizeOpaqueReplicationTag(object.opaqueKey, "opaque replication key"),
+    opaqueContentTag: normalizeOpaqueReplicationTag(
       object.opaqueContentTag,
       "opaque replication content tag",
     ),
