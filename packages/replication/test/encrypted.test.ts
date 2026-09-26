@@ -59,7 +59,8 @@ function fullRecordJson(record: ReplicationRecord): string {
 }
 
 async function sha256Digest(bytes: Uint8Array): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  const owned = Uint8Array.from(bytes);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", owned.buffer));
   return `sha256:${[...digest]
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("")}`;
