@@ -80,3 +80,6 @@ jobs:
 
       - name: Replication HTTP transport benchmark smoke test
         run: pnpm benchmark:replication:http:v1
+
+      - name: Opaque encrypted replication overhead benchmark smoke test
+        run: pnpm benchmark:replication:encrypted:v1
