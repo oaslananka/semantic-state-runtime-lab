@@ -10,7 +10,7 @@
     "@ssrl/runtime-host": "workspace:*"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.1.0",
+    "@modelcontextprotocol/client": "2.3.1",
     "@ssrl/artifact-access": "workspace:*",
     "@ssrl/artifact-store": "workspace:*",
     "@ssrl/core": "workspace:*",
