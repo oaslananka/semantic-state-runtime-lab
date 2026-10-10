@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@modelcontextprotocol/server": "2.1.0",
+    "@modelcontextprotocol/server": "2.3.1",
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
     "zod": "4.6.5",

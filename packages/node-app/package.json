@@ -12,7 +12,7 @@
     "@ssrl/runtime-host": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
     "zod": "4.6.5",
-    "@modelcontextprotocol/server": "2.1.0",
+    "@modelcontextprotocol/server": "2.3.1",
     "@ssrl/context-access": "workspace:*",
     "@ssrl/ingestion": "workspace:*",
     "@ssrl/materializer": "workspace:*",
