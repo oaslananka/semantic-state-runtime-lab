@@ -9,7 +9,7 @@
     "@ssrl/artifact-store": "workspace:*"
   },
   "devDependencies": {
-    "@types/node": "26.6.2",
+    "@types/node": "26.6.5",
     "@ssrl/storage-local-artifacts": "workspace:*"
   },
   "exports": {

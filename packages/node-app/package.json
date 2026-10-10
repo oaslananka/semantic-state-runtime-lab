@@ -23,7 +23,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.1.0",
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.5"
   },
   "bin": {
     "ssrl-node": "./dist/cli.js"
