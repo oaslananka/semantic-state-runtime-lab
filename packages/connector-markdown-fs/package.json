@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "@ssrl/runtime": "workspace:*",
-    "@types/node": "26.6.2",
+    "@types/node": "26.6.5",
     "@ssrl/storage-sqlite": "workspace:*",
     "@ssrl/storage-local-artifacts": "workspace:*",
     "@ssrl/materializer": "workspace:*"
