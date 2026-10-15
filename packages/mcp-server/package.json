@@ -7,7 +7,7 @@
     "@modelcontextprotocol/server": "2.1.0",
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
-    "zod": "4.6.5",
+    "zod": "4.6.7",
     "@ssrl/core": "workspace:*",
     "@ssrl/artifact-access": "workspace:*",
     "@ssrl/artifact-store": "workspace:*",
