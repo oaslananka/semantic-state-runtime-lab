@@ -11,7 +11,7 @@
   },
   "devDependencies": {
     "@ssrl/state-store": "workspace:*",
-    "@types/node": "26.6.2",
+    "@types/node": "26.6.5",
     "@ssrl/replication": "workspace:*",
     "@ssrl/e2e": "workspace:*"
   },

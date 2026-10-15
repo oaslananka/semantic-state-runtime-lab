@@ -13,7 +13,7 @@
   "devDependencies": {
     "@ssrl/replication-http": "workspace:*",
     "@ssrl/storage-sqlite-device-trust": "workspace:*",
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.5"
   },
   "exports": {
     ".": {

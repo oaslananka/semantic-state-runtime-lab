@@ -16,7 +16,7 @@
   "devDependencies": {
     "@ssrl/storage-local-artifacts": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
-    "@types/node": "26.6.2",
+    "@types/node": "26.6.5",
     "@ssrl/storage-sqlite-device-trust": "workspace:*",
     "@ssrl/e2e": "workspace:*"
   },
