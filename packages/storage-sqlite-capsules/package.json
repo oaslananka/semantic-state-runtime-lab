@@ -10,7 +10,7 @@
   },
   "devDependencies": {
     "@ssrl/storage-sqlite": "workspace:*",
-    "@types/node": "26.6.2"
+    "@types/node": "26.6.5"
   },
   "exports": {
     ".": {
