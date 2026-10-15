@@ -11,7 +11,7 @@
     "@ssrl/runtime": "workspace:*",
     "@ssrl/runtime-host": "workspace:*",
     "@ssrl/storage-sqlite": "workspace:*",
-    "zod": "4.6.5",
+    "zod": "4.6.7",
     "@modelcontextprotocol/server": "2.1.0",
     "@ssrl/context-access": "workspace:*",
     "@ssrl/ingestion": "workspace:*",
